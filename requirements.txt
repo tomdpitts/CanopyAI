@@ -1,0 +1,21 @@
+# requirements.txt
+# Core geospatial + utils
+
+rasterio
+geopandas
+shapely
+fiona
+pyproj
+rtree
+opencv-python
+wget
+
+# Also needed: PyTorch + Detectron2
+# Latest compatible Python currently: 3.12
+# Requires Pytorch
+
+# Mac build tools for Detectron2: 
+# xcode-select --install  #(if not already installed)
+# brew install cmake ninja pkg-config
+
+# pip install "git+https://github.com/facebookresearch/detectron2.git"
