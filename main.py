@@ -35,6 +35,22 @@ import json, cv2, torch
 import rasterio
 import geopandas as gpd
 
+import requests
+
+import geopandas as gpd
+import numpy as np
+from shapely.geometry import Polygon, MultiPolygon
+
+import geopandas as gpd
+import numpy as np
+import json
+from shapely.geometry import Polygon
+
+import matplotlib.pyplot as plt
+
+import rasterio
+from rasterio.transform import from_bounds
+from shapely.affinity import affine_transform
 
 
 # --------------------------------------------------
@@ -93,7 +109,7 @@ def main():
     # === 1. Define key paths ===
     # Adjust this base path if your dataset lives elsewhere
     home = Path.home()
-    site_name = "TCD"
+    site_name = "tcd"
     site_path = home / "dphil" / "detectree2" / "data" / site_name
     # img_path = site_path / "rgb" / "2015.06.10_07cm_ORTHO.tif" # update with correct .tif
     # img_path = download_one_tcd_tile(site_path / "rgb")
@@ -158,9 +174,9 @@ def main():
     tile_name = f"{img_path.stem}_tile"
     visualize_saved_prediction_with_masks(
         Path(pred_tiles_path) / f"{tile_name}.tif",
-        Path(pred_tiles_path) / "predictions" / f"Prediction_{tile_name}.json",
+        Path(pred_tiles_path) / "predictions" / f"prediction_{tile_name}.json",
         Path(overlays_path) / f"{tile_name}_overlay.png",
-        score_thresh=0.5
+        score_thresh=0.8
     )
 
     with rasterio.open(img_path) as ds:
@@ -187,11 +203,25 @@ def main():
     # print(f"\nAll done! Results saved to:\n  {out_gpkg}\n")
 
 
-    validate_predictions_vs_tcd_segments(
-        pred_geojson_path="data/tcd/tiles_pred/predictions_geo/Prediction_tcd_tile_5_tile.geojson",
+    _, pred, gt, ious, coco_anns = validate_predictions_vs_tcd_segments(
+        pred_geojson_path="data/tcd/tiles_pred/predictions_geo/Prediction_tcd_tile_0_tile.geojson",
         tcd_example=example,
         iou_thresh=0.5
     )
+
+    # Visualize
+    
+    visualize_validation_results(
+        pred, gt, ious,
+        coco_anns,
+        iou_thresh=0.5,
+        site_path=site_path,
+        rgb_path=img_path,
+        tile_name=f"{img_path.stem}_tile",
+        image_id=image_id
+    )
+
+    
 
 # CLI Args
 def parse_args():
@@ -211,126 +241,9 @@ def set_device(cfg):
     print(f"🖥️ Using device: {device}")
 
 
-from datasets import load_dataset
-import requests
-from pathlib import Path
 
-# def download_one_tcd_tile(save_dir: Path) -> Path:
-#     """Download a single tile (.tif) from the restor/tcd dataset."""
-#     ds = load_dataset("restor/tcd", split="train")  # load metadata
 
-#     # Examine first example
-#     first = ds[0]
-#     print("Available keys:", first.keys())
 
-#     # The dataset stores imagery in a field like 'image' (a PIL.Image or link)
-#     # If it's a dict with 'path' or 'url', handle accordingly:
-#     img_field = first.get("image")
-
-#     # Case 1: it's a PIL image — save it manually
-#     if hasattr(img_field, "save"):
-#         save_dir.mkdir(parents=True, exist_ok=True)
-#         out_path = save_dir / "tcd_tile_0.tif"
-#         img_field.save(out_path)
-#         print(f"🪶 Saved tile to {out_path} (PIL)")
-#         return out_path
-
-#     # Case 2: it's a remote URL (common for large EO datasets)
-#     if isinstance(img_field, str) and img_field.startswith("http"):
-#         save_dir.mkdir(parents=True, exist_ok=True)
-#         out_path = save_dir / Path(img_field).name
-#         if not out_path.exists():
-#             print(f"🌐 Downloading {img_field} ...")
-#             with requests.get(img_field, stream=True) as r:
-#                 r.raise_for_status()
-#                 with open(out_path, "wb") as f:
-#                     for chunk in r.iter_content(chunk_size=8192):
-#                         f.write(chunk)
-#         print(f"✅ Saved tile to {out_path} (remote URL)")
-#         return out_path
-
-#     raise ValueError(f"Unexpected format for 'image' field: {type(img_field)}")
-
-from datasets import load_dataset
-from pathlib import Path
-import requests
-import rasterio
-
-# def download_one_tcd_tile(save_dir: Path) -> tuple[Path, Path]:
-#     """
-#     Download a single orthomosaic (.tif) and corresponding crown annotations (.gpkg)
-#     from the Restor Foundation TCD dataset on HuggingFace.
-    
-#     Handles both PIL.Image and remote URL formats for imagery.
-#     Returns (image_path, annotation_path).
-#     """
-#     print("📦 Loading TCD dataset metadata...")
-#     ds = load_dataset("restor/tcd", split="train")
-
-#     # Inspect first example
-#     first = ds[0]
-#     print("Available keys:", list(first.keys()))
-
-#     img_field = first.get("image")
-#     crown_field = first.get("crowns_polygon")
-
-#     save_dir.mkdir(parents=True, exist_ok=True)
-#     img_path = save_dir / "tcd_tile_0.tif"
-#     ann_path = save_dir / "tcd_tile_0_crowns.gpkg"
-
-#     # --- 🖼️ IMAGE HANDLING ---
-#     if hasattr(img_field, "save"):
-#         # Case: PIL.Image object (no CRS)
-#         img_field.save(img_path)
-#         print(f"🪶 Saved tile (PIL) → {img_path}")
-#     elif isinstance(img_field, dict) and "path" in img_field:
-#         # Case: dataset stores file path or URL inside dict
-#         url = img_field["path"]
-#         print(f"🌐 Downloading GeoTIFF from {url} ...")
-#         with requests.get(url, stream=True) as r:
-#             r.raise_for_status()
-#             with open(img_path, "wb") as f:
-#                 for chunk in r.iter_content(chunk_size=8192):
-#                     f.write(chunk)
-#         print(f"✅ Saved tile (from dict URL) → {img_path}")
-#     elif isinstance(img_field, str) and img_field.startswith("http"):
-#         # Case: direct URL string
-#         print(f"🌐 Downloading GeoTIFF from {img_field} ...")
-#         with requests.get(img_field, stream=True) as r:
-#             r.raise_for_status()
-#             with open(img_path, "wb") as f:
-#                 for chunk in r.iter_content(chunk_size=8192):
-#                     f.write(chunk)
-#         print(f"✅ Saved tile (remote URL) → {img_path}")
-#     else:
-#         raise ValueError(f"Unexpected format for 'image' field: {type(img_field)}")
-
-#     # --- 🌿 ANNOTATION HANDLING ---
-#     if isinstance(crown_field, str) and crown_field.startswith("http"):
-#         print(f"🌐 Downloading crowns annotation from {crown_field} ...")
-#         with requests.get(crown_field, stream=True) as r:
-#             r.raise_for_status()
-#             with open(ann_path, "wb") as f:
-#                 for chunk in r.iter_content(chunk_size=8192):
-#                     f.write(chunk)
-#         print(f"✅ Saved annotations → {ann_path}")
-#     elif crown_field is None:
-#         print("⚠️ No crowns_polygon field found in this record.")
-#     else:
-#         print(f"⚠️ Unexpected crowns format: {type(crown_field)}")
-
-#     # --- 🧭 Validate geospatial metadata ---
-#     try:
-#         with rasterio.open(img_path) as ds_img:
-#             print(f"📐 CRS: {ds_img.crs}")
-#             print(f"🔢 Transform: {ds_img.transform}")
-#             if ds_img.crs is None:
-#                 print("⚠️ Image has no CRS — non-georeferenced tile.")
-#     except Exception as e:
-#         print(f"⚠️ Could not read GeoTIFF metadata: {e}")
-
-#     print("\n✅ Download complete.")
-#     return img_path, ann_path
 from rasterio.transform import from_bounds
 def download_one_tcd_tile(save_dir: Path) -> tuple[Path, Path]:
     """
@@ -342,10 +255,6 @@ def download_one_tcd_tile(save_dir: Path) -> tuple[Path, Path]:
     example = ds[0]
     image_id = example["image_id"]
     print("Available keys:", list(example.keys()))
-
-    print("Annotation: ", example["annotation"])
-    print("Segments: ", example["segments"])
-    print("COCO Annotations: ", example["coco_annotations"])
 
     save_dir.mkdir(parents=True, exist_ok=True)
     img_path = save_dir / "tcd_tile_0.tif"
@@ -458,100 +367,269 @@ def has_geodata(tif_path: str | Path) -> bool:
         has_crs = ds.crs is not None
         has_transform = ds.transform != rasterio.Affine.identity()
         return has_crs and has_transform
-import geopandas as gpd
-import numpy as np
-from shapely.geometry import Polygon, MultiPolygon
 
-def validate_predictions_vs_tcd_segments(pred_geojson_path, tcd_example, iou_thresh=0.5):
-    """
-    Validate Detectree2 polygon predictions against TCD ground truth 'segments'.
 
-    Parameters
-    ----------
-    pred_geojson_path : str or Path
-        Path to Detectree2's GeoJSON predictions (one tile).
-    tcd_example : dict
-        One dataset example from restor/tcd (ds[i]).
-        Must contain 'segments' and 'crs' keys.
-    iou_thresh : float, optional
-        Intersection-over-Union threshold for counting True Positives.
 
-    Returns
-    -------
-    dict
-        Summary metrics: precision, recall, mean_iou, n_pred, n_gt, n_tp
-    """
+def validate_predictions_vs_tcd_segments(pred_geojson_path, tcd_example, iou_thresh=0.5, score_thresh=0.8):
+    """Validate Detectree2 predictions against TCD 'segments' (bbox/segmentation polygons)."""
     print("📂 Loading Detectree2 predictions ...")
     pred = gpd.read_file(pred_geojson_path)
     print(f"  → {len(pred)} predicted polygons")
 
-    # --- Build ground-truth polygons from TCD 'segments' ---
-    segs = tcd_example.get("segments", [])
+    # Filter low-confidence predictions
+    if "score" in pred.columns:
+        before = len(pred)
+        pred = pred[pred["score"] >= score_thresh].copy()
+        print(f"  → Filtered {before - len(pred)} low-confidence predictions (score < {score_thresh})")
+
+    # Parse and normalize ground-truth segments
+    segs = tcd_example.get("segments")
     if not segs:
-        raise ValueError("❌ No 'segments' found in TCD example — cannot validate.")
+        raise ValueError("❌ No 'segments' found in TCD example.")
+
+    if isinstance(segs, str):  # JSON string → list
+        segs = json.loads(segs)
+    if not isinstance(segs, list):
+        raise ValueError("❌ 'segments' field not in expected list format.")
 
     gt_polys = []
-    for seg in segs:
-        # The dataset provides 'bbox' in [x, y, width, height]
-        # Some may also have 'segmentation' arrays — prefer them if available
-        if "segmentation" in seg and isinstance(seg["segmentation"], list):
-            # segmentation is [[x1,y1,x2,y2,...]] — convert to Polygon
-            coords = seg["segmentation"][0]
-            poly = Polygon(np.array(coords).reshape(-1, 2))
+    for s in segs:
+        if isinstance(s, str):
+            try:
+                s = json.loads(s)
+            except json.JSONDecodeError:
+                continue
+        if not isinstance(s, dict):
+            continue
+
+        if "segmentation" in s and isinstance(s["segmentation"], list):
+            coords = np.array(s["segmentation"][0]).reshape(-1, 2)
+            poly = Polygon(coords)
+        elif "bbox" in s:
+            x, y, w, h = s["bbox"]
+            poly = Polygon([(x, y), (x+w, y), (x+w, y+h), (x, y+h)])
         else:
-            x, y, w, h = seg["bbox"]
-            poly = Polygon([
-                (x, y),
-                (x + w, y),
-                (x + w, y + h),
-                (x, y + h)
-            ])
+            continue
+
         if poly.is_valid and poly.area > 0:
             gt_polys.append(poly)
 
-    gt = gpd.GeoDataFrame(geometry=gt_polys, crs=tcd_example.get("crs", "EPSG:3395"))
-    print(f"  → {len(gt)} ground-truth polygons from TCD segments")
+    # # --- Convert pixel polygons to world CRS ---
 
-    # --- CRS alignment ---
+    # bounds = tcd_example["bounds"]
+    # width, height = tcd_example["width"], tcd_example["height"]
+    # transform = from_bounds(*bounds, width=width, height=height)
+
+    # gt_world = [pixel_to_world(p, transform) for p in gt_polys if p.is_valid]
+    # gt = gpd.GeoDataFrame(geometry=gt_world, crs=tcd_example["crs"])
+
+    # --- Convert COCO-style pixel polygons to world CRS ---
+    coco_anns = tcd_example.get("coco_annotations", [])
+
+
+
+
+    if isinstance(coco_anns, str):
+        try:
+            coco_anns = json.loads(coco_anns)
+        except json.JSONDecodeError:
+            raise ValueError("❌ 'coco_annotations' field is not valid JSON.")
+    if not isinstance(coco_anns, list) or not coco_anns:
+        raise ValueError("❌ No valid 'coco_annotations' found in TCD example — cannot derive crowns.")
+
+    #  if this works, it feels inefficient to filter here after we've already pulled the coco_anns - update to do it sooner
+    image_id = tcd_example.get("image_id")
+    if image_id is not None:
+        coco_anns = [a for a in coco_anns if a.get("image_id") == image_id]
+        print(f"Filtered to {len(coco_anns)} annotations for image_id={image_id}")
+    else:
+        print("⚠️ No image_id found; using all annotations.")
+
+
+        
+    # =============================================================
+    print(f"Annotations: {len(coco_anns)} total")
+    cats = [a.get("category_id") for a in coco_anns]
+    print(f"  Trees: {cats.count(1)}, Canopy: {cats.count(2)}")
+
+    for i, a in enumerate(coco_anns[:3]):
+        print(f"Ann {i}: seg count {len(a.get('segmentation', []))}, first seg len={len(a['segmentation'][0]) if a['segmentation'] else 0}")
+
+        # =============================================================
+
+    gt_polys = []
+    gt_cats = []
+    for ann in coco_anns:
+        segs = ann.get("segmentation", [])
+        if not segs or not isinstance(segs[0], list):
+            continue
+        coords = np.array(segs[0]).reshape(-1, 2)
+        poly = Polygon(coords)
+        if poly.is_valid and poly.area > 0:
+            gt_polys.append(poly)
+            gt_cats.append(ann.get("category_id", 1))
+
+    # Use image georeferencing transform to map pixel → world
+    width, height = tcd_example["width"], tcd_example["height"]
+    bounds = tcd_example["bounds"]
+    transform = from_bounds(*bounds, width=width, height=height)
+
+    # gt_world = [pixel_to_world(p, transform) for p in gt_polys if p.is_valid]
+    # gt = gpd.GeoDataFrame(geometry=gt_world, crs=tcd_example["crs"])
+
+    gt_world = [pixel_to_world(p, transform) for p in gt_polys if p.is_valid]
+    gt = gpd.GeoDataFrame({"geometry": gt_world, "category": gt_cats}, crs=tcd_example["crs"])
+
+    print(f"  → {len(gt)} ground-truth polygons (from coco_annotations)")
+
+    # gt = gpd.GeoDataFrame(geometry=gt_polys, crs=tcd_example.get("crs", "EPSG:3395"))
+    print(f"  → {len(gt)} ground-truth polygons")
+
     if pred.crs != gt.crs:
-        print(f"🔄 Aligning CRS from {pred.crs} → {gt.crs}")
         pred = pred.to_crs(gt.crs)
 
-    # --- IoU helper ---
+    # IoU computation
     def iou(a, b):
-        inter = a.intersection(b).area
-        union = a.union(b).area
+        inter, union = a.intersection(b).area, a.union(b).area
         return inter / union if union > 0 else 0.0
 
-    # --- Compute IoUs ---
-    ious = []
+    def iop(a, b):
+        inter = a.intersection(b).area
+        denom = a.area
+        return inter / denom if denom > 0 else 0.0
+
+    scores = []
     for p in pred.geometry:
         if not p.is_valid or p.is_empty:
             continue
-        best = max((iou(p, g) for g in gt.geometry), default=0.0)
-        ious.append(best)
+        best_score = 0.0
+        for g, cat in zip(gt.geometry, gt["category"]):
+            score = iou(p, g) if cat == 1 else iop(p, g)
+            if score > best_score:
+                best_score = score
+        scores.append(best_score)
 
-    n_pred = len(pred)
-    n_gt = len(gt)
-    n_tp = sum(i >= iou_thresh for i in ious)
-    precision = n_tp / n_pred if n_pred else 0
-    recall = n_tp / n_gt if n_gt else 0
-    mean_iou = np.mean(ious) if ious else 0
+    n_pred, n_gt = len(pred), len(gt)
+    n_tp = sum(s >= iou_thresh for s in scores)
+    mean_score = np.mean(scores) if scores else 0
 
     metrics = {
-        "precision": precision,
-        "recall": recall,
-        "mean_iou": mean_iou,
+        "precision": n_tp / n_pred if n_pred else 0,
+        "recall": n_tp / n_gt if n_gt else 0,
+        "mean_overlap": mean_score,
         "n_pred": n_pred,
         "n_gt": n_gt,
         "n_tp": n_tp,
     }
 
-    print("\n📊 Validation Results:")
+    print("\n📊 Validation Results (IoU for trees, IoP for canopy):")
     for k, v in metrics.items():
-        print(f"  {k:10s}: {v:.3f}" if isinstance(v, float) else f"  {k:10s}: {v}")
+        print(f"  {k:12s}: {v:.3f}" if isinstance(v, float) else f"  {k:12s}: {v}")
 
-    return metrics
+    print("GT CRS:", tcd_example.get("crs"))
+    print("Pred CRS:", pred.crs)
+    print("GT number:", len(gt_polys))
+    print("Pred number:", len(pred))
+
+    print(gt.geometry.iloc[0].bounds)
+    print(pred.geometry.iloc[0].bounds)
+
+    return metrics, pred, gt, scores, coco_anns
+
+
+def visualize_validation_results(pred, gt, ious, coco_anns=None, iou_thresh=0.5,
+                                 site_path=None, rgb_path=None,
+                                 tile_name=None, image_id=None):
+    """
+    Visualize Detectree2 vs TCD polygons over RGB base image.
+
+    Colors:
+      🟩 Teal   → True Positives (IoU ≥ threshold)
+      🟧 Orange → False Positives (IoU < threshold)
+      🟪 Purple → Ground Truth crowns
+    """
+
+    # === 1. Output path ===
+    out_dir = Path(site_path) / "overlays_validation"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    parts = ["validation_overlay"]
+    if image_id:
+        parts.append(str(image_id))
+    if tile_name:
+        parts.append(tile_name)
+    out_path = out_dir / f"{'_'.join(parts)}.png"
+
+    # === 2. Load background image ===
+    img, extent = None, None
+    if rgb_path and Path(rgb_path).exists():
+        with rasterio.open(rgb_path) as src:
+            img = src.read([1, 2, 3])
+            img = np.moveaxis(img, 0, -1)
+            img = (img - img.min()) / (img.max() - img.min() + 1e-9)
+            extent = [src.bounds.left, src.bounds.right,
+                      src.bounds.bottom, src.bounds.top]
+
+    # === 3. Plot setup ===
+    fig, ax = plt.subplots(figsize=(8, 8))
+    ax.set_title(f"Detectree2 vs TCD — IoU ≥ {iou_thresh}")
+    ax.set_aspect("equal")
+
+    if img is not None:
+        ax.imshow(img, extent=extent, origin="upper")
+
+    # === 4. Draw predictions ===
+    for i, p in enumerate(pred.geometry):
+        if not p.is_valid or p.is_empty:
+            continue
+        color = "#00FFC6" if i < len(ious) and ious[i] >= iou_thresh else "#FF8800"  # teal / orange
+        ax.plot(*p.exterior.xy, color=color, linewidth=1.2, alpha=0.9)
+
+    # === 5. Draw ground-truth crowns & canopy ===
+    for idx, g in enumerate(gt.geometry):
+        if not g.is_valid or g.is_empty:
+            continue
+        # Match color by category (1=tree, 2=canopy)
+        cat = None
+        if coco_anns and idx < len(coco_anns):
+            cat = coco_anns[idx].get("category_id", 1)
+        color = "#C266FF" if cat == 1 else "#66CCFF"  # purple vs light-blue
+        x, y = g.exterior.xy
+        ax.fill(x, y, facecolor=color, edgecolor=color, linewidth=0.8, alpha=0.25)
+        ax.plot(x, y, color=color, linewidth=0.8, alpha=0.8)
+
+    # === 6. Legend ===
+    import matplotlib.patches as mpatches
+    legend_elems = [
+        mpatches.Patch(color="#00FFC6", label="True Positive (IoU ≥ threshold)"),
+        mpatches.Patch(color="#FF8800", label="False Positive (IoU < threshold)"),
+        mpatches.Patch(color="#C266FF", label="Ground Truth — Tree"),
+        mpatches.Patch(color="#66CCFF", label="Ground Truth — Canopy")
+    ]
+    ax.legend(handles=legend_elems, loc="lower right", frameon=True, fontsize=8)
+
+    ax.set_xlabel("Easting")
+    ax.set_ylabel("Northing")
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=250)
+    plt.close(fig)
+
+    print(f"🖼️  Saved validation overlay → {out_path}")
+
+
+
+def pixel_to_world(poly, transform):
+    """
+    Convert a polygon from pixel to world (map) coordinates using a rasterio Affine transform.
+    Works safely with both Affine objects and tuple/list transforms.
+    """
+    # Ensure we have 6 coefficients in order: [a, b, d, e, xoff, yoff]
+    if isinstance(transform, rasterio.Affine):
+        coeffs = [transform.a, transform.b, transform.d, transform.e, transform.c, transform.f]
+    else:
+        a, b, c, d, e, f = transform[:6]
+        coeffs = [a, b, d, e, c, f]
+
+    return affine_transform(poly, coeffs)
 
 # --------------------------------------------------
 # Entrypoint
