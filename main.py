@@ -211,8 +211,7 @@ def main():
     # === 11. Validate predictions vs TCD segments ===  
     _, pred, gt, ious, coco_anns = validate_predictions_vs_tcd_segments(
         pred_geojson_path="data/tcd/tiles_pred/predictions_geo/Prediction_tcd_tile_0_tile.geojson",
-        tcd_example=example,
-        iou_thresh=0.5
+        tcd_example=example
     )
 
     # === 12. Visualize validation results ===
@@ -454,9 +453,9 @@ def validate_predictions_vs_tcd_segments(pred_geojson_path, tcd_example, iou_thr
     scores_trees = []
     scores_canopy = []
 
-    # Performance improvement with geopandas R-tree - only check nearby polygons
+    # --- Build STRtree and map indices to categories ---
     gt_tree = STRtree(gt.geometry)
-    geom_to_cat = dict(zip(gt.geometry, gt["category"]))  # map geom→category
+    geom_to_cat = dict(enumerate(gt["category"]))  # index → category
 
     for p in pred.geometry:
         if not p.is_valid or p.is_empty:
@@ -465,18 +464,19 @@ def validate_predictions_vs_tcd_segments(pred_geojson_path, tcd_example, iou_thr
         best_score_tree = 0.0
         best_score_canopy = 0.0
 
-        # Only compare to nearby candidates from STRtree
-        candidates = gt_tree.query(p)
-        for g in candidates:
-            cat = geom_to_cat[g]
+        # query() returns integer indices in Shapely ≥2.0
+        candidate_idxs = gt_tree.query(p, predicate="intersects")
+
+        for g_idx in candidate_idxs:
+            cat = geom_to_cat[g_idx]
+            g = gt.geometry.iloc[g_idx]
+
             score = iop(p, g) if cat == 1 else iou(p, g)
 
             if cat == 1:  # canopy
-                if score > best_score_canopy:
-                    best_score_canopy = score
+                best_score_canopy = max(best_score_canopy, score)
             elif cat == 2:  # tree
-                if score > best_score_tree:
-                    best_score_tree = score
+                best_score_tree = max(best_score_tree, score)
 
         if best_score_tree > 0:
             scores_trees.append(best_score_tree)
