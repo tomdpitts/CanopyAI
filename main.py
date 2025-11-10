@@ -111,12 +111,9 @@ def main():
     model_name = "230103_randresize_full"
 
     # === 1. Define key paths ===
-    # Adjust this base path if your dataset lives elsewhere
     home = Path.home()
     site_name = "tcd"
     site_path = home / "dphil" / "detectree2" / "data" / site_name
-    # img_path = site_path / "rgb" / "2015.06.10_07cm_ORTHO.tif" # update with correct .tif
-    # img_path = download_one_tcd_tile(site_path / "rgb")
     img_path, ann_path, example, image_id = download_one_tcd_tile(site_path / "rgb")
     model_path = Path(f"{model_name}.pth")
 
@@ -207,7 +204,7 @@ def main():
 
 
     # === 11. Validate predictions vs TCD segments ===  
-    _, pred, gt, ious, coco_anns = validate_predictions_vs_tcd_segments(
+    _, pred, gt, ious, coco_anns = clean_validate_predictions_vs_tcd_segments(
         pred_geojson_path=Path(preds_geo_path) / "Prediction_tcd_tile_0_tile.geojson",
         tcd_example=example
     )
@@ -301,6 +298,53 @@ def download_one_tcd_tile(save_dir: Path) -> tuple[Path, Path]:
         print("⚠️ No valid annotation URL found; skipping crowns download.")
 
     return img_path, ann_path, example, image_id
+
+def download_tcd_tiles(save_dir: Path, max_images: int = 3):
+    """
+    Download multiple orthomosaics (.tif) and crowns annotation (.gpkg) from restor/tcd.
+    Returns a list of tuples: (img_path, ann_path, example, image_id)
+    """
+    print("📦 Loading TCD dataset metadata...")
+    ds = load_dataset("restor/tcd", split="train")
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    all_entries = []
+    for i, example in enumerate(ds.select(range(max_images))):
+        image_id = example["image_id"]
+        print(f"📸 Downloading image {i}: {image_id}")
+
+        img_path = save_dir / f"tcd_tile_{i}.tif"
+        ann_path = save_dir / f"tcd_tile_{i}_crowns.gpkg"
+
+        img = np.array(example["image"])
+        height, width = img.shape[:2]
+        crs = example.get("crs")
+        bounds = example.get("bounds")
+        if crs is None or bounds is None:
+            print(f"⚠️ Skipping {image_id} — missing CRS/bounds.")
+            continue
+
+        transform = from_bounds(*bounds, width=width, height=height)
+        with rasterio.open(
+            img_path, "w", driver="GTiff",
+            height=height, width=width, count=3,
+            dtype=img.dtype, crs=crs, transform=transform
+        ) as dst:
+            for b in range(3):
+                dst.write(img[:, :, b], b + 1)
+
+        crown_url = example.get("annotation") or example.get("crowns_polygon")
+        if isinstance(crown_url, str) and crown_url.startswith("http"):
+            with requests.get(crown_url, stream=True) as r:
+                r.raise_for_status()
+                with open(ann_path, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=8192):
+                        f.write(chunk)
+
+        all_entries.append((img_path, ann_path, example, image_id))
+        print(f"✅ Saved georeferenced tile → {img_path}")
+
+    return all_entries
 
 def is_australia(example):
     return (example["lat"] >= -44 and example["lat"] <= -10
@@ -480,6 +524,7 @@ def validate_predictions_vs_tcd_segments(pred_geojson_path, tcd_example, iou_thr
         inter, union = a.intersection(b).area, a.union(b).area
         return inter / union if union > 0 else 0.0
 
+    # Intersection over polygon
     def iop(a, b):
         inter = a.intersection(b).area
         denom = a.area
@@ -594,6 +639,208 @@ def validate_predictions_vs_tcd_segments(pred_geojson_path, tcd_example, iou_thr
 
     return metrics_all, pred, gt, (scores_trees, scores_canopy), coco_annotations
 
+def clean_validate_predictions_vs_tcd_segments(
+    pred_geojson_path,
+    tcd_example,
+    iou_thresh_tree=0.5,
+    iop_thresh_canopy=0.7,
+):
+    """
+    Validate Detectree2 predictions against TCD 'segments' polygons.
+    Robust to GeometryCollection / MultiPolygon GT geometries.
+    Returns: (metrics_all, pred_gdf, gt_gdf, (scores_trees, scores_canopy), coco_annotations)
+    """
+    import json
+    import numpy as np
+    import geopandas as gpd
+    from shapely.geometry import Polygon, MultiPolygon, GeometryCollection
+    from shapely.validation import make_valid
+    from shapely.affinity import affine_transform
+    from shapely.strtree import STRtree
+    from rasterio.transform import from_bounds
+
+    # ---------------------------
+    # Helpers
+    # ---------------------------
+    def polygon_parts(geom):
+        """Yield polygonal parts (Polygon) from any shapely geometry (Polygon/MultiPolygon/GeometryCollection)."""
+        if geom is None or geom.is_empty:
+            return []
+        if isinstance(geom, Polygon):
+            return [geom]
+        if isinstance(geom, MultiPolygon):
+            return list(geom.geoms)
+        if isinstance(geom, GeometryCollection):
+            # keep only polygonal parts; flatten nested multipolygons
+            out = []
+            for g in geom.geoms:
+                out.extend(polygon_parts(g))
+            return out
+        return []
+
+    def pixel_to_world_geom(geom, transform):
+        """
+        Apply rasterio Affine transform to a geometry using shapely.affinity.affine_transform.
+        Handles any geometry type; here we only pass Polygon parts.
+        """
+        # rasterio Affine: | a  b  c |
+        #                  | d  e  f |
+        # shapely expects: [a, b, d, e, xoff, yoff]
+        coeffs = [transform.a, transform.b, transform.d, transform.e, transform.c, transform.f]
+        return affine_transform(geom, coeffs)
+
+    def iou(a, b):
+        inter = a.intersection(b).area
+        if inter <= 0.0:
+            return 0.0
+        union = a.union(b).area
+        return inter / union if union > 0 else 0.0
+
+    def iop(a, b):
+        inter = a.intersection(b).area
+        return inter / a.area if a.area > 0 else 0.0
+
+    def compute_metrics(scores, thresh, n_pred, n_gt):
+        scores = np.asarray(scores, dtype=float)
+        n_tp = int(np.sum(scores >= thresh))
+        precision = n_tp / n_pred if n_pred else 0.0
+        recall = n_tp / n_gt if n_gt else 0.0
+        mean_score = float(np.mean(scores)) if scores.size > 0 else 0.0
+        f1 = 2 * (precision * recall) / (precision + recall + 1e-9)
+        return {
+            "precision": precision,
+            "recall": recall,
+            "f1_score": f1,
+            "mean_overlap": mean_score,
+            "n_tp": n_tp,
+        }
+
+    # ---------------------------
+    # 1) Load predictions
+    # ---------------------------
+    print("📂 Loading Detectree2 predictions ...")
+    pred = gpd.read_file(pred_geojson_path)
+    print(f"  → {len(pred)} predicted polygons")
+
+    # ---------------------------
+    # 2) Parse COCO annotations
+    # ---------------------------
+    coco_annotations = tcd_example.get("coco_annotations", [])
+    if isinstance(coco_annotations, str):
+        coco_annotations = json.loads(coco_annotations)
+    if not isinstance(coco_annotations, list) or not coco_annotations:
+        raise ValueError("❌ No valid 'coco_annotations' found in TCD example.")
+
+    gt_polys_px = []
+    gt_cats = []
+    for ann in coco_annotations:
+        segs = ann.get("segmentation", [])
+        if not segs or not isinstance(segs[0], list):
+            continue
+        coords = np.array(segs[0], dtype=float).reshape(-1, 2)
+        poly = Polygon(coords)
+
+        # make_valid can produce MultiPolygon or GeometryCollection
+        if not poly.is_valid:
+            poly = make_valid(poly) if callable(make_valid) else poly.buffer(0)
+
+        parts = polygon_parts(poly)
+        if not parts:
+            continue
+
+        cat = int(ann.get("category_id", 1))  # 1=canopy, 2=tree
+        for part in parts:
+            if part.is_valid and part.area > 0:
+                gt_polys_px.append(part)
+                gt_cats.append(cat)
+
+    print(f" GT Categories — Canopy: {gt_cats.count(1)}, Trees: {gt_cats.count(2)}")
+
+    # ---------------------------
+    # 3) Pixel → world transform
+    # ---------------------------
+    width, height = tcd_example["width"], tcd_example["height"]
+    bounds = tcd_example["bounds"]
+    transform = from_bounds(*bounds, width=width, height=height)
+
+    gt_world_parts = [pixel_to_world_geom(p, transform) for p in gt_polys_px]
+    gt = gpd.GeoDataFrame({"geometry": gt_world_parts, "category": gt_cats}, crs=tcd_example["crs"])
+    print(f"  → {len(gt)} ground-truth polygons (after normalization)")
+
+    # ---------------------------
+    # 4) CRS alignment
+    # ---------------------------
+    if pred.crs != gt.crs:
+        print(f"Aligning CRS: {pred.crs} → {gt.crs}")
+        pred = pred.to_crs(gt.crs)
+
+    # ---------------------------
+    # 5) Per-pred overlaps via STRtree
+    # ---------------------------
+    gt_geoms = list(gt.geometry)
+    gt_cats_arr = np.asarray(gt["category"], dtype=int)
+    gt_tree = STRtree(gt_geoms)
+
+    n_pred = len(pred)
+    scores_trees = np.zeros(n_pred, dtype=float)   # best IoU vs any tree (cat==2)
+    scores_canopy = np.zeros(n_pred, dtype=float)  # best IoP vs any canopy (cat==1)
+
+    for i, p in enumerate(pred.geometry):
+        if p is None or p.is_empty or not p.is_valid:
+            continue
+        try:
+            cand_idx = gt_tree.query(p, predicate="intersects")
+        except TypeError:
+            cand_idx = [j for j, ggt in enumerate(gt_geoms) if p.intersects(ggt)]
+        if len(cand_idx) == 0:
+            continue
+
+        best_tree = 0.0
+        best_canopy = 0.0
+        for j in cand_idx:
+            ggt = gt_geoms[j]
+            if not p.intersects(ggt):
+                continue
+            if gt_cats_arr[j] == 2:
+                best_tree = max(best_tree, iou(p, ggt))     # IoU for trees
+            else:
+                best_canopy = max(best_canopy, iop(p, ggt)) # IoP for canopy
+        scores_trees[i] = best_tree
+        scores_canopy[i] = best_canopy
+
+    # ---------------------------
+    # 6) Metrics (+F1)
+    # ---------------------------
+    n_gt = len(gt)
+    n_gt_trees = int(np.sum(gt_cats_arr == 2))
+    n_gt_canopy = int(np.sum(gt_cats_arr == 1))
+
+    metrics_trees = compute_metrics(scores_trees, iou_thresh_tree, n_pred, n_gt_trees)
+    metrics_canopy = compute_metrics(scores_canopy, iop_thresh_canopy, n_pred, n_gt_canopy)
+
+    metrics_all = {
+        "trees": metrics_trees,
+        "canopy": metrics_canopy,
+        "n_pred": n_pred,
+        "n_gt_total": n_gt,
+        "n_gt_trees": n_gt_trees,
+        "n_gt_canopy": n_gt_canopy,
+    }
+
+    # ---------------------------
+    # 7) Summary
+    # ---------------------------
+    print("\n📊 Validation Results:")
+    print("  🌳 Trees (IoU):")
+    for k, v in metrics_trees.items():
+        print(f"    {k:12s}: {v:.3f}" if isinstance(v, float) else f"    {k:12s}: {v}")
+    print("  🌿 Canopy (IoP):")
+    for k, v in metrics_canopy.items():
+        print(f"    {k:12s}: {v:.3f}" if isinstance(v, float) else f"    {k:12s}: {v}")
+    print(f"\n  Total predictions: {n_pred}")
+    print(f"  Total GT polygons: {n_gt} (Trees: {n_gt_trees}, Canopy: {n_gt_canopy})")
+
+    return metrics_all, pred, gt, (scores_trees, scores_canopy), coco_annotations
 
 def visualize_validation_results(pred, gt, ious, coco_anns=None, 
                                  iou_thresh_tree=0.5, iop_thresh_canopy=0.7,
@@ -601,11 +848,6 @@ def visualize_validation_results(pred, gt, ious, coco_anns=None,
                                  tile_name=None, image_id=None):
     """
     Visualize Detectree2 vs TCD polygons over RGB base image.
-
-    Colors:
-      🟩 Teal   → True Positives (IoU ≥ threshold)
-      🟧 Orange → False Positives (IoU < threshold)
-      🟪 Purple → Ground Truth crowns
     """
 
     # === 1. Output path ===
