@@ -14,4 +14,5 @@ ds = load_dataset("restor/tcd", split="train")
 example = ds[0]
 print(example.keys())
 
-print(example["segments"][:300])
+print(example["segments"][:1000])
+print(example["coco_annotations"][:1000])

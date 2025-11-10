@@ -3,11 +3,11 @@
 Detectree2 end-to-end inference script (local version)
 -----------------------------------------------------
 Runs the full Detectree2 workflow:
-  1. Tiles an orthomosaic
+  1. Tiles an orthomosaic -- Update: no tiling for now as TCD is 2048x2048px images
   2. Runs Detectron2 model inference
   3. Projects predictions to GeoJSON
-  4. Stitches and cleans crowns
-  5. Writes the output GeoPackage
+  4. Stitches and cleans crowns if necessary
+  5. Writes the output -- Work In Progress
 """
 
 from __future__ import annotations
@@ -51,6 +51,9 @@ import matplotlib.pyplot as plt
 import rasterio
 from rasterio.transform import from_bounds
 from shapely.affinity import affine_transform
+
+from shapely.validation import make_valid
+from shapely.geometry import Polygon, MultiPolygon, GeometryCollection
 
 
 # --------------------------------------------------
@@ -103,7 +106,7 @@ def smoke_test(model_path: Path):
 # Main pipeline
 # --------------------------------------------------
 def main():
-
+    # SET MODEL HERE
     model_name = "230103_randresize_full"
 
     # === 1. Define key paths ===
@@ -135,7 +138,7 @@ def main():
         print(f"⚠️ GeoTIFF not found at {img_path}.")
         return
 
-    # # === 5. Tile orthomosaic ===
+    # # === 5. Tile orthomosaic === SKIPPING FOR NOW AS TCD IS 2048x2048px images
     # print("\n🧩 Tiling image into smaller chips ...")
     # buffer = 30
     # tile_width = 40
@@ -152,6 +155,7 @@ def main():
     tif_tiles = list(tile_dir.glob("*.tif"))
 
     if len(tif_tiles) == 0:
+        # Deprecated, len should be > 0
         # If tiler produced nothing (maybe because it's not a georeferenced image), copy original image in as a single tile
         single_tile_path = tile_dir / f"{img_path.stem}_tile.tif"
         shutil.copy(img_path, single_tile_path)
@@ -203,14 +207,14 @@ def main():
     # print(f"\nAll done! Results saved to:\n  {out_gpkg}\n")
 
 
+    # === 11. Validate predictions vs TCD segments ===  
     _, pred, gt, ious, coco_anns = validate_predictions_vs_tcd_segments(
         pred_geojson_path="data/tcd/tiles_pred/predictions_geo/Prediction_tcd_tile_0_tile.geojson",
         tcd_example=example,
         iou_thresh=0.5
     )
 
-    # Visualize
-    
+    # === 12. Visualize validation results ===
     visualize_validation_results(
         pred, gt, ious,
         coco_anns,
@@ -392,27 +396,27 @@ def validate_predictions_vs_tcd_segments(pred_geojson_path, tcd_example, iou_thr
     if not isinstance(segs, list):
         raise ValueError("❌ 'segments' field not in expected list format.")
 
-    gt_polys = []
-    for s in segs:
-        if isinstance(s, str):
-            try:
-                s = json.loads(s)
-            except json.JSONDecodeError:
-                continue
-        if not isinstance(s, dict):
-            continue
+    # gt_polys = []
+    # for s in segs:
+    #     if isinstance(s, str):
+    #         try:
+    #             s = json.loads(s)
+    #         except json.JSONDecodeError:
+    #             continue
+    #     if not isinstance(s, dict):
+    #         continue
 
-        if "segmentation" in s and isinstance(s["segmentation"], list):
-            coords = np.array(s["segmentation"][0]).reshape(-1, 2)
-            poly = Polygon(coords)
-        elif "bbox" in s:
-            x, y, w, h = s["bbox"]
-            poly = Polygon([(x, y), (x+w, y), (x+w, y+h), (x, y+h)])
-        else:
-            continue
+    #     if "segmentation" in s and isinstance(s["segmentation"], list):
+    #         coords = np.array(s["segmentation"][0]).reshape(-1, 2)
+    #         poly = Polygon(coords)
+    #     elif "bbox" in s:
+    #         x, y, w, h = s["bbox"]
+    #         poly = Polygon([(x, y), (x+w, y), (x+w, y+h), (x, y+h)])
+    #     else:
+    #         continue
 
-        if poly.is_valid and poly.area > 0:
-            gt_polys.append(poly)
+    #     if poly.is_valid and poly.area > 0:
+    #         gt_polys.append(poly)
 
     # # --- Convert pixel polygons to world CRS ---
 
@@ -424,50 +428,69 @@ def validate_predictions_vs_tcd_segments(pred_geojson_path, tcd_example, iou_thr
     # gt = gpd.GeoDataFrame(geometry=gt_world, crs=tcd_example["crs"])
 
     # --- Convert COCO-style pixel polygons to world CRS ---
-    coco_anns = tcd_example.get("coco_annotations", [])
+    coco_annotations = tcd_example.get("coco_annotations", [])
 
-
-
-
-    if isinstance(coco_anns, str):
+    if isinstance(coco_annotations, str):
         try:
-            coco_anns = json.loads(coco_anns)
+            coco_annotations = json.loads(coco_annotations)
         except json.JSONDecodeError:
             raise ValueError("❌ 'coco_annotations' field is not valid JSON.")
-    if not isinstance(coco_anns, list) or not coco_anns:
+    if not isinstance(coco_annotations, list) or not coco_annotations:
         raise ValueError("❌ No valid 'coco_annotations' found in TCD example — cannot derive crowns.")
 
+    print(f"Annotations 1: {len(coco_annotations)} total")
     #  if this works, it feels inefficient to filter here after we've already pulled the coco_anns - update to do it sooner
+    # Update: not sure this is needed or actually doing anything - 52 before filter, still 52 after
     image_id = tcd_example.get("image_id")
     if image_id is not None:
-        coco_anns = [a for a in coco_anns if a.get("image_id") == image_id]
-        print(f"Filtered to {len(coco_anns)} annotations for image_id={image_id}")
+        coco_annotations = [a for a in coco_annotations if a.get("image_id") == image_id]
+        print(f"Filtered to {len(coco_annotations)} annotations for image_id={image_id}")
     else:
         print("⚠️ No image_id found; using all annotations.")
 
 
-        
-    # =============================================================
-    print(f"Annotations: {len(coco_anns)} total")
-    cats = [a.get("category_id") for a in coco_anns]
-    print(f"  Trees: {cats.count(1)}, Canopy: {cats.count(2)}")
+    #     #just to check...
+    # # =============================================================
+    # print(f"Annotations: {len(coco_annotations)} total")
+    # check_cats = [a.get("category_id") for a in coco_annotations]
+    # print(f"  Canopy: {check_cats.count(1)}, Trees: {check_cats.count(2)}")
 
-    for i, a in enumerate(coco_anns[:3]):
-        print(f"Ann {i}: seg count {len(a.get('segmentation', []))}, first seg len={len(a['segmentation'][0]) if a['segmentation'] else 0}")
+    # for i, a in enumerate(coco_annotations[:3]):
+    #     print(f"Ann {i}: seg count {len(a.get('segmentation', []))}, first seg len={len(a['segmentation'][0]) if a['segmentation'] else 0}")
 
-        # =============================================================
+    #     # =============================================================
 
     gt_polys = []
     gt_cats = []
-    for ann in coco_anns:
+    for ann in coco_annotations:
         segs = ann.get("segmentation", [])
         if not segs or not isinstance(segs[0], list):
             continue
         coords = np.array(segs[0]).reshape(-1, 2)
         poly = Polygon(coords)
+        if not poly.is_valid:
+            poly = make_valid(poly) if hasattr(make_valid, "__call__") else poly.buffer(0)
         if poly.is_valid and poly.area > 0:
+            # print(f"Ann {ann.get('id')}: {ann.get('category_id')}")
             gt_polys.append(poly)
             gt_cats.append(ann.get("category_id", 1))
+        else:
+            print(f"Ann {ann.get('id')}: Invalid polygon")
+            print(f"  Area: {poly.area}")
+            print(f"  Is valid: {poly.is_valid}")
+            print(f"  Is empty: {poly.is_empty}")
+            print(f"  Coords: {coords}")
+            print(f"  Segs: {segs}")
+            print(f"  Segs[0]: {segs[0]}")
+            print(f"  Segs[0][0]: {segs[0][0]}")
+            print(f"  Segs[0][1]: {segs[0][1]}")
+
+        # print(f"Segs length: {len(segs)}")
+        # if len(segs) > 1:
+        #     print("WOAH")
+
+    # This print is "GT Cats [] - Canopy: 3, Trees: 48", but coco_annotations has 52 entries - Help!
+    print(f" GT Cats [] - Canopy: {gt_cats.count(1)}, Trees: {gt_cats.count(2)}")
 
     # Use image georeferencing transform to map pixel → world
     width, height = tcd_example["width"], tcd_example["height"]
@@ -534,7 +557,7 @@ def validate_predictions_vs_tcd_segments(pred_geojson_path, tcd_example, iou_thr
     print(gt.geometry.iloc[0].bounds)
     print(pred.geometry.iloc[0].bounds)
 
-    return metrics, pred, gt, scores, coco_anns
+    return metrics, pred, gt, scores, coco_annotations
 
 
 def visualize_validation_results(pred, gt, ious, coco_anns=None, iou_thresh=0.5,
@@ -581,7 +604,7 @@ def visualize_validation_results(pred, gt, ious, coco_anns=None, iou_thresh=0.5,
     for i, p in enumerate(pred.geometry):
         if not p.is_valid or p.is_empty:
             continue
-        color = "#00FFC6" if i < len(ious) and ious[i] >= iou_thresh else "#FF8800"  # teal / orange
+        color = "#00F0FF" if i < len(ious) and ious[i] >= iou_thresh else "#FF8800"  # teal / orange
         ax.plot(*p.exterior.xy, color=color, linewidth=1.2, alpha=0.9)
 
     # === 5. Draw ground-truth crowns & canopy ===
@@ -592,19 +615,36 @@ def visualize_validation_results(pred, gt, ious, coco_anns=None, iou_thresh=0.5,
         cat = None
         if coco_anns and idx < len(coco_anns):
             cat = coco_anns[idx].get("category_id", 1)
-        color = "#C266FF" if cat == 1 else "#66CCFF"  # purple vs light-blue
-        x, y = g.exterior.xy
-        ax.fill(x, y, facecolor=color, edgecolor=color, linewidth=0.8, alpha=0.25)
-        ax.plot(x, y, color=color, linewidth=0.8, alpha=0.8)
+        color = "#C266FF" if cat == 1 else "#0a20ad"  # purple vs dark-blue
+        if isinstance(g, Polygon):
+            geoms = [g]
+        elif isinstance(g, MultiPolygon):
+            geoms = list(g.geoms)
+        elif isinstance(g, GeometryCollection):
+            geoms = [geom for geom in g.geoms if isinstance(geom, (Polygon, MultiPolygon))]
+        else:
+            geoms = []
+
+        for geom in geoms:
+            if isinstance(geom, Polygon):
+                x, y = geom.exterior.xy
+                ax.fill(x, y, facecolor=color, edgecolor=color, linewidth=0.8, alpha=0.25)
+                ax.plot(x, y, color=color, linewidth=0.8, alpha=0.9)
+            elif isinstance(geom, MultiPolygon):
+                for sub in geom.geoms:
+                    x, y = sub.exterior.xy
+                    ax.fill(x, y, facecolor=color, edgecolor=color, linewidth=0.8, alpha=0.25)
+                    ax.plot(x, y, color=color, linewidth=0.8, alpha=0.9)
 
     # === 6. Legend ===
     import matplotlib.patches as mpatches
     legend_elems = [
-        mpatches.Patch(color="#00FFC6", label="True Positive (IoU ≥ threshold)"),
+        mpatches.Patch(color="#00F0FF", label="True Positive (IoU ≥ threshold)"),
         mpatches.Patch(color="#FF8800", label="False Positive (IoU < threshold)"),
-        mpatches.Patch(color="#C266FF", label="Ground Truth — Tree"),
-        mpatches.Patch(color="#66CCFF", label="Ground Truth — Canopy")
+        mpatches.Patch(color="#C266FF", label="Ground Truth — Canopy"),
+        mpatches.Patch(color="#0a20ad", label="Ground Truth — Tree")
     ]
+
     ax.legend(handles=legend_elems, loc="lower right", frameon=True, fontsize=8)
 
     ax.set_xlabel("Easting")
@@ -614,6 +654,118 @@ def visualize_validation_results(pred, gt, ious, coco_anns=None, iou_thresh=0.5,
     plt.close(fig)
 
     print(f"🖼️  Saved validation overlay → {out_path}")
+
+    # === 7. Also save pure Ground Truth visualization for comparison ===
+
+    fig_gt, ax_gt = plt.subplots(figsize=(8, 8))
+    ax_gt.set_title(f"TCD Ground Truth (image_id={image_id})")
+    ax_gt.set_aspect("equal")
+
+    if img is not None:
+        ax_gt.imshow(img, extent=extent, origin="upper")
+
+    for idx, g in enumerate(gt.geometry):
+        if g.is_empty:
+            continue
+
+        # Category colouring
+        cat = None
+        if coco_anns and idx < len(coco_anns):
+            cat = coco_anns[idx].get("category_id", 1)
+        color = "#C266FF" if cat == 1 else "#0a20ad"  # purple=canopy, blue=tree
+
+        # Handle all geometry types safely
+        if isinstance(g, Polygon):
+            geoms = [g]
+        elif isinstance(g, MultiPolygon):
+            geoms = list(g.geoms)
+        elif isinstance(g, GeometryCollection):
+            geoms = [geom for geom in g.geoms if isinstance(geom, (Polygon, MultiPolygon))]
+        else:
+            geoms = []
+
+        for geom in geoms:
+            if isinstance(geom, Polygon):
+                x, y = geom.exterior.xy
+                ax_gt.fill(x, y, facecolor=color, edgecolor=color, linewidth=0.8, alpha=0.25)
+                ax_gt.plot(x, y, color=color, linewidth=0.8, alpha=0.9)
+            elif isinstance(geom, MultiPolygon):
+                for sub in geom.geoms:
+                    x, y = sub.exterior.xy
+                    ax_gt.fill(x, y, facecolor=color, edgecolor=color, linewidth=0.8, alpha=0.25)
+                    ax_gt.plot(x, y, color=color, linewidth=0.8, alpha=0.9)
+
+    ax_gt.set_xlabel("Easting")
+    ax_gt.set_ylabel("Northing")
+
+    out_gt_path = out_path.with_name(out_path.stem + "_groundtruth.png")
+    plt.tight_layout()
+    plt.savefig(out_gt_path, dpi=250)
+    plt.close(fig_gt)
+
+    print(f"🗺️  Saved pure ground-truth overlay → {out_gt_path}")
+# ======================
+
+    # fig_gt, ax_gt = plt.subplots(figsize=(8, 8))
+    # ax_gt.set_title(f"TCD Ground Truth (image_id={image_id})")
+    # ax_gt.set_aspect("equal")
+
+    # if img is not None:
+    #     ax_gt.imshow(img, extent=extent, origin="upper")
+
+    # for idx, g in enumerate(gt.geometry):
+    #     if not g.is_valid or g.is_empty:
+    #         continue
+    #     cat = None
+    #     if coco_anns and idx < len(coco_anns):
+    #         cat = coco_anns[idx].get("category_id", 1)
+    #     color = "#C266FF" if cat == 1 else "#0a20ad"  # purple=tree, blue=canopy
+    #     x, y = g.exterior.xy
+    #     ax_gt.fill(x, y, facecolor=color, edgecolor=color, linewidth=0.8, alpha=0.25)
+    #     ax_gt.plot(x, y, color=color, linewidth=0.8, alpha=0.9)
+
+    # ax_gt.set_xlabel("Easting")
+    # ax_gt.set_ylabel("Northing")
+
+    # out_gt_path = out_path.with_name(out_path.stem + "_groundtruth.png")
+    # plt.tight_layout()
+    # plt.savefig(out_gt_path, dpi=250)
+    # plt.close(fig_gt)
+
+    # print(f"🗺️  Saved pure ground-truth overlay → {out_gt_path}")
+
+
+
+    # for idx, g in enumerate(gt.geometry):
+    #     if g.is_empty:
+    #         continue
+
+    #     # Match color by category (1 = tree, 2 = canopy)
+    #     cat = None
+    #     if coco_anns and idx < len(coco_anns):
+    #         cat = coco_anns[idx].get("category_id", 1)
+    #     color = "#C266FF" if cat == 1 else "#0a20ad"  # purple vs dark-blue
+
+    #     # --- Handle all geometry types safely ---
+    #     if isinstance(g, Polygon):
+    #         geoms = [g]
+    #     elif isinstance(g, MultiPolygon):
+    #         geoms = list(g.geoms)
+    #     elif isinstance(g, GeometryCollection):
+    #         geoms = [geom for geom in g.geoms if isinstance(geom, (Polygon, MultiPolygon))]
+    #     else:
+    #         geoms = []
+
+    #     for geom in geoms:
+    #         if isinstance(geom, Polygon):
+    #             xs, ys = geom.exterior.xy
+    #             ax.fill(xs, ys, facecolor=color, edgecolor=color, linewidth=0.8, alpha=0.25)
+    #             ax.plot(xs, ys, color=color, linewidth=0.8, alpha=0.8)
+    #         elif isinstance(geom, MultiPolygon):
+    #             for sub in geom.geoms:
+    #                 xs, ys = sub.exterior.xy
+    #                 ax.fill(xs, ys, facecolor=color, edgecolor=color, linewidth=0.8, alpha=0.25)
+    #                 ax.plot(xs, ys, color=color, linewidth=0.8, alpha=0.8)
 
 
 
