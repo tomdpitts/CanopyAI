@@ -54,6 +54,7 @@ from shapely.affinity import affine_transform
 
 from shapely.validation import make_valid
 from shapely.geometry import Polygon, MultiPolygon, GeometryCollection
+from shapely.strtree import STRtree
 
 
 # --------------------------------------------------
@@ -374,7 +375,7 @@ def has_geodata(tif_path: str | Path) -> bool:
 
 
 
-def validate_predictions_vs_tcd_segments(pred_geojson_path, tcd_example, iou_thresh=0.5, score_thresh=0.8):
+def validate_predictions_vs_tcd_segments(pred_geojson_path, tcd_example, iou_thresh_tree=0.5, iop_thresh_canopy=0.7, score_thresh=0.8):
     """Validate Detectree2 predictions against TCD 'segments' (bbox/segmentation polygons)."""
     print("📂 Loading Detectree2 predictions ...")
     pred = gpd.read_file(pred_geojson_path)
@@ -386,46 +387,6 @@ def validate_predictions_vs_tcd_segments(pred_geojson_path, tcd_example, iou_thr
         pred = pred[pred["score"] >= score_thresh].copy()
         print(f"  → Filtered {before - len(pred)} low-confidence predictions (score < {score_thresh})")
 
-    # Parse and normalize ground-truth segments
-    segs = tcd_example.get("segments")
-    if not segs:
-        raise ValueError("❌ No 'segments' found in TCD example.")
-
-    if isinstance(segs, str):  # JSON string → list
-        segs = json.loads(segs)
-    if not isinstance(segs, list):
-        raise ValueError("❌ 'segments' field not in expected list format.")
-
-    # gt_polys = []
-    # for s in segs:
-    #     if isinstance(s, str):
-    #         try:
-    #             s = json.loads(s)
-    #         except json.JSONDecodeError:
-    #             continue
-    #     if not isinstance(s, dict):
-    #         continue
-
-    #     if "segmentation" in s and isinstance(s["segmentation"], list):
-    #         coords = np.array(s["segmentation"][0]).reshape(-1, 2)
-    #         poly = Polygon(coords)
-    #     elif "bbox" in s:
-    #         x, y, w, h = s["bbox"]
-    #         poly = Polygon([(x, y), (x+w, y), (x+w, y+h), (x, y+h)])
-    #     else:
-    #         continue
-
-    #     if poly.is_valid and poly.area > 0:
-    #         gt_polys.append(poly)
-
-    # # --- Convert pixel polygons to world CRS ---
-
-    # bounds = tcd_example["bounds"]
-    # width, height = tcd_example["width"], tcd_example["height"]
-    # transform = from_bounds(*bounds, width=width, height=height)
-
-    # gt_world = [pixel_to_world(p, transform) for p in gt_polys if p.is_valid]
-    # gt = gpd.GeoDataFrame(geometry=gt_world, crs=tcd_example["crs"])
 
     # --- Convert COCO-style pixel polygons to world CRS ---
     coco_annotations = tcd_example.get("coco_annotations", [])
@@ -437,28 +398,6 @@ def validate_predictions_vs_tcd_segments(pred_geojson_path, tcd_example, iou_thr
             raise ValueError("❌ 'coco_annotations' field is not valid JSON.")
     if not isinstance(coco_annotations, list) or not coco_annotations:
         raise ValueError("❌ No valid 'coco_annotations' found in TCD example — cannot derive crowns.")
-
-    print(f"Annotations 1: {len(coco_annotations)} total")
-    #  if this works, it feels inefficient to filter here after we've already pulled the coco_anns - update to do it sooner
-    # Update: not sure this is needed or actually doing anything - 52 before filter, still 52 after
-    image_id = tcd_example.get("image_id")
-    if image_id is not None:
-        coco_annotations = [a for a in coco_annotations if a.get("image_id") == image_id]
-        print(f"Filtered to {len(coco_annotations)} annotations for image_id={image_id}")
-    else:
-        print("⚠️ No image_id found; using all annotations.")
-
-
-    #     #just to check...
-    # # =============================================================
-    # print(f"Annotations: {len(coco_annotations)} total")
-    # check_cats = [a.get("category_id") for a in coco_annotations]
-    # print(f"  Canopy: {check_cats.count(1)}, Trees: {check_cats.count(2)}")
-
-    # for i, a in enumerate(coco_annotations[:3]):
-    #     print(f"Ann {i}: seg count {len(a.get('segmentation', []))}, first seg len={len(a['segmentation'][0]) if a['segmentation'] else 0}")
-
-    #     # =============================================================
 
     gt_polys = []
     gt_cats = []
@@ -485,10 +424,6 @@ def validate_predictions_vs_tcd_segments(pred_geojson_path, tcd_example, iou_thr
             print(f"  Segs[0][0]: {segs[0][0]}")
             print(f"  Segs[0][1]: {segs[0][1]}")
 
-        # print(f"Segs length: {len(segs)}")
-        # if len(segs) > 1:
-        #     print("WOAH")
-
     # This print is "GT Cats [] - Canopy: 3, Trees: 48", but coco_annotations has 52 entries - Help!
     print(f" GT Cats [] - Canopy: {gt_cats.count(1)}, Trees: {gt_cats.count(2)}")
 
@@ -497,18 +432,13 @@ def validate_predictions_vs_tcd_segments(pred_geojson_path, tcd_example, iou_thr
     bounds = tcd_example["bounds"]
     transform = from_bounds(*bounds, width=width, height=height)
 
-    # gt_world = [pixel_to_world(p, transform) for p in gt_polys if p.is_valid]
-    # gt = gpd.GeoDataFrame(geometry=gt_world, crs=tcd_example["crs"])
-
     gt_world = [pixel_to_world(p, transform) for p in gt_polys if p.is_valid]
     gt = gpd.GeoDataFrame({"geometry": gt_world, "category": gt_cats}, crs=tcd_example["crs"])
 
     print(f"  → {len(gt)} ground-truth polygons (from coco_annotations)")
 
-    # gt = gpd.GeoDataFrame(geometry=gt_polys, crs=tcd_example.get("crs", "EPSG:3395"))
-    print(f"  → {len(gt)} ground-truth polygons")
-
     if pred.crs != gt.crs:
+        print(f"Aligning CRS: {pred.crs} → {gt.crs}")
         pred = pred.to_crs(gt.crs)
 
     # IoU computation
@@ -521,43 +451,74 @@ def validate_predictions_vs_tcd_segments(pred_geojson_path, tcd_example, iou_thr
         denom = a.area
         return inter / denom if denom > 0 else 0.0
 
-    scores = []
+    scores_trees = []
+    scores_canopy = []
+
+    # Performance improvement with geopandas R-tree - only check nearby polygons
+    gt_tree = STRtree(gt.geometry)
+    geom_to_cat = dict(zip(gt.geometry, gt["category"]))  # map geom→category
+
     for p in pred.geometry:
         if not p.is_valid or p.is_empty:
             continue
-        best_score = 0.0
-        for g, cat in zip(gt.geometry, gt["category"]):
-            score = iou(p, g) if cat == 1 else iop(p, g)
-            if score > best_score:
-                best_score = score
-        scores.append(best_score)
+
+        best_score_tree = 0.0
+        best_score_canopy = 0.0
+
+        # Only compare to nearby candidates from STRtree
+        candidates = gt_tree.query(p)
+        for g in candidates:
+            cat = geom_to_cat[g]
+            score = iop(p, g) if cat == 1 else iou(p, g)
+
+            if cat == 1:  # canopy
+                if score > best_score_canopy:
+                    best_score_canopy = score
+            elif cat == 2:  # tree
+                if score > best_score_tree:
+                    best_score_tree = score
+
+        if best_score_tree > 0:
+            scores_trees.append(best_score_tree)
+        if best_score_canopy > 0:
+            scores_canopy.append(best_score_canopy)
+
+    # --- Compute category-wise metrics ---
+    def compute_metrics(scores, thresh, n_pred, n_gt):
+        n_tp = sum(s >= thresh for s in scores)
+        mean_score = np.mean(scores) if scores else 0
+        return {
+            "precision": n_tp / n_pred if n_pred else 0,
+            "recall": n_tp / n_gt if n_gt else 0,
+            "mean_overlap": mean_score,
+            "n_tp": n_tp,
+        }
 
     n_pred, n_gt = len(pred), len(gt)
-    n_tp = sum(s >= iou_thresh for s in scores)
-    mean_score = np.mean(scores) if scores else 0
+    metrics_trees = compute_metrics(scores_trees, iou_thresh_tree, n_pred, gt["category"].eq(2).sum())
+    metrics_canopy = compute_metrics(scores_canopy, iop_thresh_canopy, n_pred, gt["category"].eq(1).sum())
 
-    metrics = {
-        "precision": n_tp / n_pred if n_pred else 0,
-        "recall": n_tp / n_gt if n_gt else 0,
-        "mean_overlap": mean_score,
+    # --- Combine overall summary ---
+    metrics_all = {
+        "trees": metrics_trees,
+        "canopy": metrics_canopy,
         "n_pred": n_pred,
-        "n_gt": n_gt,
-        "n_tp": n_tp,
+        "n_gt_total": n_gt,
     }
 
-    print("\n📊 Validation Results (IoU for trees, IoP for canopy):")
-    for k, v in metrics.items():
-        print(f"  {k:12s}: {v:.3f}" if isinstance(v, float) else f"  {k:12s}: {v}")
+    print("\n📊 Validation Results:")
+    print("  🌳 Trees (IoU):")
+    for k, v in metrics_trees.items():
+        print(f"    {k:12s}: {v:.3f}" if isinstance(v, float) else f"    {k:12s}: {v}")
 
-    print("GT CRS:", tcd_example.get("crs"))
-    print("Pred CRS:", pred.crs)
-    print("GT number:", len(gt_polys))
-    print("Pred number:", len(pred))
+    print("  🌿 Canopy (IoP):")
+    for k, v in metrics_canopy.items():
+        print(f"    {k:12s}: {v:.3f}" if isinstance(v, float) else f"    {k:12s}: {v}")
 
-    print(gt.geometry.iloc[0].bounds)
-    print(pred.geometry.iloc[0].bounds)
+    print(f"\n  Total predictions: {n_pred}")
+    print(f"  Total GT polygons: {n_gt} (Trees: {gt['category'].eq(2).sum()}, Canopy: {gt['category'].eq(1).sum()})")
 
-    return metrics, pred, gt, scores, coco_annotations
+    return metrics_all, pred, gt, (scores_trees, scores_canopy), coco_annotations
 
 
 def visualize_validation_results(pred, gt, ious, coco_anns=None, iou_thresh=0.5,
