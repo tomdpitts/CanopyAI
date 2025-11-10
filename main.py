@@ -177,7 +177,7 @@ def main():
     print("✅ Inference complete.")
 
     # === 7b. Filter raw predictions before projection ===
-    filter_raw_predictions(Path(preds_path), score_thresh=0.8, overwrite=True)
+    filter_raw_predictions(Path(preds_path), score_thresh=0.6, overwrite=True)
 
     # === 8. Convert predictions to GeoJSON ===
     print("\n🗺️  Projecting predictions to GeoJSON ...")

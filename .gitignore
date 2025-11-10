@@ -2,3 +2,5 @@
 230103_randresize_full.pth
 data2/
 data/tcd/overlays_validation/*
+data/tcd/tiles_pred/predictions/*
+data/tcd/tiles_pred/predictions_geo/*
