@@ -1,6 +1,9 @@
 .venv312
 230103_randresize_full.pth
 data2/
+data/tcd/rgb/*
+data/tcd/overlays/*
 data/tcd/overlays_validation/*
+data/tcd/tiles_pred/*.tif
 data/tcd/tiles_pred/predictions/*
 data/tcd/tiles_pred/predictions_geo/*
