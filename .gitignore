@@ -7,5 +7,6 @@ data/tcd/raw/*
 data/tcd/overlays/*
 data/tcd/overlays_validation/*
 data/tcd/tiles_pred/*.tif
+data/tcd/tiles_pred/*.png
 data/tcd/tiles_pred/predictions/*
 data/tcd/tiles_pred/predictions_geo/*
