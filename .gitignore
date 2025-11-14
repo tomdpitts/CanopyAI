@@ -1,7 +1,9 @@
 .venv312
+.vscode
 230103_randresize_full.pth
 data2/
 data/tcd/rgb/*
+data/tcd/raw/*
 data/tcd/overlays/*
 data/tcd/overlays_validation/*
 data/tcd/tiles_pred/*.tif

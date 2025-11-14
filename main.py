@@ -58,8 +58,8 @@ from shapely.strtree import STRtree
 
 
 # Key Hyperparameters
-max_images = 10
-filter_threshold = 0.8
+max_images = 4
+filter_threshold = 0.6
 
 
 # --------------------------------------------------
@@ -121,7 +121,9 @@ def main():
     site_path = home / "dphil" / "detectree2" / "data" / site_name
 
     # === 1b. Download multiple tiles ===
-    tiles_info = download_tcd_tiles(site_path / "rgb", max_images=max_images)
+    tiles_info = download_tcd_tiles(site_path / "raw", max_images=max_images)
+
+    # tiles_info = test_crop()  # For testing with local crop
 
     # === 2. Create output/working directories ===
     pred_tiles_path = ensure_dir(site_path / "tiles_pred")
@@ -149,7 +151,7 @@ def main():
         print(f"\n================ Processing {image_id} ================")
 
         tile_dir = Path(pred_tiles_path)
-        single_tile_path = tile_dir / f"{img_path.stem}_tile.tif"
+        single_tile_path = tile_dir / f"{img_path.stem}_run.tif"
         shutil.copy(img_path, single_tile_path)
         print(f"📎 Copied source → {single_tile_path}")
 
@@ -163,12 +165,13 @@ def main():
         project_to_geojson(pred_tiles_path, preds_path, preds_geo_path)
         print("✅ GeoJSON projection complete.")
 
-        tile_name = f"{img_path.stem}_tile"
+        tile_name = f"{img_path.stem}_run"
 
         visualize_saved_prediction_with_masks(
             Path(pred_tiles_path) / f"{tile_name}.tif",
             Path(preds_path) / f"prediction_{tile_name}.json",
-            Path(overlays_path) / f"{tile_name}_overlay.png"
+            Path(overlays_path),
+            image_id
         )
 
         geojson_path = Path(preds_geo_path) / f"Prediction_{tile_name}.geojson"
@@ -351,65 +354,106 @@ def filter_raw_predictions(pred_dir: Path, score_thresh: float = 0.8, overwrite=
     print(f"✅ Filtering complete — overwrote {len(json_files)} files at ≥ {score_thresh}.")
 
 
-def visualize_saved_prediction_with_masks(img_path, pred_json_path, out_path):
+def visualize_saved_prediction_with_masks(img_path, pred_json_path, out_dir, image_id=None):
+    """
+    Visualize Detectree2 predictions from JSON over the original RGB image.
+    Focuses on segmentation masks rather than bounding boxes.
+    Automatically names the output file using the image_id and tile index.
+    """
+
+    import re
+    import torch
+    import numpy as np
+    import cv2
+    import json
+    from detectron2.structures import Boxes, Instances
+    from detectron2.utils.visualizer import Visualizer
+    from pycocotools import mask as mask_utils
+    from pathlib import Path
+
+    # --- Load image ---
     img = cv2.imread(str(img_path))
     if img is None:
-        raise FileNotFoundError(f"Could not read {img_path}")
+        raise FileNotFoundError(f"❌ Could not read {img_path}")
 
+    H, W = img.shape[:2]
+
+    # --- Load predictions ---
     with open(pred_json_path) as f:
         data = json.load(f)
 
-    # detections = [d for d in data if d.get("score", 0) >= score_thresh]
-    # if len(detections) == 0:
-    #     print(f"⚠️ No detections above threshold ({score_thresh}) in {pred_json_path}")
-    #     return
-
-    # --- Boxes ---
-    boxes = [d["bbox"] for d in data if "bbox" in d]
-    if not boxes:
-        print(f"⚠️ No bounding boxes found in {pred_json_path}")
+    if not data:
+        print(f"⚠️ No predictions found in {pred_json_path}")
         return
 
-    boxes = torch.tensor(boxes, dtype=torch.float32)
-    if boxes.ndim == 1:
-        boxes = boxes.unsqueeze(0)  # shape (1, 4)
-
-    boxes[:, 2:] += boxes[:, :2]
-    print(f"Loaded {len(boxes)} boxes with shape {boxes.shape}")
-
-    # --- Masks (decode directly from compressed RLE) ---
+    # --- Decode segmentation masks (supports compressed + uncompressed RLE) ---
     masks = []
     for d in data:
         seg = d.get("segmentation")
-        if seg and "counts" in seg:
-            m = mask_utils.decode(seg)  # ✅ directly decode
+        if not seg:
+            masks.append(np.zeros((H, W), dtype=np.uint8))
+            continue
+
+        try:
+            # Handle compressed RLE (string) or uncompressed (list)
+            if isinstance(seg, dict) and "counts" in seg:
+                if isinstance(seg["counts"], list):
+                    # Convert uncompressed → compressed RLE first
+                    seg = mask_utils.frPyObjects(seg, *seg["size"])
+                m = mask_utils.decode(seg)
+            else:
+                # Segmentation not RLE; fallback blank
+                m = np.zeros((H, W), dtype=np.uint8)
+
             if m.ndim == 3:
-                m = np.any(m, axis=2)  # collapse if multi-channel
+                m = np.any(m, axis=2)
             masks.append(m)
-        else:
-            masks.append(np.zeros((img.shape[0], img.shape[1]), dtype=np.uint8))
+        except Exception as e:
+            print(f"⚠️ Failed to decode RLE segmentation: {e}")
+            masks.append(np.zeros((H, W), dtype=np.uint8))
+
+    if not masks:
+        print(f"⚠️ No valid masks decoded for {pred_json_path}")
+        return
+
     masks = torch.as_tensor(np.stack(masks))  # [N, H, W]
 
-    # --- Instances ---
-    scores = torch.tensor([d["score"] for d in data])
+    # --- Dummy boxes (since we mainly care about masks) ---
+    boxes = torch.tensor([[0, 0, W, H]], dtype=torch.float32).repeat(len(masks), 1)
+
+    # --- Scores / Classes ---
+    scores = torch.tensor([d.get("score", 0) for d in data])
     classes = torch.tensor([d.get("category_id", 0) for d in data])
 
-    instances = Instances((img.shape[0], img.shape[1]))
+    # --- Build Detectron2 Instances ---
+    instances = Instances((H, W))
     instances.pred_boxes = Boxes(boxes)
     instances.scores = scores
     instances.pred_classes = classes
     instances.pred_masks = masks
 
-    # Custom labels ("Tree XX%")
+    # --- Labels for overlay ---
     labels = [f"Tree {s * 100:.0f}%" for s in instances.scores]
 
+    # --- Visualization ---
     vis = Visualizer(img[:, :, ::-1], scale=1.0)
     vis_out = vis.overlay_instances(
-        boxes=instances.pred_boxes,
         masks=instances.pred_masks,
         labels=labels
     )
 
+    # --- Construct output path ---
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    tile_index = re.search(r"tile_(\d+)", pred_json_path.name)
+    tile_str = f"tile_{tile_index.group(1)}" if tile_index else "tile"
+
+    if image_id is None:
+        image_id = "unknown"
+
+    out_path = out_dir / f"{tile_str}_tcd{image_id}.png"
+
+    # --- Write file ---
     cv2.imwrite(str(out_path), vis_out.get_image()[:, :, ::-1])
     print(f"✅ Saved overlay with masks → {out_path}")
 
@@ -856,12 +900,13 @@ def visualize_validation_results(pred, gt, ious, coco_anns=None,
     # === 1. Output path ===
     out_dir = Path(site_path) / "overlays_validation"
     out_dir.mkdir(parents=True, exist_ok=True)
-    parts = ["validation_overlay"]
-    if image_id:
-        parts.append(str(image_id))
+    path_constructor = ["validate"]
     if tile_name:
-        parts.append(tile_name)
-    out_path = out_dir / f"{'_'.join(parts)}.png"
+        path_constructor.append(tile_name)
+    if image_id:
+        path_constructor.append(f"tcd{image_id}")
+
+    out_path = out_dir / f"{'_'.join(path_constructor)}.png"
 
     # === 2. Load background image ===
     img, extent = None, None
