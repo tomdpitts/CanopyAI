@@ -37,11 +37,10 @@ import geopandas as gpd
 
 import requests
 
-import geopandas as gpd
 import numpy as np
 from shapely.geometry import Polygon, MultiPolygon
 
-import geopandas as gpd
+
 import numpy as np
 import json
 from shapely.geometry import Polygon
@@ -55,11 +54,11 @@ from shapely.affinity import affine_transform
 from shapely.validation import make_valid
 from shapely.geometry import Polygon, MultiPolygon, GeometryCollection
 from shapely.strtree import STRtree
-
+import pandas as pd
 
 # Key Hyperparameters
-max_images = 4
-filter_threshold = 0.6
+max_images = 30
+filter_threshold = 0.8
 
 
 # --------------------------------------------------
@@ -121,13 +120,15 @@ def main():
     site_path = home / "dphil" / "detectree2" / "data" / site_name
 
     # === 1b. Download multiple tiles ===
-    tiles_info = download_tcd_tiles(site_path / "raw", max_images=max_images)
-
+    tiles_info = download_tcd_tiles_streaming(site_path / "raw", max_images=max_images)
+    print(f"✅ Downloaded {len(tiles_info)} TCD tiles for processing.")
+    
+    
     # === 2. Create output/working directories ===
     pred_tiles_path = ensure_dir(site_path / "tiles_pred")
     preds_path = ensure_dir(Path(pred_tiles_path) / "predictions")
     preds_geo_path = ensure_dir(Path(pred_tiles_path) / "predictions_geo")
-    overlays_path = ensure_dir(site_path / "overlays")
+    # overlays_path = ensure_dir(site_path / "overlays")
 
     # === 3. Download pretrained model if missing ===
     model_path = Path(f"{model_name}.pth")
@@ -145,37 +146,87 @@ def main():
     print("✅ Predictor ready.")
 
     # === 5–12. Process each tile ===
-    for img_path, ann_path, example, image_id in tiles_info:
+    for img_path, ann_path, tile_info, image_id in tiles_info:
         print(f"\n================ Processing {image_id} ================")
+        print(f"Biome: {tile_info.get('biome_name', 'N/A')}")
 
-        tile_dir = Path(pred_tiles_path)
-        single_tile_path = tile_dir / f"{img_path.stem}_run.tif"
-        shutil.copy(img_path, single_tile_path)
-        print(f"📎 Copied source → {single_tile_path}")
+        # tile_dir = Path(pred_tiles_path)
+        # ------------------------------------------------------------
+        # 5. Tile orthomosaic into chips for inference
+        # ------------------------------------------------------------
+        print("\n🧩 Tiling image into smaller chips ...")
 
-        print("\n🔮 Running model inference ...")
-        predict_on_data(pred_tiles_path, predictor=predictor, save=True)
+        chip_dir = Path(pred_tiles_path) / f"{img_path.stem}_chips"
+        ensure_dir(chip_dir)
+
+        buffer = 10
+        tile_width = 40
+        tile_height = 40
+
+        try:
+            # Your Detectree2 tiler (no CRS loss if the input GeoTIFF is georeferenced)
+            tile_data(
+                str(img_path),
+                chip_dir,        # output directory
+                buffer,
+                tile_width,
+                tile_height,
+                dtype_bool=True  # Detectree2 expects this for mask chips
+            )
+            print("✅ Tiling complete.")
+        except AttributeError as e:
+            print(f"⚠️ Non-georeferenced image — skipping CRS: {e}")
+            
+        # If no tiles were created, just skip this image and continue.
+        chips = list(Path(chip_dir).glob("*.tif"))
+        if len(chips) == 0:
+            print(f"⚠️  Skipping {image_id} — no tiles produced (likely nodata or invalid raster).")
+            continue
+
+        # ------------------------------------------------------------
+        # 6. Run Detectron2 inference on chips
+        # ------------------------------------------------------------
+        print("\n🔮 Running model inference on tiled chips ...")
+        predict_on_data(chip_dir, predictor=predictor, save=True)
         print("✅ Inference complete.")
 
-        filter_raw_predictions(Path(preds_path), score_thresh=filter_threshold, overwrite=True)
+        # ------------------------------------------------------------
+        # 7. Filter raw Detectron2 predictions *inside chip folder*
+        # ------------------------------------------------------------
+        chip_pred_dir = chip_dir / "predictions"
+        filter_raw_predictions(chip_pred_dir, score_thresh=filter_threshold, overwrite=True)
 
-        print("\n🗺️  Projecting predictions to GeoJSON ...")
-        project_to_geojson(pred_tiles_path, preds_path, preds_geo_path)
+        # ------------------------------------------------------------
+        # 8. Reproject tiled predictions → GeoJSON in global CRS
+        # ------------------------------------------------------------
+        print("\n🗺️  Projecting tile predictions to GeoJSON ...")
+        chip_geo_dir = chip_dir / "predictions_geo"
+        ensure_dir(chip_geo_dir)
+
+        project_to_geojson(
+            tiles_path=chip_dir,
+            pred_fold=chip_pred_dir,
+            output_fold=chip_geo_dir
+        )
         print("✅ GeoJSON projection complete.")
 
-        tile_name = f"{img_path.stem}_run"
+        # ------------------------------------------------------------
+        # 9. Visualize & Validate on the *merged* predictions
+        # ------------------------------------------------------------
+        # Detectree2 produces one GeoJSON per tile — merge them for evaluation
+        merged_geojson = chip_geo_dir / f"{img_path.stem}_merged.geojson"
+        merge_tile_geojsons(chip_geo_dir, merged_geojson)
 
-        visualize_saved_prediction_with_masks(
-            Path(pred_tiles_path) / f"{tile_name}.tif",
-            Path(preds_path) / f"prediction_{tile_name}.json",
-            Path(overlays_path),
-            image_id
-        )
+        # visualize_saved_prediction_with_masks(
+        #     img_path,                     # original tile
+        #     merged_geojson,               # merged prediction mask JSON
+        #     overlays_path,
+        #     image_id
+        # )
 
-        geojson_path = Path(preds_geo_path) / f"Prediction_{tile_name}.geojson"
-        _, pred, gt, ious, coco_anns = clean_validate_predictions_vs_tcd_segments(
-            pred_geojson_path=geojson_path,
-            tcd_example=example
+        metrics_all, pred, gt, ious, coco_anns = clean_validate_predictions_vs_tcd_segments(
+            pred_geojson_path=merged_geojson,
+            tcd_example=tile_info
         )
 
         visualize_validation_results(
@@ -183,11 +234,24 @@ def main():
             coco_anns,
             site_path=site_path,
             rgb_path=img_path,
-            tile_name=tile_name,
+            tile_name=img_path.stem,
             image_id=image_id
         )
 
-    
+def merge_tile_geojsons(geo_dir: Path, out_file: Path):
+    import geopandas as gpd
+
+    geo_dir = Path(geo_dir)
+    files = sorted(geo_dir.glob("Prediction_*.geojson"))
+
+    if not files:
+        raise FileNotFoundError(f"No tile GeoJSONs found in {geo_dir}")
+
+    gdfs = [gpd.read_file(f) for f in files]
+    merged = gpd.GeoDataFrame(pd.concat(gdfs, ignore_index=True), crs=gdfs[0].crs)
+    merged.to_file(out_file, driver="GeoJSON")
+
+    print(f"🧩 Merged {len(files)} tile GeoJSONs → {out_file}")
 
 # CLI Args
 def parse_args():
@@ -215,21 +279,21 @@ def download_one_tcd_tile(save_dir: Path) -> tuple[Path, Path]:
     """
     print("📦 Loading TCD dataset metadata...")
     ds = load_dataset("restor/tcd", split="train")
-    example = ds[0]
-    image_id = example["image_id"]
-    print("Available keys:", list(example.keys()))
+    tile_info = ds[0]
+    image_id = tile_info["image_id"]
+    print("Available keys:", list(tile_info.keys()))
 
     save_dir.mkdir(parents=True, exist_ok=True)
     img_path = save_dir / "tcd_tile_0.tif"
     ann_path = save_dir / "tcd_tile_0_crowns.gpkg"
 
     # --- Image ---
-    img = np.array(example["image"])  # PIL → NumPy
+    img = np.array(tile_info["image"])  # PIL → NumPy
     height, width = img.shape[:2]
 
     # Extract CRS and bounds from metadata
-    crs = example.get("crs")
-    bounds = example.get("bounds")
+    crs = tile_info.get("crs")
+    bounds = tile_info.get("bounds")
     if crs is None or bounds is None:
         raise ValueError("❌ Dataset entry missing 'crs' or 'bounds' — cannot proceed without georef info.")
 
@@ -248,7 +312,7 @@ def download_one_tcd_tile(save_dir: Path) -> tuple[Path, Path]:
     print(f"🔢 Bounds: {bounds}")
 
     # --- Annotations ---
-    crown_url = example.get("annotation") or example.get("crowns_polygon")
+    crown_url = tile_info.get("annotation") or tile_info.get("crowns_polygon")
     if isinstance(crown_url, str) and crown_url.startswith("http"):
         print(f"🌿 Downloading crown polygons from {crown_url}")
         with requests.get(crown_url, stream=True) as r:
@@ -260,7 +324,7 @@ def download_one_tcd_tile(save_dir: Path) -> tuple[Path, Path]:
     else:
         print("⚠️ No valid annotation URL found; skipping crowns download.")
 
-    return img_path, ann_path, example, image_id
+    return img_path, ann_path, tile_info, image_id
 
 def download_tcd_tiles(save_dir: Path, max_images: int = 3):
     """
@@ -270,19 +334,22 @@ def download_tcd_tiles(save_dir: Path, max_images: int = 3):
     print("📦 Loading TCD dataset metadata...")
     ds = load_dataset("restor/tcd", split="train")
     save_dir.mkdir(parents=True, exist_ok=True)
+    
+    # ds_au = ds.filter(is_australia)
+
 
     all_entries = []
-    for i, example in enumerate(ds.select(range(max_images))):
-        image_id = example["image_id"]
+    for i, tile_info in enumerate(ds.select(range(max_images))):
+        image_id = tile_info["image_id"]
         print(f"📸 Downloading image {i}: {image_id}")
 
         img_path = save_dir / f"tcd_tile_{i}.tif"
         ann_path = save_dir / f"tcd_tile_{i}_crowns.gpkg"
 
-        img = np.array(example["image"])
+        img = np.array(tile_info["image"])
         height, width = img.shape[:2]
-        crs = example.get("crs")
-        bounds = example.get("bounds")
+        crs = tile_info.get("crs")
+        bounds = tile_info.get("bounds")
         if crs is None or bounds is None:
             print(f"⚠️ Skipping {image_id} — missing CRS/bounds.")
             continue
@@ -296,7 +363,7 @@ def download_tcd_tiles(save_dir: Path, max_images: int = 3):
             for b in range(3):
                 dst.write(img[:, :, b], b + 1)
 
-        crown_url = example.get("annotation") or example.get("crowns_polygon")
+        crown_url = tile_info.get("annotation") or tile_info.get("crowns_polygon")
         if isinstance(crown_url, str) and crown_url.startswith("http"):
             with requests.get(crown_url, stream=True) as r:
                 r.raise_for_status()
@@ -304,16 +371,128 @@ def download_tcd_tiles(save_dir: Path, max_images: int = 3):
                     for chunk in r.iter_content(chunk_size=8192):
                         f.write(chunk)
 
-        all_entries.append((img_path, ann_path, example, image_id))
+        all_entries.append((img_path, ann_path, tile_info, image_id))
         print(f"✅ Saved georeferenced tile → {img_path}")
 
     return all_entries
 
-def is_australia(example):
-    return (example["lat"] >= -44 and example["lat"] <= -10
-            and example["lon"] >= 112 and example["lon"] <= 154)
+def is_australia(x):
+    return (
+        -44 <= x["lat"] <= -10 and
+        112 <= x["lon"] <= 154
+    )
+aus_tiles = [
+1207, 4347, 4159, 4893, 4406, 2100, 1104, 3956, 2859, 3684, 5001, 3469,
+5012, 4660, 536, 4315, 4506, 3624, 4127, 4963, 423, 1703, 3016, 4643,
+922, 4221, 4955, 4909, 3219, 1671, 195, 4923, 4556, 4086, 1969, 3611,
+4336, 2581, 1033, 314, 2491, 4720, 4421, 5005, 4435, 2654, 62, 4593,
+5057, 1612, 1417, 1278, 2403, 2270, 367, 1339, 1117, 4507, 4040, 577,
+439, 2888, 4326, 1875, 760, 678, 3456, 4108, 1029, 2515, 4996, 876,
+4639, 4933, 2031, 750, 1248, 743, 2293, 3277, 3875, 1077
+]
 
-# ds_au = ds.filter(is_australia) # example usage
+def is_really_australia(x):
+    return x["image_id"] in aus_tiles
+
+rangeland = [
+    "West Sudanian savanna",
+    "East Sudanian savanna",
+    "Northern Congolian forest-savanna mosaic",
+    "Northern mixed grasslands",
+    "Central and Southern mixed grasslands",
+    "Pontic steppe",
+    "East European forest steppe",
+    "Snake-Columbia shrub steppe",
+    "Chilean matorral",
+    "Central Mexican matorral",
+    "Sechura desert",
+    "Sonoran desert",
+    "Gulf of Oman desert and semi-desert",
+    "Low Monte",
+    "Central Andean puna",
+    "Central Andean dry puna",
+    "Zambezian and Mopane woodlands"
+]
+
+def is_rangeland(x):
+    return x["biome_name"] in rangeland
+
+from pathlib import Path
+from datasets import load_dataset
+import requests
+
+def download_tcd_tiles_streaming(save_dir: Path, max_images: int = 3):
+    print("📦 Loading TCD dataset in streaming mode...")
+    ds = load_dataset("restor/tcd", split="train", streaming=True)
+
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    results = []
+    count = 0
+
+    for example in ds:
+        if not is_rangeland(example):
+            print("Nope!")
+            continue
+
+        # stop early
+        if count >= max_images:
+            break
+
+        image_id = example["image_id"]
+        print(f"📸 Downloading Rangeland tile {count}: {image_id}")
+
+        img_path = save_dir / f"tcd_tile_{count}.tif"
+        ann_path = save_dir / f"tcd_tile_{count}_crowns.gpkg"
+
+        # ------------------
+        # Save image (.tif)
+        # ------------------
+        img = np.array(example["image"])
+        h, w = img.shape[:2]
+        crs = example["crs"]
+        bounds = example["bounds"]
+
+        transform = from_bounds(*bounds, width=w, height=h)
+
+        with rasterio.open(
+            img_path, "w", driver="GTiff",
+            height=h, width=w, count=3,
+            dtype=img.dtype, crs=crs, transform=transform
+        ) as dst:
+            for b in range(3):
+                dst.write(img[:, :, b], b + 1)
+
+        # ------------------
+        # Download annotation
+        # ------------------
+        crown_url = example.get("annotation") or example.get("crowns_polygon")
+
+        # Case 1: Annotation is a URL
+        if isinstance(crown_url, str) and crown_url.startswith("http"):
+            with requests.get(crown_url, stream=True) as r:
+                r.raise_for_status()
+                with open(ann_path, "wb") as f:
+                    for chunk in r.iter_content(8192):
+                        f.write(chunk)
+
+        # Case 2: Annotation is an image (PIL)
+        elif hasattr(crown_url, "save"):
+            png_path = ann_path.with_suffix(".png")
+            crown_url.save(png_path)
+            print(f"🟦 Saved PNG mask annotation → {png_path}")
+
+        # Case 3: Something else — skip politely
+        else:
+            print(f"⚠️ Skipping annotation for tile {image_id}: unsupported type {type(crown_url)}")
+
+        results.append((img_path, ann_path, example, image_id))
+        print(f"✅ Saved Australian tile → {img_path}")
+
+        count += 1
+
+    return results
+
 
 def filter_raw_predictions(pred_dir: Path, score_thresh: float = 0.8, overwrite=True) -> None:
     """
