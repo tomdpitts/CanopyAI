@@ -1,7 +1,7 @@
 """
 utils.py — Shared logic for downloading TCD tiles with streaming.
 
-Used by both main.py (inference) and train.py (data preparation).
+Used by both infer.py (inference) and train.py (data preparation).
 """
 
 from pathlib import Path
@@ -9,31 +9,17 @@ import numpy as np
 import requests
 import rasterio
 from rasterio.transform import from_bounds
-from datasets import load_dataset
-from pathlib import Path
-from datasets import load_dataset
-import requests
 import json
-import numpy as np
 import geopandas as gpd
-import rasterio
 import rasterio.features
 from shapely.geometry import Polygon, MultiPolygon, GeometryCollection, shape
 from shapely.validation import make_valid
 from shapely.affinity import affine_transform
 from shapely.strtree import STRtree
 from pycocotools import mask as mask_utils
-from rasterio.transform import from_bounds
-
-import rasterio
-from rasterio.transform import from_bounds
-from shapely.affinity import affine_transform
-
-from shapely.validation import make_valid
-from shapely.geometry import Polygon, MultiPolygon, GeometryCollection
-from shapely.strtree import STRtree
 import matplotlib.pyplot as plt
-import json, cv2
+import cv2
+
 from detectree2.preprocessing.tiling import tile_data
 
 
@@ -103,6 +89,7 @@ def download_tcd_tiles_streaming(save_dir: Path, max_images: int = 3):
       save_dir / f"tcd_tile_{i}.tif"
       save_dir / f"tcd_tile_{i}_meta.json"
     """
+    from datasets import load_dataset
     print("📦 Loading TCD dataset in streaming mode...")
     ds = load_dataset("restor/tcd", split="train", streaming=True)
 

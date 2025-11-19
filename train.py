@@ -41,6 +41,9 @@ from utils import download_tcd_tiles_streaming
 from utils import coco_meta_to_geodf
 from utils import tile_all_tcd_tiles
 
+import torch.multiprocessing as mp
+mp.set_start_method("spawn", force=True)
+torch.set_num_threads(1)
 
 # ============================================================
 #   TRAIN DETECTREE2
@@ -76,6 +79,7 @@ def train_detectree2(tiles_root: Path, output_dir: Path, preset="tiny"):
 
     cfg.MODEL.DEVICE = "cpu"
     print("🧠 Using CPU backend")
+    cfg.DATALOADER.NUM_WORKERS = 0
 
     # --- Apply preset ---
     if preset == "tiny":
@@ -114,15 +118,15 @@ def main():
     raw_dir.mkdir(parents=True, exist_ok=True)
     tiles_root.mkdir(parents=True, exist_ok=True)
 
-    # Step 1: download or reuse tiles
-    if not args.already_downloaded:
-        print("🌐 Downloading via HF...")
-        download_tcd_tiles_streaming(raw_dir, max_images=3)
-    else:
-        print("⏭️ Using existing tiles in raw/")
+    # # Step 1: download or reuse tiles
+    # if not args.already_downloaded:
+    #     print("🌐 Downloading via HF...")
+    #     download_tcd_tiles_streaming(raw_dir, max_images=3)
+    # else:
+    #     print("⏭️ Using existing tiles in raw/")
 
     # Step 2: tile everything
-    tile_all_tcd_tiles(raw_dir, tiles_root)
+    # tile_all_tcd_tiles(raw_dir, tiles_root)
 
     # Step 3: train
     train_detectree2(tiles_root, output_dir, preset=args.preset)

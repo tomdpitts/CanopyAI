@@ -23,12 +23,10 @@ from detectron2.utils.visualizer import Visualizer
 import wget
 import cv2
 import argparse
-import numpy as np
 from detectron2.utils.visualizer import Visualizer
 from datasets import load_dataset
 import cv2
-import rasterio
-import requests
+
 import rasterio
 from rasterio.transform import from_bounds
 import pandas as pd
@@ -38,10 +36,12 @@ from utils import visualize_validation_results
 from utils import compute_final_metric
 from utils import filter_raw_predictions
 from utils import load_tcd_meta_for_tile
-
+import torch
+import torch.multiprocessing as mp
+mp.set_start_method("spawn", force=True)
 
 # Key Hyperparameters
-max_images = 2
+
 filter_threshold = 0.65
 
 
@@ -107,13 +107,13 @@ def main():
     site_path = home / "dphil" / "detectree2" / "data" / site_name
     raw_dir = site_path / "raw"
 
-    # === 1b. Download tiles ===
-    if not args.already_downloaded:
-        print("🌐 Downloading via HF...")
-        tiles_info = download_tcd_tiles_streaming(raw_dir, max_images=max_images)
-        print(f"✅ Downloaded {len(tiles_info)} TCD tiles for processing.")
-    else:
-        print("⏭️ Using existing tiles in raw/")
+    # # === 1b. Download tiles ===
+    # if not args.already_downloaded:
+    #     print("🌐 Downloading via HF...")
+    #     tiles_info = download_tcd_tiles_streaming(raw_dir, max_images=max_images)
+    #     print(f"✅ Downloaded {len(tiles_info)} TCD tiles for processing.")
+    # else:
+    #     print("⏭️ Using existing tiles in raw/")
     
     # === 2. Create output/working directories ===
     pred_tiles_path = ensure_dir(site_path / "tiles_pred")
@@ -124,9 +124,6 @@ def main():
         print(f"📦 Model not found locally — downloading from {url} ...")
         wget.download(url, out=str(model_path))
         print("\n✅ Model download complete.")
-
-
-
         
     # === 4. Initialize Detectron2 predictor ===
     print("\n⚙️  Initializing Detectron2 predictor ...")
@@ -143,11 +140,14 @@ def main():
     total_gt_canopy = 0
 
     # === 5–12. Process each tile ===
-    # for img_path, ann_path, image_info, image_id in tiles_info:
-        # print("ns")
-    
     raw_dir = Path("data/tcd/raw")
-
+    
+    if len(list(raw_dir.glob("tcd_tile_*.tif"))) == 0:
+        raise FileNotFoundError(
+            f"❌ No TCD tiles found in {raw_dir}.\n"
+            "Please run prepare_data.py first to download and tile the dataset."
+        )
+    
     for img_path in sorted(raw_dir.glob("tcd_tile_*.tif")):
         image_info = load_tcd_meta_for_tile(img_path)
         
@@ -322,113 +322,8 @@ def set_device(cfg):
     device = "cpu"
     cfg.MODEL.DEVICE = device
     print(f"🖥️ Using device: {device}")
-
-
-from rasterio.transform import from_bounds
-def download_one_tcd_tile(save_dir: Path) -> tuple[Path, Path]:
-    """
-    Download one orthomosaic (.tif) and crowns annotation (.gpkg) from restor/tcd,
-    and ensure the image is saved as a fully georeferenced GeoTIFF (with CRS & transform).
-    """
-    print("📦 Loading TCD dataset metadata...")
-    ds = load_dataset("restor/tcd", split="train")
-    tile_info = ds[0]
-    image_id = tile_info["image_id"]
-    print("Available keys:", list(tile_info.keys()))
-
-    save_dir.mkdir(parents=True, exist_ok=True)
-    img_path = save_dir / "tcd_tile_0.tif"
-    ann_path = save_dir / "tcd_tile_0_crowns.gpkg"
-
-    # --- Image ---
-    img = np.array(tile_info["image"])  # PIL → NumPy
-    height, width = img.shape[:2]
-
-    # Extract CRS and bounds from metadata
-    crs = tile_info.get("crs")
-    bounds = tile_info.get("bounds")
-    if crs is None or bounds is None:
-        raise ValueError("❌ Dataset entry missing 'crs' or 'bounds' — cannot proceed without georef info.")
-
-    transform = from_bounds(*bounds, width=width, height=height)
-
-    with rasterio.open(
-        img_path, "w", driver="GTiff",
-        height=height, width=width, count=3,
-        dtype=img.dtype, crs=crs, transform=transform
-    ) as dst:
-        for i in range(3):
-            dst.write(img[:, :, i], i + 1)
-
-    print(f"✅ Saved georeferenced tile → {img_path}")
-    print(f"📐 CRS: {crs}")
-    print(f"🔢 Bounds: {bounds}")
-
-    # --- Annotations ---
-    crown_url = tile_info.get("annotation") or tile_info.get("crowns_polygon")
-    if isinstance(crown_url, str) and crown_url.startswith("http"):
-        print(f"🌿 Downloading crown polygons from {crown_url}")
-        with requests.get(crown_url, stream=True) as r:
-            r.raise_for_status()
-            with open(ann_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    f.write(chunk)
-        print(f"✅ Saved annotations → {ann_path}")
-    else:
-        print("⚠️ No valid annotation URL found; skipping crowns download.")
-
-    return img_path, ann_path, tile_info, image_id
-
-def download_tcd_tiles(save_dir: Path, max_images: int = 3):
-    """
-    Download multiple orthomosaics (.tif) and crowns annotation (.gpkg) from restor/tcd.
-    Returns a list of tuples: (img_path, ann_path, example, image_id)
-    """
-    print("📦 Loading TCD dataset metadata...")
-    ds = load_dataset("restor/tcd", split="train")
-    save_dir.mkdir(parents=True, exist_ok=True)
-    
-    # ds_au = ds.filter(is_australia)
-
-
-    all_entries = []
-    for i, tile_info in enumerate(ds.select(range(max_images))):
-        image_id = tile_info["image_id"]
-        print(f"📸 Downloading image {i}: {image_id}")
-
-        img_path = save_dir / f"tcd_tile_{i}.tif"
-        ann_path = save_dir / f"tcd_tile_{i}_crowns.gpkg"
-
-        img = np.array(tile_info["image"])
-        height, width = img.shape[:2]
-        crs = tile_info.get("crs")
-        bounds = tile_info.get("bounds")
-        if crs is None or bounds is None:
-            print(f"⚠️ Skipping {image_id} — missing CRS/bounds.")
-            continue
-
-        transform = from_bounds(*bounds, width=width, height=height)
-        with rasterio.open(
-            img_path, "w", driver="GTiff",
-            height=height, width=width, count=3,
-            dtype=img.dtype, crs=crs, transform=transform
-        ) as dst:
-            for b in range(3):
-                dst.write(img[:, :, b], b + 1)
-
-        crown_url = tile_info.get("annotation") or tile_info.get("crowns_polygon")
-        if isinstance(crown_url, str) and crown_url.startswith("http"):
-            with requests.get(crown_url, stream=True) as r:
-                r.raise_for_status()
-                with open(ann_path, "wb") as f:
-                    for chunk in r.iter_content(chunk_size=8192):
-                        f.write(chunk)
-
-        all_entries.append((img_path, ann_path, tile_info, image_id))
-        print(f"✅ Saved georeferenced tile → {img_path}")
-
-    return all_entries
-
+    cfg.DATALOADER.NUM_WORKERS = 0 
+    torch.set_num_threads(1)
 
 
 def visualize_saved_prediction_with_masks(img_path, pred_json_path, out_dir, image_id=None):
@@ -533,9 +428,6 @@ def visualize_saved_prediction_with_masks(img_path, pred_json_path, out_dir, ima
     # --- Write file ---
     cv2.imwrite(str(out_path), vis_out.get_image()[:, :, ::-1])
     print(f"✅ Saved overlay with masks → {out_path}")
-
-
-
 
 
 # --------------------------------------------------
