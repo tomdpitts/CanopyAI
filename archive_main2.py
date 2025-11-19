@@ -56,6 +56,18 @@ from shapely.geometry import Polygon, MultiPolygon, GeometryCollection
 from shapely.strtree import STRtree
 import pandas as pd
 
+import json
+import numpy as np
+import geopandas as gpd
+import rasterio
+import rasterio.features
+from shapely.geometry import Polygon, MultiPolygon, GeometryCollection, shape
+from shapely.validation import make_valid
+from shapely.affinity import affine_transform
+from shapely.strtree import STRtree
+from pycocotools import mask as mask_utils
+from rasterio.transform import from_bounds
+
 # Key Hyperparameters
 max_images = 5
 filter_threshold = 0.8
@@ -126,8 +138,8 @@ def main():
     
     # === 2. Create output/working directories ===
     pred_tiles_path = ensure_dir(site_path / "tiles_pred")
-    # preds_path = ensure_dir(Path(pred_tiles_path) / "predictions")
-    # preds_geo_path = ensure_dir(Path(pred_tiles_path) / "predictions_geo")
+    preds_path = ensure_dir(Path(pred_tiles_path) / "predictions")
+    preds_geo_path = ensure_dir(Path(pred_tiles_path) / "predictions_geo")
     # overlays_path = ensure_dir(site_path / "overlays")
 
     # === 3. Download pretrained model if missing ===
@@ -144,20 +156,14 @@ def main():
     set_device(cfg)
     predictor = DefaultPredictor(cfg)
     print("✅ Predictor ready.")
-    
-    # Initialize accumulators
-    all_tree_scores = []
-    all_canopy_scores = []
-    total_pred = 0
-    total_gt_trees = 0
-    total_gt_canopy = 0
 
     # === 5–12. Process each tile ===
     for img_path, ann_path, tile_info, image_id in tiles_info:
         print(f"\n================ Processing {image_id} ================")
-        print(f"Biome: {tile_info.get('biome_name', 'N/A')}")
+        
+        biome_name = tile_info.get("biome_name", "N/A")
+        print(f"Biome: {biome_name}")
 
-        # tile_dir = Path(pred_tiles_path)
         # ------------------------------------------------------------
         # 5. Tile orthomosaic into chips for inference
         # ------------------------------------------------------------
@@ -231,53 +237,30 @@ def main():
         #     image_id
         # )
 
-        metrics_all, pred, gt, scores, coco_anns = clean_validate_predictions_vs_tcd_segments(
+        result = clean_validate_predictions_vs_tcd_segments(
             pred_geojson_path=merged_geojson,
-            tcd_example=tile_info
+            tcd_example=tile_info,
+            ann_path=ann_path
         )
+
+        if result is None:
+            print(f"⚠️ Skipping validation for tile {image_id} (no GT).")
+            continue
+
+        metrics_all, pred, gt, scores = result
         
         if metrics_all is None:
             print(f"⚠️ No GT for tile {image_id} — skipping.")
             continue
-        scores_trees, scores_canopy = scores
-        
-        total_pred += metrics_all["n_pred"]
-        total_gt_trees += metrics_all["n_gt_trees"]
-        total_gt_canopy += metrics_all["n_gt_canopy"]
-        
-        
 
-        # Extend raw overlap score lists
-        all_tree_scores.extend(scores_trees.tolist())
-        all_canopy_scores.extend(scores_canopy.tolist())
-        
         visualize_validation_results(
             pred, gt, scores,
-            coco_anns,
             site_path=site_path,
             rgb_path=img_path,
             tile_name=img_path.stem,
-            image_id=image_id
+            image_id=image_id,
+            biome_name=biome_name
         )
-        
-    final_tree = compute_final_metric(all_tree_scores, thresh=0.5,
-                                n_pred=total_pred, n_gt=total_gt_trees)
-
-    final_canopy = compute_final_metric(all_canopy_scores, thresh=0.7,
-                                    n_pred=total_pred, n_gt=total_gt_canopy)
-    
-    print_metrics("Trees (IoU)", final_tree)
-    print_metrics("Canopy (IoP)", final_canopy)  
-    
-
-def print_metrics(name, m):
-    print(f"\n📊 {name} metrics")
-    for k, v in m.items():
-        if isinstance(v, float):
-            print(f"  {k:12s}: {v:.4f}")
-        else:
-            print(f"  {k:12s}: {v}")
-
 
 def merge_tile_geojsons(geo_dir: Path, out_file: Path):
     import geopandas as gpd
@@ -467,6 +450,8 @@ arid_rangeland = [
     "West Sudanian savanna"
 ]
 
+# Add in total metrics summary for lot of images
+
 def is_rangeland(x):
     return x["biome_name"] in arid_rangeland
 
@@ -477,6 +462,16 @@ import requests
 def download_tcd_tiles_streaming(save_dir: Path, max_images: int = 3):
     print("📦 Loading TCD dataset in streaming mode...")
     ds = load_dataset("restor/tcd", split="train", streaming=True)
+    
+    parquet_dir = Path.home() / "dphil" / "restor" / "tcd" / "tcd_parquet" / "default" / "train"
+    # /Users/tompitts/dphil/restor/tcd/tcd_parquet/default/train
+    
+    # ds = load_dataset(
+    #     "parquet",
+    #     data_files=str(parquet_dir / "*.parquet"),
+    #     split="train"
+    # )
+
 
     save_dir.mkdir(parents=True, exist_ok=True)
 
@@ -692,84 +687,374 @@ def has_geodata(tif_path: str | Path) -> bool:
         has_crs = ds.crs is not None
         has_transform = ds.transform != rasterio.Affine.identity()
         return has_crs and has_transform
-    
 
-def compute_final_metric(scores, thresh, n_pred, n_gt):
-    scores = np.asarray(scores, dtype=float)
-    n_tp = int(np.sum(scores >= thresh))
-    precision = n_tp / n_pred if n_pred else 0.0
-    recall = n_tp / n_gt if n_gt else 0.0
-    f1 = 2 * (precision * recall) / (precision + recall + 1e-9)
-    mean_overlap = float(np.mean(scores)) if len(scores) else 0.0
 
-    return {
-        "precision": precision,
-        "recall": recall,
-        "f1": f1,
-        "mean_overlap": mean_overlap,
-        "n_tp": n_tp,
+
+def validate_predictions_vs_tcd_segments(pred_geojson_path, tcd_example, iou_thresh_tree=0.5, iop_thresh_canopy=0.7):
+    """Validate Detectree2 predictions against TCD 'segments' (bbox/segmentation polygons)."""
+    print("📂 Loading Detectree2 predictions ...")
+    pred = gpd.read_file(pred_geojson_path)
+    print(f"  → {len(pred)} predicted polygons")
+
+    # # Filter low-confidence predictions
+    # if "score" in pred.columns:
+    #     before = len(pred)
+    #     pred = pred[pred["score"] >= score_thresh].copy()
+    #     print(f"  → Filtered {before - len(pred)} low-confidence predictions (score < {score_thresh})")
+        
+    #     # ✅ Overwrite the GeoJSON file with only filtered predictions
+    #     pred.to_file(pred_geojson_path, driver="GeoJSON")
+    #     print(f"  ✅ Saved filtered predictions ({len(pred)}) back to {pred_geojson_path}")
+
+    # --- Convert COCO-style pixel polygons to world CRS ---
+    coco_annotations = tcd_example.get("coco_annotations", [])
+
+    if isinstance(coco_annotations, str):
+        try:
+            coco_annotations = json.loads(coco_annotations)
+        except json.JSONDecodeError:
+            raise ValueError("❌ 'coco_annotations' field is not valid JSON.")
+    if not isinstance(coco_annotations, list) or not coco_annotations:
+        raise ValueError("❌ No valid 'coco_annotations' found in TCD example — cannot derive crowns.")
+
+    gt_polys = []
+    gt_cats = []
+    for ann in coco_annotations:
+        segs = ann.get("segmentation", [])
+        # Handle both polygon and RLE segmentations
+        if not segs:
+            continue
+        if isinstance(segs, dict):
+            # RLE mask — skip, as we only support polygon-style annotations here
+            continue
+        if not isinstance(segs, list) or not isinstance(segs[0], list):
+            continue
+
+        coords = np.array(segs[0], dtype=float).reshape(-1, 2)
+        poly = Polygon(coords)
+        if not poly.is_valid:
+            poly = make_valid(poly) if hasattr(make_valid, "__call__") else poly.buffer(0)
+        if poly.is_valid and poly.area > 0:
+            # print(f"Ann {ann.get('id')}: {ann.get('category_id')}")
+            gt_polys.append(poly)
+            gt_cats.append(ann.get("category_id", 1))
+        else:
+            print(f"Ann {ann.get('id')}: Invalid polygon")
+            print(f"  Area: {poly.area}")
+            print(f"  Is valid: {poly.is_valid}")
+            print(f"  Is empty: {poly.is_empty}")
+            print(f"  Coords: {coords}")
+            print(f"  Segs: {segs}")
+            print(f"  Segs[0]: {segs[0]}")
+            print(f"  Segs[0][0]: {segs[0][0]}")
+            print(f"  Segs[0][1]: {segs[0][1]}")
+
+    # This print is "GT Cats [] - Canopy: 3, Trees: 48", but coco_annotations has 52 entries - Help!
+    print(f" GT Cats [] - Canopy: {gt_cats.count(1)}, Trees: {gt_cats.count(2)}")
+
+    # Use image georeferencing transform to map pixel → world
+    width, height = tcd_example["width"], tcd_example["height"]
+    bounds = tcd_example["bounds"]
+    transform = from_bounds(*bounds, width=width, height=height)
+
+    gt_world = [pixel_to_world(p, transform) for p in gt_polys if p.is_valid]
+    gt = gpd.GeoDataFrame({"geometry": gt_world, "category": gt_cats}, crs=tcd_example["crs"])
+
+    print(f"  → {len(gt)} ground-truth polygons (from coco_annotations)")
+
+    if pred.crs != gt.crs:
+        print(f"Aligning CRS: {pred.crs} → {gt.crs}")
+        pred = pred.to_crs(gt.crs)
+
+    # IoU computation
+    def iou(a, b):
+        inter, union = a.intersection(b).area, a.union(b).area
+        return inter / union if union > 0 else 0.0
+
+    # Intersection over polygon
+    def iop(a, b):
+        inter = a.intersection(b).area
+        denom = a.area
+        return inter / denom if denom > 0 else 0.0
+
+    # --- Category-aware per-prediction scores (aligned with pred.index) ---
+    from shapely.strtree import STRtree
+
+    # Build spatial index on GT and keep parallel arrays for lookup
+    gt_geoms = list(gt.geometry)
+    gt_cats_arr = np.asarray(gt["category"], dtype=int)
+    gt_tree = STRtree(gt_geoms)
+
+    # Pre-size per-pred arrays so indices align 1:1 with pred.geometry
+    n_pred = len(pred)
+    scores_trees = np.zeros(n_pred, dtype=float)   # best IoU vs any tree GT (cat==2)
+    scores_canopy = np.zeros(n_pred, dtype=float)  # best IoP vs any canopy GT (cat==1)
+
+    # Helper to plot-safe iterate prediction geometry parts
+    def polygon_parts(g):
+        from shapely.geometry import Polygon, MultiPolygon, GeometryCollection
+        if g.is_empty:
+            return []
+        if isinstance(g, Polygon):
+            return [g]
+        if isinstance(g, MultiPolygon):
+            return list(g.geoms)
+        if isinstance(g, GeometryCollection):
+            return [h for h in g.geoms if h.geom_type in ("Polygon", "MultiPolygon")]
+        return []
+
+    # Compute best per-pred scores using only intersecting GT candidates
+    for i, p in enumerate(pred.geometry):
+        if p is None or p.is_empty or not p.is_valid:
+            continue
+
+        # Query intersecting GT indices (fast prune)
+        # NOTE: STRtree.query with shapely>=2 returns numpy indices with predicate
+        try:
+            cand_idx = gt_tree.query(p, predicate="intersects")
+        except TypeError:
+            # Fallback if predicate= isn’t available (older shapely): filter manually
+            cand_idx = [j for j, ggt in enumerate(gt_geoms) if p.intersects(ggt)]
+
+        if len(cand_idx) == 0:
+            continue
+
+        best_tree = 0.0
+        best_canopy = 0.0
+
+        for j in cand_idx:
+            ggt = gt_geoms[j]
+            cat = gt_cats_arr[j]
+
+            # Robust intersection to avoid topology errors
+            if not p.intersects(ggt):
+                continue
+
+            inter_area = p.intersection(ggt).area
+            if inter_area <= 0.0:
+                continue
+
+            if cat == 2:
+                # Tree: IoU (symmetric)
+                union_area = p.union(ggt).area
+                if union_area > 0:
+                    best_tree = max(best_tree, inter_area / union_area)
+            else:
+                # Canopy (cat==1): IoP = overlap proportion of PREDICTION inside GT
+                denom = p.area
+                if denom > 0:
+                    best_canopy = max(best_canopy, inter_area / denom)
+
+        scores_trees[i] = best_tree
+        scores_canopy[i] = best_canopy
+
+    # --- Compute category-wise metrics ---
+    def compute_metrics(scores, thresh, n_pred, n_gt):
+        scores = np.asarray(scores)
+        n_tp = np.sum(scores >= thresh)
+        mean_score = np.mean(scores) if scores.size > 0 else 0.0
+        return {
+            "precision": n_tp / n_pred if n_pred else 0,
+            "recall": n_tp / n_gt if n_gt else 0,
+            "mean_overlap": mean_score,
+            "n_tp": int(n_tp),
+        }
+
+    n_pred, n_gt = len(pred), len(gt)
+    metrics_trees = compute_metrics(scores_trees, iou_thresh_tree, n_pred, gt["category"].eq(2).sum())
+    metrics_canopy = compute_metrics(scores_canopy, iop_thresh_canopy, n_pred, gt["category"].eq(1).sum())
+
+    # --- Combine overall summary ---
+    metrics_all = {
+        "trees": metrics_trees,
+        "canopy": metrics_canopy,
         "n_pred": n_pred,
-        "n_gt": n_gt
+        "n_gt_total": n_gt,
     }
 
+    print("\n📊 Validation Results:")
+    print("  🌳 Trees (IoU):")
+    for k, v in metrics_trees.items():
+        print(f"    {k:12s}: {v:.3f}" if isinstance(v, float) else f"    {k:12s}: {v}")
 
+    print("  🌿 Canopy (IoP):")
+    for k, v in metrics_canopy.items():
+        print(f"    {k:12s}: {v:.3f}" if isinstance(v, float) else f"    {k:12s}: {v}")
+
+    print(f"\n  Total predictions: {n_pred}")
+    print(f"  Total GT polygons: {n_gt} (Trees: {gt['category'].eq(2).sum()}, Canopy: {gt['category'].eq(1).sum()})")
+
+    return metrics_all, pred, gt, (scores_trees, scores_canopy), coco_annotations
 
 def clean_validate_predictions_vs_tcd_segments(
     pred_geojson_path,
     tcd_example,
+    ann_path=None,
     iou_thresh_tree=0.5,
     iop_thresh_canopy=0.7,
 ):
     """
-    Validate Detectree2 predictions against TCD 'segments' polygons.
-    Robust to all COCO segmentation formats (Polygon, RLE string/list),
-    and complex geometry types (MultiPolygon, GeometryCollection).
-    Returns: (metrics_all, pred_gdf, gt_gdf, (scores_trees, scores_canopy), coco_annotations)
+    Validate Detectree2 predictions using real TCD annotations (.gpkg or .png).
+
+    Supports ALL TCD annotation formats:
+      • Semantic masks (85=canopy, 170=tree)
+      • Instance masks (multiple labels: 52–65 etc.)
+      • Mixed hybrid masks
+      • Vector .gpkg files
+
+    Returns:
+        metrics_all, pred_gdf, gt_gdf, (scores_trees, scores_canopy)
     """
-    import json
-    import numpy as np
-    import geopandas as gpd
-    import rasterio
-    import rasterio.features
-    from shapely.geometry import Polygon, MultiPolygon, GeometryCollection, shape
-    from shapely.validation import make_valid
-    from shapely.affinity import affine_transform
-    from shapely.strtree import STRtree
-    from pycocotools import mask as mask_utils
-    from rasterio.transform import from_bounds
 
-    # ---------------------------
-    # Helper: flatten geometry parts
-    # ---------------------------
-    def polygon_parts(geom):
-        """Return list of Polygon parts from any shapely geometry."""
-        if geom is None or geom.is_empty:
-            return []
-        if isinstance(geom, Polygon):
-            return [geom]
-        if isinstance(geom, MultiPolygon):
-            return list(geom.geoms)
-        if isinstance(geom, GeometryCollection):
-            out = []
-            for g in geom.geoms:
-                out.extend(polygon_parts(g))
-            return out
-        return []
+    # import geopandas as gpd
+    # import numpy as np
+    # import rasterio
+    # import rasterio.features
+    # import cv2
+    # from pathlib import Path
+    # from shapely.geometry import shape, Polygon, MultiPolygon, GeometryCollection
+    # from shapely.validation import make_valid
+    # from shapely.strtree import STRtree
 
-    # ---------------------------
-    # Helper: pixel → world transform
-    # ---------------------------
-    def pixel_to_world_geom(geom, transform):
-        """Apply rasterio Affine transform to shapely geometry."""
-        coeffs = [transform.a, transform.b, transform.d, transform.e, transform.c, transform.f]
-        return affine_transform(geom, coeffs)
+    # ------------------------------------------------------------
+    # 1. Load predictions
+    # ------------------------------------------------------------
+    print("📂 Loading Detectree2 predictions ...")
+    pred = gpd.read_file(pred_geojson_path)
+    print(f"  → {len(pred)} predicted polygons")
 
-    # ---------------------------
-    # Metric helpers
-    # ---------------------------
+    if len(pred) == 0:
+        print("⚠️ No predicted polygons — skipping validation.")
+        return None, None, None, None
+
+    # ------------------------------------------------------------
+    # 2. Resolve annotation path
+    # ------------------------------------------------------------
+    if ann_path is None:
+        tile_id = tcd_example["image_id"]
+        ann_path = Path(pred_geojson_path).parents[2] / "raw" / f"tcd_tile_{tile_id}_crowns.gpkg"
+        alt_png = ann_path.with_suffix(".png")
+        if not ann_path.exists() and alt_png.exists():
+            ann_path = alt_png
+
+    ann_path = Path(ann_path)
+    print(f"📘 Using annotation file: {ann_path}")
+
+    if not ann_path.exists():
+        print(f"⚠️ Annotation not found — expected {ann_path}")
+        print("Skipping validation.")
+        return None, None, None, None
+
+    # ------------------------------------------------------------
+    # 3. Load GT polygons (handles ALL TCD formats)
+    # ------------------------------------------------------------
+    gt_polys = []
+    gt_cats = []  # 1 = canopy, 2 = tree
+
+    # ------------------------------------------------------------
+    # Vector polygons (.gpkg)
+    # ------------------------------------------------------------
+    if ann_path.suffix == ".gpkg":
+        gdf = gpd.read_file(ann_path)
+
+        # guess category column
+        type_col = None
+        for cand in ["type", "class", "category", "label"]:
+            if cand in gdf.columns:
+                type_col = cand
+                break
+
+        for _, row in gdf.iterrows():
+            geom = row.geometry
+            if geom is None or geom.is_empty:
+                continue
+            geom = make_valid(geom)
+
+            if type_col:
+                t = str(row[type_col]).lower()
+                cat = 2 if "tree" in t else 1
+            else:
+                cat = 1
+
+            # flatten geometry
+            if isinstance(geom, Polygon):
+                gt_polys.append(geom)
+                gt_cats.append(cat)
+            elif isinstance(geom, MultiPolygon):
+                for p in geom.geoms:
+                    gt_polys.append(p)
+                    gt_cats.append(cat)
+            elif isinstance(geom, GeometryCollection):
+                for g in geom.geoms:
+                    if isinstance(g, Polygon):
+                        gt_polys.append(g)
+                        gt_cats.append(cat)
+
+    # ------------------------------------------------------------
+    # Raster masks (.png) — semantic, instance, or mixed
+    # ------------------------------------------------------------
+    elif ann_path.suffix == ".png":
+        mask = cv2.imread(str(ann_path), cv2.IMREAD_GRAYSCALE)
+        if mask is None:
+            raise RuntimeError(f"Failed to read {ann_path}")
+
+        unique = np.unique(mask)
+        print("Unique mask values:", unique)
+
+        # --- Case A: Semantic masks (85=canopy, 170=tree) ---
+        if (85 in unique) or (170 in unique):
+            # canopy
+            canopy = (mask == 85).astype(np.uint8)
+            for geom, v in rasterio.features.shapes(canopy, canopy == 1):
+                poly = shape(geom)
+                if poly.is_valid:
+                    gt_polys.append(poly)
+                    gt_cats.append(1)
+
+            # tree
+            trees = (mask == 170).astype(np.uint8)
+            for geom, v in rasterio.features.shapes(trees, trees == 1):
+                poly = shape(geom)
+                if poly.is_valid:
+                    gt_polys.append(poly)
+                    gt_cats.append(2)
+
+        # --- Case B: Instance masks (multiple labels >2) ---
+        elif len(unique) > 2:
+            for val in unique:
+                if val == 0:
+                    continue
+                inst = (mask == val).astype(np.uint8)
+                for geom, v in rasterio.features.shapes(inst, inst == 1):
+                    poly = shape(geom)
+                    if poly.is_valid:
+                        gt_polys.append(poly)
+                        gt_cats.append(2)  # instance masks = trees only
+
+        # --- Case C: Empty/unknown ---
+        else:
+            print("⚠️ Unsupported mask format — no polygons extracted.")
+            return None, None, None, None
+
+    else:
+        raise ValueError(f"Unsupported annotation type: {ann_path.suffix}")
+
+    print(f"  → Loaded {len(gt_polys)} GT polygons "
+          f"(trees={gt_cats.count(2)}, canopy={gt_cats.count(1)})")
+
+    if len(gt_polys) == 0:
+        print("⚠️ No GT polygons found — skipping validation.")
+        return None, None, None, None
+
+    # GT GeoDataFrame
+    gt = gpd.GeoDataFrame({"geometry": gt_polys, "category": gt_cats}, crs=pred.crs)
+
+    # ------------------------------------------------------------
+    # 4. Evaluate overlap
+    # ------------------------------------------------------------
     def iou(a, b):
         inter = a.intersection(b).area
-        if inter <= 0.0:
+        if inter <= 0:
             return 0.0
         union = a.union(b).area
         return inter / union if union > 0 else 0.0
@@ -778,289 +1063,244 @@ def clean_validate_predictions_vs_tcd_segments(
         inter = a.intersection(b).area
         return inter / a.area if a.area > 0 else 0.0
 
-    def compute_metrics(scores, thresh, n_pred, n_gt):
-        scores = np.asarray(scores, dtype=float)
+    # build spatial index
+    gt_geoms = list(gt.geometry)
+    gt_cats_arr = np.array(gt["category"], dtype=int)
+    gt_tree = STRtree(gt_geoms)
+
+    n_pred = len(pred)
+    scores_trees = np.zeros(n_pred)
+    scores_canopy = np.zeros(n_pred)
+
+    for i, pg in enumerate(pred.geometry):
+        if pg is None or pg.is_empty:
+            continue
+
+        try:
+            cand_idx = gt_tree.query(pg, predicate="intersects")
+        except TypeError:
+            cand_idx = [j for j, g in enumerate(gt_geoms) if pg.intersects(g)]
+
+        if len(cand_idx) == 0:
+            continue
+
+        best_tree = 0.0
+        best_canopy = 0.0
+
+        for j in cand_idx:
+            g = gt_geoms[j]
+            if gt_cats_arr[j] == 2:  # tree
+                best_tree = max(best_tree, iou(pg, g))
+            else:  # canopy
+                best_canopy = max(best_canopy, iop(pg, g))
+
+        scores_trees[i] = best_tree
+        scores_canopy[i] = best_canopy
+
+    # ------------------------------------------------------------
+    # 5. Metrics summarisation
+    # ------------------------------------------------------------
+    def compute(scores, thresh, n_pred, n_gt):
+        scores = np.array(scores)
         n_tp = int(np.sum(scores >= thresh))
         precision = n_tp / n_pred if n_pred else 0.0
-        recall = n_tp / n_gt if n_gt else 0.0
+        recall    = n_tp / n_gt if n_gt else 0.0
         f1 = 2 * (precision * recall) / (precision + recall + 1e-9)
-        mean_score = float(np.mean(scores)) if scores.size > 0 else 0.0
         return {
             "precision": precision,
             "recall": recall,
             "f1_score": f1,
-            "mean_overlap": mean_score,
+            "mean_overlap": float(scores.mean() if len(scores) else 0.0),
             "n_tp": n_tp,
         }
 
-    # ---------------------------
-    # 1) Load predictions
-    # ---------------------------
-    print("📂 Loading Detectree2 predictions ...")
-    pred = gpd.read_file(pred_geojson_path)
-    print(f"  → {len(pred)} predicted polygons")
-
-    # ---------------------------
-    # 2) Parse COCO annotations
-    # ---------------------------
-    coco_annotations = tcd_example.get("coco_annotations", [])
-    if isinstance(coco_annotations, str):
-        coco_annotations = json.loads(coco_annotations)
-    if not isinstance(coco_annotations, list) or not coco_annotations:
-        print(f"❌ coco_annotations: {coco_annotations}")
-        return None, None, None, None, None
-
-    gt_polys_px = []
-    gt_cats = []
-
-    for ann in coco_annotations:
-        segs = ann.get("segmentation", None)
-        cat = int(ann.get("category_id", 1))  # 1=canopy, 2=tree
-
-        if not segs:
-            continue
-
-        polys = []
-
-        # Case A: Polygon list (e.g. [[x1,y1,...]])
-        if isinstance(segs, list) and isinstance(segs[0], list):
-            try:
-                coords = np.array(segs[0], dtype=float).reshape(-1, 2)
-                poly = Polygon(coords)
-                if not poly.is_valid:
-                    poly = make_valid(poly)
-                polys = polygon_parts(poly)
-            except Exception as e:
-                print(f"⚠️ Skipping invalid polygon segmentation: {e}")
-                polys = []
-
-        # Case B: RLE dict (either string or list counts)
-        elif isinstance(segs, dict) and "counts" in segs and "size" in segs:
-            try:
-                mask = mask_utils.decode(segs)  # works for both string and list counts
-                shapes = rasterio.features.shapes(mask.astype(np.uint8), mask > 0)
-                polys = [shape(geom) for geom, val in shapes if val == 1]
-            except Exception as e:
-                print(f"⚠️ Failed to decode RLE segmentation: {e}")
-                polys = []
-
-        else:
-            print(f"⚠️ Unknown segmentation format in annotation id={ann.get('id')} — skipping.")
-            polys = []
-
-        for p in polys:
-            if p.is_valid and p.area > 0:
-                gt_polys_px.append(p)
-                gt_cats.append(cat)
-
-    print(f" GT Categories — Canopy: {gt_cats.count(1)}, Trees: {gt_cats.count(2)}")
-
-    # ---------------------------
-    # 3) Pixel → world transform
-    # ---------------------------
-    width, height = tcd_example["width"], tcd_example["height"]
-    bounds = tcd_example["bounds"]
-    transform = from_bounds(*bounds, width=width, height=height)
-
-    gt_world_parts = [pixel_to_world_geom(p, transform) for p in gt_polys_px]
-    gt = gpd.GeoDataFrame({"geometry": gt_world_parts, "category": gt_cats}, crs=tcd_example["crs"])
-    print(f"  → {len(gt)} ground-truth polygons (after normalization)")
-
-    # ---------------------------
-    # 4) CRS alignment
-    # ---------------------------
-    if pred.crs != gt.crs:
-        print(f"Aligning CRS: {pred.crs} → {gt.crs}")
-        pred = pred.to_crs(gt.crs)
-
-    # ---------------------------
-    # 5) Overlap evaluation via STRtree
-    # ---------------------------
-    gt_geoms = list(gt.geometry)
-    gt_cats_arr = np.asarray(gt["category"], dtype=int)
-    gt_tree = STRtree(gt_geoms)
-
-    n_pred = len(pred)
-    scores_trees = np.zeros(n_pred, dtype=float)
-    scores_canopy = np.zeros(n_pred, dtype=float)
-
-    for i, p in enumerate(pred.geometry):
-        if p is None or p.is_empty or not p.is_valid:
-            continue
-        try:
-            cand_idx = gt_tree.query(p, predicate="intersects")
-        except TypeError:
-            cand_idx = [j for j, ggt in enumerate(gt_geoms) if p.intersects(ggt)]
-        if len(cand_idx) == 0:
-            continue
-
-        best_tree, best_canopy = 0.0, 0.0
-        for j in cand_idx:
-            ggt = gt_geoms[j]
-            if not p.intersects(ggt):
-                continue
-            if gt_cats_arr[j] == 2:
-                best_tree = max(best_tree, iou(p, ggt))
-            else:
-                best_canopy = max(best_canopy, iop(p, ggt))
-        scores_trees[i] = best_tree
-        scores_canopy[i] = best_canopy
-
-    # ---------------------------
-    # 6) Metrics (+F1)
-    # ---------------------------
-    n_gt = len(gt)
     n_gt_trees = int(np.sum(gt_cats_arr == 2))
     n_gt_canopy = int(np.sum(gt_cats_arr == 1))
 
-    metrics_trees = compute_metrics(scores_trees, iou_thresh_tree, n_pred, n_gt_trees)
-    metrics_canopy = compute_metrics(scores_canopy, iop_thresh_canopy, n_pred, n_gt_canopy)
+    metrics_trees  = compute(scores_trees, iou_thresh_tree, n_pred, n_gt_trees)
+    metrics_canopy = compute(scores_canopy, iop_thresh_canopy, n_pred, n_gt_canopy)
 
     metrics_all = {
         "trees": metrics_trees,
         "canopy": metrics_canopy,
         "n_pred": n_pred,
-        "n_gt_total": n_gt,
         "n_gt_trees": n_gt_trees,
         "n_gt_canopy": n_gt_canopy,
+        "n_gt_total": len(gt),
     }
 
-    # ---------------------------
-    # 7) Summary
-    # ---------------------------
+    # ------------------------------------------------------------
+    # 6. Print summary
+    # ------------------------------------------------------------
     print("\n📊 Validation Results:")
     print("  🌳 Trees (IoU):")
     for k, v in metrics_trees.items():
         print(f"    {k:12s}: {v:.3f}" if isinstance(v, float) else f"    {k:12s}: {v}")
+
     print("  🌿 Canopy (IoP):")
     for k, v in metrics_canopy.items():
         print(f"    {k:12s}: {v:.3f}" if isinstance(v, float) else f"    {k:12s}: {v}")
+
     print(f"\n  Total predictions: {n_pred}")
-    print(f"  Total GT polygons: {n_gt} (Trees: {n_gt_trees}, Canopy: {n_gt_canopy})")
+    print(f"  Total GT polygons: {len(gt)} "
+          f"(Trees: {n_gt_trees}, Canopy: {n_gt_canopy})")
 
-    return metrics_all, pred, gt, (scores_trees, scores_canopy), coco_annotations
+    return metrics_all, pred, gt, (scores_trees, scores_canopy)
 
-def visualize_validation_results(pred, gt, ious, coco_anns=None, 
-                                 iou_thresh_tree=0.5, iop_thresh_canopy=0.7,
-                                 site_path=None, rgb_path=None,
-                                 tile_name=None, image_id=None):
+def visualize_validation_results(
+    pred,
+    gt,
+    scores,
+    iou_thresh_tree=0.5,
+    iop_thresh_canopy=0.7,
+    site_path=None,
+    rgb_path=None,
+    tile_name=None,
+    image_id=None,
+    biome_name=None,
+):
     """
-    Visualize Detectree2 vs TCD polygons over RGB base image.
+    Visualize Detectree2 predictions vs TCD ground truth.
+    100% COCO-free. Works only with GeoJSON preds + GPKG/PNG GT polygons.
+
+    pred       → GeoDataFrame of predicted polygons
+    gt         → GeoDataFrame of ground-truth polygons (columns: geometry, category)
+    scores     → (scores_trees, scores_canopy)
     """
 
-    # === 1. Output path ===
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
+    import numpy as np
+    import geopandas as gpd
+    import rasterio
+    from shapely.geometry import Polygon, MultiPolygon, GeometryCollection
+
+    scores_trees, scores_canopy = scores
+
+    # ------------------------------------------------------------
+    # 1. Construct save path
+    # ------------------------------------------------------------
     out_dir = Path(site_path) / "overlays_validation"
     out_dir.mkdir(parents=True, exist_ok=True)
-    path_constructor = ["validate"]
+
+    elements = ["validate"]
     if tile_name:
-        path_constructor.append(tile_name)
+        elements.append(tile_name)
     if image_id:
-        path_constructor.append(f"tcd{image_id}")
+        elements.append(f"tcd{image_id}")
 
-    out_path = out_dir / f"{'_'.join(path_constructor)}.png"
+    out_path = out_dir / f"{'_'.join(elements)}.png"
 
-    # === 2. Load background image ===
-    img, extent = None, None
+    # ------------------------------------------------------------
+    # 2. Load background RGB (GeoTIFF)
+    # ------------------------------------------------------------
+    rgb_img, extent = None, None
     if rgb_path and Path(rgb_path).exists():
         with rasterio.open(rgb_path) as src:
-            img = src.read([1, 2, 3])
-            img = np.moveaxis(img, 0, -1)
-            img = (img - img.min()) / (img.max() - img.min() + 1e-9)
+            rgb = src.read([1, 2, 3])
+            rgb = np.moveaxis(rgb, 0, -1)
+            rgb = (rgb - rgb.min()) / (rgb.max() - rgb.min() + 1e-9)
+            rgb_img = rgb
             extent = [src.bounds.left, src.bounds.right,
                       src.bounds.bottom, src.bounds.top]
 
-    # === 3. Plot setup ===
+    # ------------------------------------------------------------
+    # 3. Plot setup
+    # ------------------------------------------------------------
     fig, ax = plt.subplots(figsize=(8, 8))
-    ax.set_title(f"Detectree2 vs TCD — IoU ≥ {iou_thresh_tree}, IoP ≥ {iop_thresh_canopy}")
+    subtitle = f"Image ID: {image_id}" + (f" | Biome: {biome_name}" if biome_name else "")
+    ax.set_title(f"Detectree2 vs TCD — IoU≥{iou_thresh_tree}, IoP≥{iop_thresh_canopy}")
     ax.set_aspect("equal")
 
-    if img is not None:
-        ax.imshow(img, extent=extent, origin="upper")
+    if rgb_img is not None:
+        ax.imshow(rgb_img, extent=extent, origin="upper")
 
-    # === 4. Draw predictions ===
-
-    def draw_pred_outline(ax, geom, color):
-        from shapely.geometry import Polygon, MultiPolygon, GeometryCollection
-        if geom.is_empty: 
+    # ------------------------------------------------------------
+    # 4. Helper: draw polygons
+    # ------------------------------------------------------------
+    def draw_outline(ax, geom, color, lw=1.2):
+        """Draw any polygon-like geometry safely."""
+        if geom.is_empty:
             return
+
         if isinstance(geom, Polygon):
             x, y = geom.exterior.xy
-            ax.plot(x, y, color=color, linewidth=1.2, alpha=0.9)
+            ax.plot(x, y, color=color, linewidth=lw, alpha=0.9)
+
         elif isinstance(geom, MultiPolygon):
-            for sub in geom.geoms:
-                x, y = sub.exterior.xy
-                ax.plot(x, y, color=color, linewidth=1.2, alpha=0.9)
+            for g in geom.geoms:
+                x, y = g.exterior.xy
+                ax.plot(x, y, color=color, linewidth=lw, alpha=0.9)
+
+        elif isinstance(geom, GeometryCollection):
+            for g in geom.geoms:
+                if isinstance(g, (Polygon, MultiPolygon)):
+                    draw_outline(ax, g, color, lw)
+
+    def draw_filled(ax, geom, color):
+        """Fill GT polygons."""
+        if geom.is_empty:
+            return
+
+        if isinstance(geom, Polygon):
+            x, y = geom.exterior.xy
+            ax.fill(x, y, facecolor=color, edgecolor=color, alpha=0.25)
+
+        elif isinstance(geom, MultiPolygon):
+            for p in geom.geoms:
+                x, y = p.exterior.xy
+                ax.fill(x, y, facecolor=color, edgecolor=color, alpha=0.25)
+
         elif isinstance(geom, GeometryCollection):
             for sub in geom.geoms:
-                draw_pred_outline(ax, sub, color)
+                if isinstance(sub, (Polygon, MultiPolygon)):
+                    draw_filled(ax, sub, color)
 
-
+    # ------------------------------------------------------------
+    # 5. Draw predictions (colour based on IoU/IoP passes)
+    # ------------------------------------------------------------
     for i, p in enumerate(pred.geometry):
-        if not p.is_valid or p.is_empty:
+        if p is None or p.is_empty or not p.is_valid:
             continue
 
-        # --- Extract per-prediction score ---
-        score_tree = score_canopy = 0.0
-        if isinstance(ious, tuple) and len(ious) == 2:
-            scores_trees, scores_canopy = ious
-            if i < len(scores_trees):
-                score_tree = scores_trees[i]
-            if i < len(scores_canopy):
-                score_canopy = scores_canopy[i]
-        elif isinstance(ious, list):
-            if i < len(ious):
-                score_tree = ious[i]  # fallback
+        score_tree = scores_trees[i]
+        score_canopy = scores_canopy[i]
 
-        # --- Pick color based on which test passes ---
         if score_tree >= iou_thresh_tree:
-            color = "#00F0FF"      # bright teal  → good tree (IoU)
+            color = "#00F0FF"   # tree TP
         elif score_canopy >= iop_thresh_canopy:
-            color = "#00FF9D"      # neon green  → good canopy (IoP)
+            color = "#00FF9D"   # canopy TP
         else:
-            color = "#FF8800"      # orange      → low-overlap / FP
+            color = "#FF8800"   # FP or low overlap
 
-        draw_pred_outline(ax, p, color)
+        draw_outline(ax, p, color)
 
-    # === 5. Draw ground-truth crowns & canopy ===
-    for idx, g in enumerate(gt.geometry):
-        if not g.is_valid or g.is_empty:
+    # ------------------------------------------------------------
+    # 6. Draw ground truth
+    # ------------------------------------------------------------
+    for geom, cat in zip(gt.geometry, gt["category"]):
+        if geom.is_empty:
             continue
-        # Match color by category (1=tree, 2=canopy)
-        cat = None
-        if coco_anns and idx < len(coco_anns):
-            cat = coco_anns[idx].get("category_id", 1)
-        color = "#C266FF" if cat == 1 else "#0a20ad"  # purple vs dark-blue
-        if isinstance(g, Polygon):
-            geoms = [g]
-        elif isinstance(g, MultiPolygon):
-            geoms = list(g.geoms)
-        elif isinstance(g, GeometryCollection):
-            geoms = [geom for geom in g.geoms if isinstance(geom, (Polygon, MultiPolygon))]
+
+        if cat == 2:  # tree
+            color = "#0a20ad"   # dark blue
         else:
-            geoms = []
+            color = "#C266FF"   # purple (canopy)
 
-        for geom in geoms:
-            if isinstance(geom, Polygon):
-                x, y = geom.exterior.xy
-                ax.fill(x, y, facecolor=color, edgecolor=color, linewidth=0.8, alpha=0.25)
-                ax.plot(x, y, color=color, linewidth=0.8, alpha=0.9)
-            elif isinstance(geom, MultiPolygon):
-                for sub in geom.geoms:
-                    x, y = sub.exterior.xy
-                    ax.fill(x, y, facecolor=color, edgecolor=color, linewidth=0.8, alpha=0.25)
-                    ax.plot(x, y, color=color, linewidth=0.8, alpha=0.9)
+        draw_filled(ax, geom, color)
+        draw_outline(ax, geom, color, lw=0.8)
 
-    # === 6. Legend ===
-    import matplotlib.patches as mpatches
+    # ------------------------------------------------------------
+    # 7. Legend
+    # ------------------------------------------------------------
     legend_elems = [
-        mpatches.Patch(color="#00F0FF", label="Tree TP (IoU ≥ 0.5)"),
-        mpatches.Patch(color="#00FF9D", label="Canopy TP (IoP ≥ 0.7)"),
-        mpatches.Patch(color="#FF8800", label="False Positive / Low Overlap"),
-        mpatches.Patch(color="#C266FF", label="Ground Truth — Canopy"),
-        mpatches.Patch(color="#0a20ad", label="Ground Truth — Tree")
+        mpatches.Patch(color="#00F0FF", label="Tree TP (IoU ≥ threshold)"),
+        mpatches.Patch(color="#00FF9D", label="Canopy TP (IoP ≥ threshold)"),
+        mpatches.Patch(color="#FF8800", label="FP / low overlap"),
+        mpatches.Patch(color="#C266FF", label="GT Canopy"),
+        mpatches.Patch(color="#0a20ad", label="GT Tree"),
     ]
-
-    ax.legend(handles=legend_elems, loc="lower right", frameon=True, fontsize=8)
+    ax.legend(handles=legend_elems, loc="lower right", fontsize=7)
 
     ax.set_xlabel("Easting")
     ax.set_ylabel("Northing")
@@ -1070,56 +1310,21 @@ def visualize_validation_results(pred, gt, ious, coco_anns=None,
 
     print(f"🖼️  Saved validation overlay → {out_path}")
 
-    # === 7. Also save pure Ground Truth visualization for comparison ===
 
-    # fig_gt, ax_gt = plt.subplots(figsize=(8, 8))
-    # ax_gt.set_title(f"TCD Ground Truth (image_id={image_id})")
-    # ax_gt.set_aspect("equal")
 
-    # if img is not None:
-    #     ax_gt.imshow(img, extent=extent, origin="upper")
+def pixel_to_world(poly, transform):
+    """
+    Convert a polygon from pixel to world (map) coordinates using a rasterio Affine transform.
+    Works safely with both Affine objects and tuple/list transforms.
+    """
+    # Ensure we have 6 coefficients in order: [a, b, d, e, xoff, yoff]
+    if isinstance(transform, rasterio.Affine):
+        coeffs = [transform.a, transform.b, transform.d, transform.e, transform.c, transform.f]
+    else:
+        a, b, c, d, e, f = transform[:6]
+        coeffs = [a, b, d, e, c, f]
 
-    # for idx, g in enumerate(gt.geometry):
-    #     if g.is_empty:
-    #         continue
-
-    #     # Category colouring
-    #     cat = None
-    #     if coco_anns and idx < len(coco_anns):
-    #         cat = coco_anns[idx].get("category_id", 1)
-    #     color = "#C266FF" if cat == 1 else "#0a20ad"  # purple=canopy, blue=tree
-
-    #     # Handle all geometry types safely
-    #     if isinstance(g, Polygon):
-    #         geoms = [g]
-    #     elif isinstance(g, MultiPolygon):
-    #         geoms = list(g.geoms)
-    #     elif isinstance(g, GeometryCollection):
-    #         geoms = [geom for geom in g.geoms if isinstance(geom, (Polygon, MultiPolygon))]
-    #     else:
-    #         geoms = []
-
-    #     for geom in geoms:
-    #         if isinstance(geom, Polygon):
-    #             x, y = geom.exterior.xy
-    #             ax_gt.fill(x, y, facecolor=color, edgecolor=color, linewidth=0.8, alpha=0.25)
-    #             ax_gt.plot(x, y, color=color, linewidth=0.8, alpha=0.9)
-    #         elif isinstance(geom, MultiPolygon):
-    #             for sub in geom.geoms:
-    #                 x, y = sub.exterior.xy
-    #                 ax_gt.fill(x, y, facecolor=color, edgecolor=color, linewidth=0.8, alpha=0.25)
-    #                 ax_gt.plot(x, y, color=color, linewidth=0.8, alpha=0.9)
-
-    # ax_gt.set_xlabel("Easting")
-    # ax_gt.set_ylabel("Northing")
-
-    # out_gt_path = out_path.with_name(out_path.stem + "_groundtruth.png")
-    # plt.tight_layout()
-    # plt.savefig(out_gt_path, dpi=250)
-    # plt.close(fig_gt)
-
-    # print(f"🗺️  Saved pure ground-truth overlay → {out_gt_path}")
-
+    return affine_transform(poly, coeffs)
 
 # --------------------------------------------------
 # Entrypoint
