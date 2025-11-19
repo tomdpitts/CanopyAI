@@ -11,3 +11,4 @@ data/tcd/tiles_pred/*.png
 data/tcd/tiles_pred/predictions/*
 data/tcd/tiles_pred/predictions_geo/*
 data/tcd/tiles_validation/tiles_pred
+data/*

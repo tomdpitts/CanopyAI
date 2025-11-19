@@ -13,6 +13,17 @@ from datasets import load_dataset
 from pathlib import Path
 from datasets import load_dataset
 import requests
+import json
+import numpy as np
+import geopandas as gpd
+import rasterio
+import rasterio.features
+from shapely.geometry import Polygon, MultiPolygon, GeometryCollection, shape
+from shapely.validation import make_valid
+from shapely.affinity import affine_transform
+from shapely.strtree import STRtree
+from pycocotools import mask as mask_utils
+from rasterio.transform import from_bounds
 
 import rasterio
 from rasterio.transform import from_bounds
@@ -23,6 +34,8 @@ from shapely.geometry import Polygon, MultiPolygon, GeometryCollection
 from shapely.strtree import STRtree
 import matplotlib.pyplot as plt
 import json, cv2
+from detectree2.preprocessing.tiling import tile_data
+
 
 
 def is_australia(x):
@@ -81,76 +94,85 @@ def is_rangeland(x):
 
 
 def download_tcd_tiles_streaming(save_dir: Path, max_images: int = 3):
+    """
+    Download up to `max_images` TCD tiles (filtered by is_rangeland),
+    save each as a GeoTIFF plus a sidecar *_meta.json file containing
+    all COCO + geo metadata needed later for training/validation.
+
+    Output per tile:
+      save_dir / f"tcd_tile_{i}.tif"
+      save_dir / f"tcd_tile_{i}_meta.json"
+    """
     print("📦 Loading TCD dataset in streaming mode...")
     ds = load_dataset("restor/tcd", split="train", streaming=True)
 
     save_dir.mkdir(parents=True, exist_ok=True)
 
-    results = []
     count = 0
 
-    for example in ds:
-        if not is_rangeland(example):
+    for image_info in ds:
+        if not is_rangeland(image_info):
             print("Nope!")
             continue
 
-        # stop early
         if count >= max_images:
             break
 
-        image_id = example["image_id"]
+        image_id = image_info["image_id"]
         print(f"📸 Downloading Rangeland tile {count}: {image_id}")
 
         img_path = save_dir / f"tcd_tile_{count}.tif"
-        ann_path = save_dir / f"tcd_tile_{count}_crowns.gpkg"
+        meta_path = save_dir / f"tcd_tile_{count}_meta.json"
 
         # ------------------
         # Save image (.tif)
         # ------------------
-        img = np.array(example["image"])
+        img = np.array(image_info["image"])
         h, w = img.shape[:2]
-        crs = example["crs"]
-        bounds = example["bounds"]
+        crs = image_info["crs"]
+        bounds = image_info["bounds"]
 
         transform = from_bounds(*bounds, width=w, height=h)
 
         with rasterio.open(
-            img_path, "w", driver="GTiff",
-            height=h, width=w, count=3,
-            dtype=img.dtype, crs=crs, transform=transform
+            img_path,
+            "w",
+            driver="GTiff",
+            height=h,
+            width=w,
+            count=3,
+            dtype=img.dtype,
+            crs=crs,
+            transform=transform,
         ) as dst:
             for b in range(3):
                 dst.write(img[:, :, b], b + 1)
 
         # ------------------
-        # Download annotation
+        # Save metadata JSON
         # ------------------
-        crown_url = example.get("annotation") or example.get("crowns_polygon")
+        # We store all the important geo/COCO info in a JSON-serializable form
+        meta = {
+            "image_id": image_id,
+            "bounds": bounds,
+            "crs": str(crs),
+            "width": w,
+            "height": h,
+            "coco_annotations": image_info.get("coco_annotations", []),
+            # keep some extra context if you like:
+            "biome": image_info.get("biome"),
+            "country": image_info.get("country"),
+        }
 
-        # Case 1: Annotation is a URL
-        if isinstance(crown_url, str) and crown_url.startswith("http"):
-            with requests.get(crown_url, stream=True) as r:
-                r.raise_for_status()
-                with open(ann_path, "wb") as f:
-                    for chunk in r.iter_content(8192):
-                        f.write(chunk)
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(meta, f)
 
-        # Case 2: Annotation is an image (PIL)
-        elif hasattr(crown_url, "save"):
-            png_path = ann_path.with_suffix(".png")
-            crown_url.save(png_path)
-            print(f"🟦 Saved PNG mask annotation → {png_path}")
-
-        # Case 3: Something else — skip politely
-        else:
-            print(f"⚠️ Skipping annotation for tile {image_id}: unsupported type {type(crown_url)}")
-
-        results.append((img_path, ann_path, example, image_id))
         print(f"✅ Saved Australian tile → {img_path}")
+        print(f"📄 Saved metadata → {meta_path}")
 
         count += 1
 
-    return results
+    print(f"🎯 Finished downloading {count} TCD tiles.")
 
 def has_geodata(tif_path: str | Path) -> bool:
     """Return True if GeoTIFF has valid CRS and affine transform."""
@@ -183,7 +205,7 @@ def compute_final_metric(scores, thresh, n_pred, n_gt):
 
 def clean_validate_predictions_vs_tcd_segments(
     pred_geojson_path,
-    tcd_example,
+    image_tif,
     iou_thresh_tree=0.5,
     iop_thresh_canopy=0.7,
 ):
@@ -193,17 +215,6 @@ def clean_validate_predictions_vs_tcd_segments(
     and complex geometry types (MultiPolygon, GeometryCollection).
     Returns: (metrics_all, pred_gdf, gt_gdf, (scores_trees, scores_canopy), coco_annotations)
     """
-    import json
-    import numpy as np
-    import geopandas as gpd
-    import rasterio
-    import rasterio.features
-    from shapely.geometry import Polygon, MultiPolygon, GeometryCollection, shape
-    from shapely.validation import make_valid
-    from shapely.affinity import affine_transform
-    from shapely.strtree import STRtree
-    from pycocotools import mask as mask_utils
-    from rasterio.transform import from_bounds
 
     # ---------------------------
     # Helper: flatten geometry parts
@@ -270,7 +281,7 @@ def clean_validate_predictions_vs_tcd_segments(
     # ---------------------------
     # 2) Parse COCO annotations
     # ---------------------------
-    coco_annotations = tcd_example.get("coco_annotations", [])
+    coco_annotations = image_tif.get("coco_annotations", [])
     if isinstance(coco_annotations, str):
         coco_annotations = json.loads(coco_annotations)
     if not isinstance(coco_annotations, list) or not coco_annotations:
@@ -282,7 +293,7 @@ def clean_validate_predictions_vs_tcd_segments(
 
     for ann in coco_annotations:
         segs = ann.get("segmentation", None)
-        cat = int(ann.get("category_id", 1))  # 1=canopy, 2=tree
+        cat = int(ann.get("category_id"))  # 1=canopy, 2=tree
 
         if not segs:
             continue
@@ -325,12 +336,12 @@ def clean_validate_predictions_vs_tcd_segments(
     # ---------------------------
     # 3) Pixel → world transform
     # ---------------------------
-    width, height = tcd_example["width"], tcd_example["height"]
-    bounds = tcd_example["bounds"]
+    width, height = image_tif["width"], image_tif["height"]
+    bounds = image_tif["bounds"]
     transform = from_bounds(*bounds, width=width, height=height)
 
     gt_world_parts = [pixel_to_world_geom(p, transform) for p in gt_polys_px]
-    gt = gpd.GeoDataFrame({"geometry": gt_world_parts, "category": gt_cats}, crs=tcd_example["crs"])
+    gt = gpd.GeoDataFrame({"geometry": gt_world_parts, "category": gt_cats}, crs=image_tif["crs"])
     print(f"  → {len(gt)} ground-truth polygons (after normalization)")
 
     # ---------------------------
@@ -619,3 +630,147 @@ def filter_raw_predictions(pred_dir: Path, score_thresh: float = 0.8, overwrite=
         print(f"📊 {fpath.name}: kept {after}/{before} predictions (≥ {score_thresh})")
 
     print(f"✅ Filtering complete — overwrote {len(json_files)} files at ≥ {score_thresh}.")
+    
+
+def load_tcd_meta_for_tile(img_path: Path):
+    """
+    Load TCD metadata for a given .tif tile, if available.
+
+    Returns:
+      dict with keys: width, height, bounds, crs, coco_annotations, ...
+      or None if no _meta.json exists (in which case we skip validation).
+    """
+    meta_path = img_path.with_name(img_path.stem + "_meta.json")
+    if not meta_path.exists():
+        print(f"ℹ️  No metadata found for {img_path.name} (no _meta.json) — skipping validation.")
+        return None
+
+    with open(meta_path, "r", encoding="utf-8") as f:
+        meta = json.load(f)
+    return meta
+
+
+# ============================================================
+#   COCO → GeoDataFrame
+# ============================================================
+
+def coco_meta_to_geodf(meta: dict) -> gpd.GeoDataFrame:
+    width = meta["width"]
+    height = meta["height"]
+    bounds = meta["bounds"]
+    crs_str = meta["crs"]
+    coco_annotations = meta.get("coco_annotations", [])
+
+    if isinstance(coco_annotations, str):
+        coco_annotations = json.loads(coco_annotations)
+    if not isinstance(coco_annotations, list):
+        coco_annotations = []
+
+    transform = from_bounds(*bounds, width=width, height=height)
+
+    def px_to_world(geom):
+        coeffs = [
+            transform.a, transform.b,
+            transform.d, transform.e,
+            transform.c, transform.f,
+        ]
+        return affine_transform(geom, coeffs)
+
+    world_geoms = []
+    cats = []
+
+    for ann in coco_annotations:
+        seg = ann.get("segmentation")
+        cat = ann.get("category_id")
+
+        if not seg:
+            continue
+
+        polys = []
+
+        # Polygon list
+        if isinstance(seg, list) and isinstance(seg[0], list):
+            try:
+                coords = np.array(seg[0], dtype=float).reshape(-1, 2)
+                poly = Polygon(coords)
+                if not poly.is_valid:
+                    poly = make_valid(poly)
+                polys = [poly]
+            except Exception:
+                pass
+
+        # RLE mask
+        elif isinstance(seg, dict) and "counts" in seg:
+            try:
+                mask = mask_utils.decode(seg).astype(np.uint8)
+                shapes = rasterio.features.shapes(mask, mask > 0)
+                polys = [shape(g) for g, val in shapes if val == 1]
+            except Exception:
+                pass
+
+        for p in polys:
+            if p.is_valid and p.area > 0:
+                world_geoms.append(px_to_world(p))
+                cats.append(cat)
+
+    return gpd.GeoDataFrame({"geometry": world_geoms, "category": cats}, crs=crs_str)
+
+
+# -------------------------------------------------------------------
+# Tiling
+# -------------------------------------------------------------------
+
+def tile_all_tcd_tiles(raw_dir: Path, tiles_root: Path,
+                       buffer: int = 30,
+                       tile_width: int = 40,
+                       tile_height: int = 40,
+                       threshold: float = 0.0):
+    """
+    For each .tif + _meta.json in raw_dir:
+
+      - load metadata
+      - convert COCO segs to polygons (GeoDataFrame)
+      - tile with Detectree2 tile_data (with crowns)
+
+    Output: one chips folder per tile under tiles_root.
+    """
+    tif_files = sorted(raw_dir.glob("tcd_tile_*.tif"))
+    if not tif_files:
+        raise FileNotFoundError(f"No tcd_tile_*.tif files found in {raw_dir}")
+
+    tiles_root.mkdir(parents=True, exist_ok=True)
+
+    print(f"📸 Found {len(tif_files)} TCD tiles to tile")
+
+    for img_path in tif_files:
+        stem = img_path.stem  # e.g. "tcd_tile_0"
+        meta_path = raw_dir / f"{stem}_meta.json"
+
+        if not meta_path.exists():
+            print(f"⚠️  Missing metadata {meta_path}, skipping {img_path}")
+            continue
+
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+
+        # Convert COCO segs → polygons
+        crowns_gdf = coco_meta_to_geodf(meta)
+        if crowns_gdf.empty:
+            print(f"⚠️  No polygons found in metadata for {stem}, skipping.")
+            continue
+
+        chips_dir = tiles_root / f"{stem}_chips"
+        print(f"🧩 Tiling {img_path.name} → {chips_dir}")
+
+        tile_data(
+            img_path=str(img_path),
+            out_dir=str(chips_dir),
+            buffer=buffer,
+            tile_width=tile_width,
+            tile_height=tile_height,
+            crowns=crowns_gdf,
+            threshold=threshold,
+            mode="rgb",
+        )
+
+        print(f"✅ Finished tiling → {chips_dir}")

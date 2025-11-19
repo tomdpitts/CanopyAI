@@ -37,6 +37,7 @@ from utils import clean_validate_predictions_vs_tcd_segments
 from utils import visualize_validation_results
 from utils import compute_final_metric
 from utils import filter_raw_predictions
+from utils import load_tcd_meta_for_tile
 
 
 # Key Hyperparameters
@@ -94,34 +95,40 @@ def smoke_test(model_path: Path):
 # Main pipeline
 # --------------------------------------------------
 def main():
-    # SET MODEL HERE
-    model_name = "230103_randresize_full"
+    # Model path
+    if args.weights == "finetuned":
+        model_path = Path("data/tcd/train_outputs/model_final.pth")
+    else:
+        model_path = Path("230103_randresize_full.pth")
 
     # === 1. Define key paths ===
     home = Path.home()
     site_name = "tcd"
     site_path = home / "dphil" / "detectree2" / "data" / site_name
+    raw_dir = site_path / "raw"
 
-    # === 1b. Download multiple tiles ===
-    tiles_info = download_tcd_tiles_streaming(site_path / "raw", max_images=max_images)
-    # print(f"✅ Downloaded {len(tiles_info)} TCD tiles for processing.")
-    
+    # === 1b. Download tiles ===
+    if not args.already_downloaded:
+        print("🌐 Downloading via HF...")
+        tiles_info = download_tcd_tiles_streaming(raw_dir, max_images=max_images)
+        print(f"✅ Downloaded {len(tiles_info)} TCD tiles for processing.")
+    else:
+        print("⏭️ Using existing tiles in raw/")
     
     # === 2. Create output/working directories ===
     pred_tiles_path = ensure_dir(site_path / "tiles_pred")
-    # preds_path = ensure_dir(Path(pred_tiles_path) / "predictions")
-    # preds_geo_path = ensure_dir(Path(pred_tiles_path) / "predictions_geo")
-    # overlays_path = ensure_dir(site_path / "overlays")
 
     # === 3. Download pretrained model if missing ===
-    model_path = Path(f"{model_name}.pth")
     if not model_path.exists():
-        url = f"https://zenodo.org/records/10522461/files/{model_name}.pth"
+        url = f"https://zenodo.org/records/10522461/files/{model_path}"
         print(f"📦 Model not found locally — downloading from {url} ...")
         wget.download(url, out=str(model_path))
         print("\n✅ Model download complete.")
 
-    # === 4. Initialize Detectron2 predictor (once) ===
+
+
+        
+    # === 4. Initialize Detectron2 predictor ===
     print("\n⚙️  Initializing Detectron2 predictor ...")
     cfg = setup_cfg(update_model=str(model_path))
     set_device(cfg)
@@ -136,11 +143,20 @@ def main():
     total_gt_canopy = 0
 
     # === 5–12. Process each tile ===
-    for img_path, ann_path, tile_info, image_id in tiles_info:
-        print(f"\n================ Processing {image_id} ================")
-        print(f"Biome: {tile_info.get('biome_name', 'N/A')}")
+    # for img_path, ann_path, image_info, image_id in tiles_info:
+        # print("ns")
+    
+    raw_dir = Path("data/tcd/raw")
 
-        # tile_dir = Path(pred_tiles_path)
+    for img_path in sorted(raw_dir.glob("tcd_tile_*.tif")):
+        image_info = load_tcd_meta_for_tile(img_path)
+        
+        image_id = image_info['image_id']
+        
+        
+        print(f"\n================ Processing {image_id} ================")
+        print(f"Biome: {image_info.get('biome_name', 'N/A')}")
+
         # ------------------------------------------------------------
         # 5. Tile orthomosaic into chips for inference
         # ------------------------------------------------------------
@@ -216,7 +232,9 @@ def main():
 
         metrics_all, pred, gt, scores, coco_anns = clean_validate_predictions_vs_tcd_segments(
             pred_geojson_path=merged_geojson,
-            tcd_example=tile_info
+            image_tif=image_info,
+            iou_thresh_tree=0.5,
+            iop_thresh_canopy=0.7
         )
         
         if metrics_all is None:
@@ -285,6 +303,17 @@ def parse_args():
         action="store_true",
         help="Run non-geospatial smoke test on a single RGB image."
     )
+    ap.add_argument(
+        "--weights",
+        type=str,
+        default="baseline",
+        choices=["baseline", "finetuned"],
+        help="Which model weights to use: baseline or finetuned",
+    )
+    ap.add_argument("--already_downloaded", 
+                    default=False,
+                    action="store_true")
+    
     return ap.parse_args()
 
 def set_device(cfg):
@@ -515,9 +544,9 @@ def visualize_saved_prediction_with_masks(img_path, pred_json_path, out_dir, ima
 if __name__ == "__main__":
     os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
     args = parse_args()
-    model_path = Path("230103_randresize_full.pth")
 
     if args.smoke:
+        model_path = Path("230103_randresize_full.pth")
         smoke_test(model_path)
     else:
         main()

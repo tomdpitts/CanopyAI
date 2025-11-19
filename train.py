@@ -1,195 +1,181 @@
 #!/usr/bin/env python3
 """
-train.py — Train a Detectree2 model on the TCD dataset.
+train.py — Fine-tune Detectree2’s official ResNet50-FPN model on local TCD tiles.
 
-This script:
-1. Loads an orthomosaic + crown polygons (TCD format)
-2. Tiles them into 40×40 (or configurable) chips
-3. Splits into train/val folders
-4. Registers training data with Detectron2
-5. Trains Mask R-CNN with Detectree2's MyTrainer wrapper
+Data layout (expected):
+
+data/tcd/raw/
+    tcd_tile_0.tif
+    tcd_tile_0_meta.json
+    ...
+
+data/tcd/tiles_pred/
+    tcd_tile_0_chips/
+        ... tiles produced by tile_data
+
+Usage:
+
+  python train.py
+  python train.py --already_downloaded
 """
 
 import argparse
-import os
+import json
 from pathlib import Path
 
 import geopandas as gpd
+import numpy as np
 import rasterio
+from rasterio.transform import from_bounds
+from shapely.geometry import Polygon, shape
+from shapely.affinity import affine_transform
+from shapely.validation import make_valid
+from pycocotools import mask as mask_utils
 
-from detectree2.preprocessing.tiling import tile_data, to_traintest_folders
+from detectree2.preprocessing.tiling import tile_data
 from detectree2.models.train import register_train_data, MyTrainer, setup_cfg
 
+import torch
 
-# ---------------------------------------------------------
-# Training pipeline
-# ---------------------------------------------------------
+from utils import download_tcd_tiles_streaming
+from utils import coco_meta_to_geodf
+from utils import tile_all_tcd_tiles
 
-def prepare_tiles(img_path: Path,
-                  crowns_path: Path,
-                  out_dir: Path,
-                  tile_width: int = 40,
-                  tile_height: int = 40,
-                  buffer: int = 30,
-                  threshold: float = 0.6,
-                  test_frac: float = 0.15):
+
+# ============================================================
+#   TRAIN DETECTREE2
+# ============================================================
+
+def train_detectree2(tiles_root: Path, output_dir: Path, preset="tiny"):
     """
-    Tile orthomosaic + crowns → train/val split.
-    """
-
-    print("📦 Tiling dataset...")
-
-    # Load crowns and match CRS
-    with rasterio.open(img_path) as src:
-        img_crs = src.crs
-
-    crowns = gpd.read_file(crowns_path)
-    crowns = crowns.to_crs(img_crs)
-
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    # Tile into chips
-    tile_data(
-        img_path=str(img_path),
-        out_dir=str(out_dir),
-        buffer=buffer,
-        tile_width=tile_width,
-        tile_height=tile_height,
-        crowns=crowns,
-        threshold=threshold,
-        mode="rgb"
-    )
-
-    print("📁 Creating train/val split...")
-    to_traintest_folders(str(out_dir), str(out_dir), test_frac=test_frac)
-
-    print(f"✅ Tiling and split complete → {out_dir}")
-
-
-# ---------------------------------------------------------
-# Training
-# ---------------------------------------------------------
-
-def run_training(tiles_dir: Path,
-                 site_name: str,
-                 base_model: str,
-                 output_dir: Path,
-                 workers: int = 4,
-                 eval_period: int = 100,
-                 max_iter: int = 3000,
-                 patience: int = 5,
-                 resume: bool = False):
-    """
-    Register data, set up config, and start Detectree2 training.
+    Fine-tune Detectree2 official ResNet50-FPN model.
     """
 
-    train_dir = tiles_dir / "train"
-    if not train_dir.exists():
-        raise FileNotFoundError(f"No training directory found at {train_dir}")
+    print("📚 Registering training dataset…")
 
-    print("📚 Registering training data...")
-    register_train_data(str(train_dir), site_name, val_fold=5)
+    site_name = "TCD"
+    val_fold = 1  # default: second folder is validation
 
-    trains = (f"{site_name}_train",)
-    tests = (f"{site_name}_val",)
+    register_train_data(str(tiles_root), site_name, val_fold=val_fold)
 
+    train_name = f"{site_name}_train"
+    val_name = f"{site_name}_val"
+
+    # --- Load correct architecture & weights ---
     cfg = setup_cfg(
-        base_model=base_model,
-        trains=trains,
-        tests=tests,
-        workers=workers,
-        eval_period=eval_period,
-        max_iter=max_iter,
-        out_dir=str(output_dir)
+        base_model="COCO-InstanceSegmentation/mask_rcnn_R_50_FPN_3x.yaml",
+        trains=(train_name,),
+        tests=(val_name,),
+        workers=4,
+        eval_period=100,
+        max_iter=3000,
+        out_dir=str(output_dir),
     )
+
+    cfg.MODEL.WEIGHTS = "230103_randresize_full.pth"
+
+    cfg.MODEL.DEVICE = "cpu"
+    print("🧠 Using CPU backend")
+
+    # --- Apply preset ---
+    if preset == "tiny":
+        cfg = apply_tiny_config(cfg, train_name, val_name)
+    else:
+        cfg = apply_fast_config(cfg, train_name, val_name)
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    print("🚀 Starting training...")
-    trainer = MyTrainer(cfg, patience=patience)
-    trainer.resume_or_load(resume=resume)
+    print("🚀 Training starting…")
+    trainer = MyTrainer(cfg, patience=5)
+    trainer.resume_or_load(resume=False)
     trainer.train()
+    print("🎉 Training complete — model_final.pth ready")
 
-    print(f"🎉 Training complete. Model saved to {output_dir}")
 
-
-# ---------------------------------------------------------
-# CLI
-# ---------------------------------------------------------
+# ============================================================
+#   CLI
+# ============================================================
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Train Detectree2 on TCD dataset")
-
-    # Required inputs
-    p.add_argument("--img", required=True, type=str,
-                   help="Path to orthomosaic .tif")
-    p.add_argument("--crowns", required=True, type=str,
-                   help="Path to crowns .gpkg/.shp")
-    p.add_argument("--tiles", required=True, type=str,
-                   help="Output directory for tiled dataset")
-
-    # Training
-    p.add_argument("--site", default="TCDsite", type=str,
-                   help="Site name for dataset registration")
-    p.add_argument("--output", default="./train_outputs", type=str,
-                   help="Model output directory")
-    p.add_argument("--resume", action="store_true",
-                   help="Resume training from checkpoint")
-
-    # Model / config
-    p.add_argument("--base", default="COCO-InstanceSegmentation/mask_rcnn_R_101_FPN_3x.yaml",
-                   help="Detectron2 model zoo base model")
-    p.add_argument("--max_iter", default=3000, type=int)
-    p.add_argument("--eval_period", default=100, type=int)
-    p.add_argument("--workers", default=4, type=int)
-    p.add_argument("--patience", default=5, type=int)
-
-    # Tiling (advanced)
-    p.add_argument("--tile_width", default=40, type=int)
-    p.add_argument("--tile_height", default=40, type=int)
-    p.add_argument("--buffer", default=30, type=int)
-    p.add_argument("--threshold", default=0.6, type=float)
-    p.add_argument("--test_frac", default=0.15, type=float)
-
+    p = argparse.ArgumentParser()
+    p.add_argument("--already_downloaded", default=False, action="store_true")
+    p.add_argument("--preset", choices=["tiny", "fast"], default="tiny")
     return p.parse_args()
 
-
-# ---------------------------------------------------------
-# Main entrypoint
-# ---------------------------------------------------------
 
 def main():
     args = parse_args()
 
-    img_path = Path(args.img)
-    crowns_path = Path(args.crowns)
-    tiles_path = Path(args.tiles)
-    output_dir = Path(args.output)
+    data_root = Path("data/tcd")
+    raw_dir = data_root / "raw"
+    tiles_root = data_root / "tiles_pred"
+    output_dir = data_root / "train_outputs"
 
-    # Step 1 — tile dataset
-    prepare_tiles(
-        img_path=img_path,
-        crowns_path=crowns_path,
-        out_dir=tiles_path,
-        tile_width=args.tile_width,
-        tile_height=args.tile_height,
-        buffer=args.buffer,
-        threshold=args.threshold,
-        test_frac=args.test_frac
-    )
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    tiles_root.mkdir(parents=True, exist_ok=True)
 
-    # Step 2 — train
-    run_training(
-        tiles_dir=tiles_path,
-        site_name=args.site,
-        base_model=args.base,
-        output_dir=output_dir,
-        workers=args.workers,
-        eval_period=args.eval_period,
-        max_iter=args.max_iter,
-        patience=args.patience,
-        resume=args.resume
-    )
+    # Step 1: download or reuse tiles
+    if not args.already_downloaded:
+        print("🌐 Downloading via HF...")
+        download_tcd_tiles_streaming(raw_dir, max_images=3)
+    else:
+        print("⏭️ Using existing tiles in raw/")
+
+    # Step 2: tile everything
+    tile_all_tcd_tiles(raw_dir, tiles_root)
+
+    # Step 3: train
+    train_detectree2(tiles_root, output_dir, preset=args.preset)
+
+# ============================================================
+#   TRAINING CONFIG PRESETS (ResNet50-FPN)
+# ============================================================
+
+def apply_tiny_config(cfg, train_name, val_name, num_classes=1):
+    """
+    Tiny preset — FAST — but preserves the Detectree2 architecture.
+    Does NOT overwrite backbone.
+    """
+    cfg.DATASETS.TRAIN = (train_name,)
+    cfg.DATASETS.TEST = (val_name,)
+
+    # Very small images → very fast CPU training
+    cfg.INPUT.MIN_SIZE_TRAIN = (192,)
+    cfg.INPUT.MIN_SIZE_TEST = 192
+    cfg.INPUT.MAX_SIZE_TRAIN = 256
+    cfg.INPUT.MAX_SIZE_TEST = 256
+    cfg.INPUT.RANDOM_FLIP = "horizontal"
+
+    # Small iterator count
+    cfg.SOLVER.IMS_PER_BATCH = 1
+    cfg.SOLVER.BASE_LR = 3e-4
+    cfg.SOLVER.MAX_ITER = 120
+    cfg.SOLVER.WARMUP_ITERS = 20
+    cfg.TEST.EVAL_PERIOD = 60
+    cfg.SOLVER.CHECKPOINT_PERIOD = 120
+
+    return cfg
+
+
+def apply_fast_config(cfg, train_name, val_name, num_classes=1):
+    """
+    Larger than tiny preset but still optimised for CPU speed.
+    """
+    cfg.DATASETS.TRAIN = (train_name,)
+    cfg.DATASETS.TEST = (val_name,)
+
+    cfg.INPUT.MIN_SIZE_TRAIN = (256,)
+    cfg.INPUT.MIN_SIZE_TEST = 256
+    cfg.INPUT.MAX_SIZE_TRAIN = 512
+    cfg.INPUT.MAX_SIZE_TEST = 512
+
+    cfg.SOLVER.IMS_PER_BATCH = 1
+    cfg.SOLVER.BASE_LR = 1e-4
+    cfg.SOLVER.MAX_ITER = 800
+    cfg.SOLVER.WARMUP_ITERS = 50
+    cfg.TEST.EVAL_PERIOD = 200
+
+    return cfg
 
 
 if __name__ == "__main__":
