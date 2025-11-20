@@ -1,100 +1,116 @@
 #!/usr/bin/env python3
 """
-train.py — Fine-tune Detectree2’s official ResNet50-FPN model on local TCD tiles.
-
-Data layout (expected):
-
-data/tcd/raw/
-    tcd_tile_0.tif
-    tcd_tile_0_meta.json
-    ...
-
-data/tcd/tiles_pred/
-    tcd_tile_0_chips/
-        ... tiles produced by tile_data
+train.py — Fine-tune Detectree2 using tiny/fast/full YAML presets.
 
 Usage:
-
-  python train.py
-  python train.py --already_downloaded
+    python train.py --preset tiny   --weights baseline
+    python train.py --preset fast   --weights baseline
+    python train.py --preset full   --weights baseline
+    python train.py --weights finetuned
 """
 
 import argparse
-import json
+import os
 from pathlib import Path
 
-import geopandas as gpd
-import numpy as np
-import rasterio
-from rasterio.transform import from_bounds
-from shapely.geometry import Polygon, shape
-from shapely.affinity import affine_transform
-from shapely.validation import make_valid
-from pycocotools import mask as mask_utils
-
-from detectree2.preprocessing.tiling import tile_data
-from detectree2.models.train import register_train_data, MyTrainer, setup_cfg
-
 import torch
+from detectron2.engine import launch
+from detectron2.config import get_cfg
+from detectree2.models.train import register_train_data, MyTrainer
+from utils import download_tcd_tiles_streaming, tile_all_tcd_tiles
 
-from utils import download_tcd_tiles_streaming
-from utils import coco_meta_to_geodf
-from utils import tile_all_tcd_tiles
-
-import torch.multiprocessing as mp
-mp.set_start_method("spawn", force=True)
-torch.set_num_threads(1)
 
 # ============================================================
-#   TRAIN DETECTREE2
+#   Load preset YAML + override weights + device
 # ============================================================
 
-def train_detectree2(tiles_root: Path, output_dir: Path, preset="tiny"):
-    """
-    Fine-tune Detectree2 official ResNet50-FPN model.
-    """
+def load_preset_cfg(preset: str, weights: str, output_dir: Path):
+    cfg = get_cfg()
 
+    # Preset selection
+    preset_map = {
+        "tiny": "config/tiny_train.yaml",
+        "fast": "config/fast_train.yaml",
+        "full": "config/full_train.yaml",
+    }
+    cfg.merge_from_file(preset_map[preset])
+
+    # ---- Set model weights ----
+    if weights == "baseline":
+        cfg.MODEL.WEIGHTS = "230103_randresize_full.pth"
+    elif weights == "finetuned":
+        cfg.MODEL.WEIGHTS = str(output_dir / "model_final.pth")
+    else:
+        cfg.MODEL.WEIGHTS = weights  # custom path
+
+    # ---- Device selection ----
+    if torch.backends.mps.is_available():
+        cfg.MODEL.DEVICE = "mps"
+        print("💻 Using Apple MPS backend")
+    elif torch.cuda.is_available():
+        cfg.MODEL.DEVICE = "cuda"
+        print("🚀 Using CUDA GPU")
+    else:
+        cfg.MODEL.DEVICE = "cpu"
+        print("🧠 Using CPU")
+
+    cfg.OUTPUT_DIR = str(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    return cfg
+
+
+# ============================================================
+#   TRAINING
+# ============================================================
+
+def train_detectree2(tiles_root: Path, output_dir: Path, preset: str, weights: str):
     print("📚 Registering training dataset…")
 
     site_name = "TCD"
-    val_fold = 1  # default: second folder is validation
-
-    register_train_data(str(tiles_root), site_name, val_fold=val_fold)
+    val_fold = 1
+    register_train_data(str(tiles_root), site_name, val_fold)
 
     train_name = f"{site_name}_train"
     val_name = f"{site_name}_val"
 
-    # --- Load correct architecture & weights ---
-    cfg = setup_cfg(
-        base_model="COCO-InstanceSegmentation/mask_rcnn_R_50_FPN_3x.yaml",
-        trains=(train_name,),
-        tests=(val_name,),
-        workers=4,
-        eval_period=100,
-        max_iter=3000,
-        out_dir=str(output_dir),
-    )
-
-    cfg.MODEL.WEIGHTS = "230103_randresize_full.pth"
-
-    print(f"Using device: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'cpu'}")
-    # cfg.MODEL.DEVICE = "cpu"
-    print("🧠 Using CPU backend")
-    cfg.DATALOADER.NUM_WORKERS = 0
-
-    # --- Apply preset ---
-    if preset == "tiny":
-        cfg = apply_tiny_config(cfg, train_name, val_name)
-    else:
-        cfg = apply_fast_config(cfg, train_name, val_name)
-
-    output_dir.mkdir(parents=True, exist_ok=True)
+    cfg = load_preset_cfg(preset, weights, output_dir)
 
     print("🚀 Training starting…")
     trainer = MyTrainer(cfg, patience=5)
     trainer.resume_or_load(resume=False)
     trainer.train()
-    print("🎉 Training complete — model_final.pth ready")
+
+    print("🎉 Training complete → model_final.pth saved")
+
+
+# ============================================================
+#   Worker run by launch()
+# ============================================================
+
+def main_worker(args):
+    data_root = Path("data/tcd")
+    raw_dir = data_root / "raw"
+    tiles_root = data_root / "tiles_pred"
+    output_dir = data_root / "train_outputs"
+
+    raw_dir.mkdir(exist_ok=True)
+    tiles_root.mkdir(exist_ok=True)
+
+    # 1. Download
+    if not args.already_downloaded:
+        print("🌐 Downloading HF tiles…")
+        download_tcd_tiles_streaming(raw_dir, max_images=args.max_images)
+    else:
+        print("⏭️ Using existing raw tiles")
+
+    # 2. Tile (only needs to happen once)
+    tile_all_tcd_tiles(raw_dir, tiles_root)
+
+    # 3. Train
+    train_detectree2(tiles_root, output_dir,
+                     preset=args.preset,
+                     weights=args.weights)
 
 
 # ============================================================
@@ -103,85 +119,33 @@ def train_detectree2(tiles_root: Path, output_dir: Path, preset="tiny"):
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--already_downloaded", default=False, action="store_true")
-    p.add_argument("--preset", choices=["tiny", "fast"], default="tiny")
+
+    p.add_argument("--already_downloaded", action="store_true")
+    p.add_argument("--max_images", type=int, default=3)
+
+    p.add_argument("--preset",
+                   default="tiny",
+                   choices=["tiny", "fast", "full"])
+
+    p.add_argument("--weights",
+                   default="baseline",
+                   help="'baseline' | 'finetuned' | /path/to/model.pth")
+
     return p.parse_args()
 
 
-def main():
-    args = parse_args()
-
-    data_root = Path("data/tcd")
-    raw_dir = data_root / "raw"
-    tiles_root = data_root / "tiles_pred"
-    output_dir = data_root / "train_outputs"
-
-    raw_dir.mkdir(parents=True, exist_ok=True)
-    tiles_root.mkdir(parents=True, exist_ok=True)
-
-    # # Step 1: download or reuse tiles
-    # if not args.already_downloaded:
-    #     print("🌐 Downloading via HF...")
-    #     download_tcd_tiles_streaming(raw_dir, max_images=3)
-    # else:
-    #     print("⏭️ Using existing tiles in raw/")
-
-    # Step 2: tile everything
-    # tile_all_tcd_tiles(raw_dir, tiles_root)
-
-    # Step 3: train
-    train_detectree2(tiles_root, output_dir, preset=args.preset)
-
 # ============================================================
-#   TRAINING CONFIG PRESETS (ResNet50-FPN)
-# ============================================================
-
-def apply_tiny_config(cfg, train_name, val_name, num_classes=1):
-    """
-    Tiny preset — FAST — but preserves the Detectree2 architecture.
-    Does NOT overwrite backbone.
-    """
-    cfg.DATASETS.TRAIN = (train_name,)
-    cfg.DATASETS.TEST = (val_name,)
-
-    # Very small images → very fast CPU training
-    cfg.INPUT.MIN_SIZE_TRAIN = (192,)
-    cfg.INPUT.MIN_SIZE_TEST = 192
-    cfg.INPUT.MAX_SIZE_TRAIN = 256
-    cfg.INPUT.MAX_SIZE_TEST = 256
-    cfg.INPUT.RANDOM_FLIP = "horizontal"
-
-    # Small iterator count
-    cfg.SOLVER.IMS_PER_BATCH = 1
-    cfg.SOLVER.BASE_LR = 3e-4
-    cfg.SOLVER.MAX_ITER = 120
-    cfg.SOLVER.WARMUP_ITERS = 20
-    cfg.TEST.EVAL_PERIOD = 60
-    cfg.SOLVER.CHECKPOINT_PERIOD = 120
-
-    return cfg
-
-
-def apply_fast_config(cfg, train_name, val_name, num_classes=1):
-    """
-    Larger than tiny preset but still optimised for CPU speed.
-    """
-    cfg.DATASETS.TRAIN = (train_name,)
-    cfg.DATASETS.TEST = (val_name,)
-
-    cfg.INPUT.MIN_SIZE_TRAIN = (256,)
-    cfg.INPUT.MIN_SIZE_TEST = 256
-    cfg.INPUT.MAX_SIZE_TRAIN = 512
-    cfg.INPUT.MAX_SIZE_TEST = 512
-
-    cfg.SOLVER.IMS_PER_BATCH = 1
-    cfg.SOLVER.BASE_LR = 1e-4
-    cfg.SOLVER.MAX_ITER = 800
-    cfg.SOLVER.WARMUP_ITERS = 50
-    cfg.TEST.EVAL_PERIOD = 200
-
-    return cfg
-
 
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+
+    num_gpus = int(os.environ.get("NUM_GPUS", "1"))
+
+    launch(
+        main_worker,
+        num_gpus_per_machine=num_gpus,
+        num_machines=int(os.environ.get("NUM_MACHINES", "1")),
+        machine_rank=int(os.environ.get("MACHINE_RANK", "0")),
+        dist_url=os.environ.get("DIST_URL", "tcp://127.0.0.1:29500"),
+        args=(args,),
+    )

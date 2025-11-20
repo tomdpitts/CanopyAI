@@ -1,0 +1,91 @@
+# ============================================================
+#   FULL TRAINING CONFIG — GPU / MULTI-GPU / CLUSTER READY
+#   Heavy augmentation + long schedule + multi-scale
+#   Base: Detectree2 official ResNet50-FPN model
+# ============================================================
+
+_BASE_: "COCO-InstanceSegmentation/mask_rcnn_R_50_FPN_3x.yaml"
+
+# ------------------------------------------------------------
+#  MODEL
+# ------------------------------------------------------------
+MODEL:
+  WEIGHTS: "230103_randresize_full.pth"
+  MASK_ON: True
+  BACKBONE:
+    FREEZE_AT: 0 # 0 = fine-tune whole backbone
+  RESNETS:
+    DEPTH: 50
+  ROI_HEADS:
+    NUM_CLASSES: 1   # Only one class (crown)
+    BATCH_SIZE_PER_IMAGE: 256    # more stable fine-tuning
+  ROI_BOX_HEAD:
+    SMOOTH_L1_BETA: 0.5
+  ROI_MASK_HEAD:
+    NUM_CONV: 4
+    CONV_DIM: 256
+
+# ------------------------------------------------------------
+#  INPUT AUGMENTATIONS (HEAVY)
+# ------------------------------------------------------------
+INPUT:
+  # Multi-scale: randomly sample during training
+  MIN_SIZE_TRAIN: (512, 640, 768, 896, 1024)
+  MAX_SIZE_TRAIN: 1536
+  MIN_SIZE_TEST: 1024
+  MAX_SIZE_TEST: 1536
+
+  # Random flips
+  RANDOM_FLIP: "horizontal"
+
+  # Random cropping (helps with generalization)
+  CROP:
+    ENABLED: True
+    TYPE: "absolute_range"
+    SIZE: (512, 768)
+
+  # Color / lighting augmentations
+  BRIGHTNESS: (0.7, 1.3)
+  CONTRAST: (0.7, 1.3)
+  SATURATION: (0.7, 1.3)
+
+  # Rotation augmentation
+  ROTATION_ANGLES: (0, 90, 180, 270)
+
+# ------------------------------------------------------------
+#  SOLVER (LARGE SCALE TRAINING)
+# ------------------------------------------------------------
+SOLVER:
+  IMS_PER_BATCH: 8             # total batch size (auto-scales w/ GPUs)
+  BASE_LR: 0.00015             # lower LR for fine-tuning on small datasets
+  WARMUP_ITERS: 1000
+  WARMUP_FACTOR: 0.001
+
+  # Cosine annealing schedule
+  LR_SCHEDULER_NAME: "WarmupCosineLR"
+
+  MAX_ITER: 30000              # Full training schedule (~30k iterations)
+  CHECKPOINT_PERIOD: 5000      # Save interval
+
+  STEPS: []         # Not used for cosine LR
+  GAMMA: 0.1
+
+  CLIP_GRADIENTS:
+    ENABLED: True        # stability when training on small datasets
+    CLIP_TYPE: "norm"
+    CLIP_VALUE: 1.0
+
+# ------------------------------------------------------------
+#  DATALOADER
+# ------------------------------------------------------------
+DATALOADER:
+  NUM_WORKERS: 8    # For GPU cluster which supports this
+  FILTER_EMPTY_ANNOTATIONS: True
+
+# ------------------------------------------------------------
+#  TRAIN / TEST
+# ------------------------------------------------------------
+TEST:
+  EVAL_PERIOD: 2500  # Lower this for more frequent eval
+
+OUTPUT_DIR: "output_full"

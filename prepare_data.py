@@ -45,7 +45,7 @@ def parse_args():
     p.add_argument(
         "--max_images",
         type=int,
-        default=3,
+        default=20,
         help="Number of TCD tiles to download (ignored if already_downloaded=True)"
     )
     return p.parse_args()
