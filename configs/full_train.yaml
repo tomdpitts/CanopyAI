@@ -4,13 +4,13 @@
 #   Base: Detectree2 official ResNet50-FPN model
 # ============================================================
 
-_BASE_: "COCO-InstanceSegmentation/mask_rcnn_R_50_FPN_3x.yaml"
+_BASE_: "base.yaml"
 
 # ------------------------------------------------------------
 #  MODEL
 # ------------------------------------------------------------
 MODEL:
-  WEIGHTS: "230103_randresize_full.pth"
+  WEIGHTS: "../230103_randresize_full.pth"
   MASK_ON: True
   BACKBONE:
     FREEZE_AT: 0 # 0 = fine-tune whole backbone

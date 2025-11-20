@@ -1,5 +1,9 @@
 # config/fast_train.yaml
-_BASE_: "230103_randresize_full.yaml"
+_BASE_: "base.yaml"
+
+MODEL:
+  WEIGHTS: "../230103_randresize_full.pth"
+  MASK_ON: True
 
 SOLVER:
   MAX_ITER: 1200
@@ -18,7 +22,3 @@ INPUT:
 
 DATALOADER:
   FILTER_EMPTY_ANNOTATIONS: True
-
-MODEL:
-  MASK_ON: True
-  # no weights here — CLI controls this

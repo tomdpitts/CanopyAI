@@ -3,9 +3,11 @@
 train.py — Fine-tune Detectree2 using tiny/fast/full YAML presets.
 
 Usage:
-    python train.py --preset tiny   --weights baseline
+    python train.py --preset tiny   --weights baseline --already_downloaded
     python train.py --preset fast   --weights baseline
     python train.py --preset full   --weights baseline
+    
+for finetuning from previous run:
     python train.py --weights finetuned
 """
 
@@ -15,8 +17,10 @@ from pathlib import Path
 
 import torch
 from detectron2.engine import launch
-from detectron2.config import get_cfg
+# from detectron2.config import get_cfg
+from detectron2 import model_zoo
 from detectree2.models.train import register_train_data, MyTrainer
+from detectree2.models.train import setup_cfg
 from utils import download_tcd_tiles_streaming, tile_all_tcd_tiles
 
 
@@ -25,15 +29,18 @@ from utils import download_tcd_tiles_streaming, tile_all_tcd_tiles
 # ============================================================
 
 def load_preset_cfg(preset: str, weights: str, output_dir: Path):
-    cfg = get_cfg()
+    
+    cfg = setup_cfg(update_model="230103_randresize_full.pth")
 
     # Preset selection
     preset_map = {
-        "tiny": "config/tiny_train.yaml",
-        "fast": "config/fast_train.yaml",
-        "full": "config/full_train.yaml",
+        "tiny": "configs/tiny_debug.yaml",
+        "fast": "configs/fast_train.yaml",
+        "full": "configs/full_train.yaml",
     }
     cfg.merge_from_file(preset_map[preset])
+    cfg.IMGMODE = "rgb"
+
 
     # ---- Set model weights ----
     if weights == "baseline":
@@ -72,17 +79,18 @@ def train_detectree2(tiles_root: Path, output_dir: Path, preset: str, weights: s
     register_train_data(str(tiles_root), site_name, val_fold)
 
     train_name = f"{site_name}_train"
-    val_name = f"{site_name}_val"
+    val_name   = f"{site_name}_val"
 
     cfg = load_preset_cfg(preset, weights, output_dir)
+
+    # Explicitly set correct datasets
+    cfg.DATASETS.TRAIN = (train_name,)
+    cfg.DATASETS.TEST  = (val_name,)
 
     print("🚀 Training starting…")
     trainer = MyTrainer(cfg, patience=5)
     trainer.resume_or_load(resume=False)
     trainer.train()
-
-    print("🎉 Training complete → model_final.pth saved")
-
 
 # ============================================================
 #   Worker run by launch()
@@ -99,13 +107,16 @@ def main_worker(args):
 
     # 1. Download
     if not args.already_downloaded:
-        print("🌐 Downloading HF tiles…")
-        download_tcd_tiles_streaming(raw_dir, max_images=args.max_images)
-    else:
-        print("⏭️ Using existing raw tiles")
+        # Full pipeline: download + tile
+        print("🌐 Downloading TCD tiles via HuggingFace…")
+        download_tcd_tiles_streaming(save_dir=raw_dir, max_images=args.max_images)
 
-    # 2. Tile (only needs to happen once)
-    tile_all_tcd_tiles(raw_dir, tiles_root)
+        print("🧩 Tiling tiles for training…")
+        tile_all_tcd_tiles(raw_dir, tiles_root)
+
+    else:
+        # Nothing to download, nothing to tile
+        print("⏭️ Skipping download and tiling (using existing chips)")
 
     # 3. Train
     train_detectree2(tiles_root, output_dir,

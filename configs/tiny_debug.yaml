@@ -1,5 +1,5 @@
 # config/tiny_train.yaml
-_BASE_: "230103_randresize_full.yaml"
+_BASE_: "base.yaml"
 
 SOLVER:
   MAX_ITER: 50
@@ -10,7 +10,7 @@ SOLVER:
   WARMUP_ITERS: 0
 
 INPUT:
-  MIN_SIZE_TRAIN: [256]
+  MIN_SIZE_TRAIN: 256
   MAX_SIZE_TRAIN: 512
   MIN_SIZE_TEST: 256
   MAX_SIZE_TEST: 512
@@ -18,8 +18,3 @@ INPUT:
 
 DATALOADER:
   FILTER_EMPTY_ANNOTATIONS: True
-
-MODEL:
-  MASK_ON: True
-  # --- IMPORTANT ---
-  # Do NOT set MODEL.WEIGHTS here.
