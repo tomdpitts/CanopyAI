@@ -77,7 +77,8 @@ def train_detectree2(tiles_root: Path, output_dir: Path, preset="tiny"):
 
     cfg.MODEL.WEIGHTS = "230103_randresize_full.pth"
 
-    cfg.MODEL.DEVICE = "cpu"
+    print(f"Using device: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'cpu'}")
+    # cfg.MODEL.DEVICE = "cpu"
     print("🧠 Using CPU backend")
     cfg.DATALOADER.NUM_WORKERS = 0
 

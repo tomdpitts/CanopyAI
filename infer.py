@@ -36,6 +36,7 @@ from utils import visualize_validation_results
 from utils import compute_final_metric
 from utils import filter_raw_predictions
 from utils import load_tcd_meta_for_tile
+from utils import apply_nms_to_geojson
 import torch
 import torch.multiprocessing as mp
 mp.set_start_method("spawn", force=True)
@@ -43,6 +44,7 @@ mp.set_start_method("spawn", force=True)
 # Key Hyperparameters
 
 filter_threshold = 0.65
+nms_dedupe_threshold = 0.18
 
 
 # --------------------------------------------------
@@ -165,7 +167,7 @@ def main():
         chip_dir = Path(pred_tiles_path) / f"{img_path.stem}_chips"
         ensure_dir(chip_dir)
 
-        buffer = 10
+        buffer = 30
         tile_width = 40
         tile_height = 40
 
@@ -222,7 +224,9 @@ def main():
         # Detectree2 produces one GeoJSON per tile — merge them for evaluation
         merged_geojson = chip_geo_dir / f"{img_path.stem}_merged.geojson"
         merge_tile_geojsons(chip_geo_dir, merged_geojson)
-
+        # Apply NMS to remove duplicate overlapping polygons
+        apply_nms_to_geojson(merged_geojson, iou_threshold=nms_dedupe_threshold)
+        
         # visualize_saved_prediction_with_masks(
         #     img_path,                     # original tile
         #     merged_geojson,               # merged prediction mask JSON
@@ -310,9 +314,6 @@ def parse_args():
         choices=["baseline", "finetuned"],
         help="Which model weights to use: baseline or finetuned",
     )
-    ap.add_argument("--already_downloaded", 
-                    default=False,
-                    action="store_true")
     
     return ap.parse_args()
 
@@ -442,3 +443,4 @@ if __name__ == "__main__":
         smoke_test(model_path)
     else:
         main()
+        

@@ -761,3 +761,55 @@ def tile_all_tcd_tiles(raw_dir: Path, tiles_root: Path,
         )
 
         print(f"✅ Finished tiling → {chips_dir}")
+
+
+# Non Maximum Suppression (NMS) for GeoJSON predictions
+def apply_nms_to_geojson(geojson_path: Path, iou_threshold: float = 0.3) -> Path:
+    """
+    Remove duplicate/overlapping predictions using NMS (Non-Maximum Suppression).
+    Keeps highest-confidence predictions and removes lower-confidence overlaps.
+    """
+    
+    gdf = gpd.read_file(geojson_path)
+    
+    if len(gdf) == 0:
+        print(f"⚠️ No predictions in {geojson_path}")
+        return geojson_path
+    
+    print(f"📊 NMS input: {len(gdf)} polygons")
+    
+    gdf = gdf.sort_values("Confidence_score", ascending=False).reset_index(drop=True)
+    
+    keep_indices = set(range(len(gdf)))  # Start with all indices
+    removed = 0
+    
+    for i in range(len(gdf)):
+        if i not in keep_indices:
+            continue  # Already removed
+        
+        geom_i = gdf.loc[i, "geometry"]
+        conf_i = gdf.loc[i, "Confidence_score"]
+        
+        for j in range(i + 1, len(gdf)):
+            if j not in keep_indices:
+                continue  # Already removed
+            
+            geom_j = gdf.loc[j, "geometry"]
+            conf_j = gdf.loc[j, "Confidence_score"]
+            
+            intersection = geom_i.intersection(geom_j).area
+            union = geom_i.union(geom_j).area
+            iou = intersection / union if union > 0 else 0
+            
+            # Remove LOWER-confidence polygon (j, since sorted descending)
+            if iou > iou_threshold:
+                keep_indices.discard(j)  # REMOVE j from keep set
+                removed += 1
+                # print(f"  Removing poly_{j} (conf={conf_j:.3f}) — overlaps with poly_{i} (conf={conf_i:.3f}, IoU={iou:.3f})")
+    
+    print(f"📊 NMS output: {len(keep_indices)} polygons (removed {removed})")
+    
+    gdf_dedup = gdf.loc[list(keep_indices)].copy()
+    gdf_dedup.to_file(geojson_path, driver="GeoJSON")
+    
+    return geojson_path
