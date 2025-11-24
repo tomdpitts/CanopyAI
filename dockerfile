@@ -1,39 +1,43 @@
-# Base image with PyTorch and CUDA
-# To run: 
-    # docker build -t detectree2:tcd .
-# On cluster node:
-    # docker run --gpus all -it -v /data:/data detectree2:tcd /bin/bash
+# ============================================================
+# canopyAI Dockerfile (HPC-friendly, Singularity compatible)
+# ============================================================
 
+FROM continuumio/miniconda3
 
-FROM pytorch/pytorch:2.4.0-cuda12.1-cudnn9-runtime
-
-# System deps for rasterio/GDAL/shapely etc.
+# --- System deps ---
 RUN apt-get update && apt-get install -y \
-    gdal-bin libgdal-dev \
-    libspatialindex-dev \
+    git build-essential wget \
+    libgl1 libglib2.0-0 libgdal-dev gdal-bin \
     && rm -rf /var/lib/apt/lists/*
 
-# Optional: set GDAL envs
-ENV GDAL_DATA=/usr/share/gdal \
-    PROJ_LIB=/usr/share/proj
+# --- Conda env ---
+RUN conda create -y -n canopyAI python=3.12
+SHELL ["conda", "run", "-n", "canopyAI", "/bin/bash", "-c"]
 
-# Create workspace
+# --- Geospatial stack ---
+RUN conda install -y -c conda-forge \
+    gdal=3.12 rasterio geopandas shapely fiona pyproj rtree affine \
+    && conda clean -afy
+
+# --- PyTorch CPU ---
+RUN pip install torch torchvision torchaudio
+
+# --- Detectron2 ---
+RUN pip install "git+https://github.com/facebookresearch/detectron2.git"
+
+# --- Utilities ---
+RUN pip install \
+    opencv-python wget requests matplotlib cython pycocotools \
+    duckdb pyarrow scikit-image tqdm
+
+# --- Copy canopyAI repo ---
 WORKDIR /workspace
-
-# Copy project
 COPY . /workspace
 
-# Python deps
-RUN pip install --no-cache-dir --upgrade pip \
- && pip install --no-cache-dir \
-    "torchmetrics" "tensorboard" \
-    "rasterio" "geopandas" "shapely" "pycocotools" "datasets" "wget"
+# --- Install canopyAI package from the repo ---
+RUN pip install -e .
 
-# Install detectron2 (matching CUDA/PyTorch)
-RUN pip install --no-cache-dir 'git+https://github.com/facebookresearch/detectron2.git'
+ENV PYTHONPATH=/workspace
+ENV PATH=/opt/conda/envs/canopyAI/bin:$PATH
 
-# Install detectree2
-RUN pip install --no-cache-dir 'git+https://github.com/PatBall1/detectree2.git'
-
-# Default: just drop into bash
 CMD ["/bin/bash"]

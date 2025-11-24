@@ -1,6 +1,7 @@
 # requirements.txt
 # Core geospatial + utils
 
+torch
 rasterio
 geopandas
 shapely
@@ -9,6 +10,10 @@ pyproj
 rtree
 opencv-python
 wget
+requests
+pycocotools
+matplotlib
+datasets
 
 # Also needed: PyTorch + Detectron2
 # Latest compatible Python currently: 3.12
@@ -18,4 +23,7 @@ wget
 # xcode-select --install  #(if not already installed)
 # brew install cmake ninja pkg-config
 
+# pip install git+https://github.com/PatBall1/detectree2.git
+
+# Not sure this is needed actually:
 # pip install "git+https://github.com/facebookresearch/detectron2.git"

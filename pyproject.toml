@@ -1,0 +1,10 @@
+[project]
+name = "canopyAI"
+version = "0.1.0"
+description = "High-resolution tree canopy detection & remote sensing tools"
+readme = "README.md"
+authors = [{ name = "Tom Pitts, Kunqi Li" }]
+requires-python = "3.12"
+
+[tool.setuptools.packages.find]
+where = ["."]

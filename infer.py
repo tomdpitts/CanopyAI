@@ -271,6 +271,7 @@ def main():
     final_canopy = compute_final_metric(all_canopy_scores, thresh=0.7,
                                     n_pred=total_pred, n_gt=total_gt_canopy)
     
+    print(f"============= Cohort Metrics ================")
     print_metrics("Trees (IoU)", final_tree)
     print_metrics("Canopy (IoP)", final_canopy)  
     
