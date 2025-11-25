@@ -1,8 +1,12 @@
 # ============================================================
-# canopyAI Dockerfile (HPC-friendly, Singularity compatible)
+# canopyAI Dockerfile (HPC-ready & Singularity compatible)
 # ============================================================
 
-FROM continuumio/miniconda3
+# To build:
+# docker build -t canopyai .
+
+# Hardcoded to Linux x86_64 for HPC env
+FROM --platform=linux/amd64 continuumio/miniconda3
 
 # --- System deps ---
 RUN apt-get update && apt-get install -y \
@@ -11,12 +15,16 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # --- Conda env ---
-RUN conda create -y -n canopyAI python=3.12
+RUN conda create -y -n canopyAI python=3.10
 SHELL ["conda", "run", "-n", "canopyAI", "/bin/bash", "-c"]
 
 # --- Geospatial stack ---
 RUN conda install -y -c conda-forge \
-    gdal=3.12 rasterio geopandas shapely fiona pyproj rtree affine \
+    gdal=3.10.* \
+    rasterio=1.4.* \
+    fiona=1.9.* \
+    geopandas=0.14.* \
+    shapely pyproj rtree affine \
     && conda clean -afy
 
 # --- PyTorch CPU ---
