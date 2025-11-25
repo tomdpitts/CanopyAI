@@ -6,3 +6,7 @@ data/*
 overlays_validation
 eval
 eval2
+
+.mypy_cache
+__pycache__
+archive*

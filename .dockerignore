@@ -1,0 +1,63 @@
+# ---------------------------
+# Python cache / venvs
+# ---------------------------
+__pycache__/
+.mypy_cache
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+venv*/
+*.egg-info/
+
+# ---------------------------
+# IDE / system noise
+# ---------------------------
+.vscode/
+.idea/
+.DS_Store
+
+# ---------------------------
+# Large model weights
+# ---------------------------
+*.pth
+*.pt
+*.bin
+*.ckpt
+
+# If you want to keep only the code version of your model,
+# explicitly ignore the file you mentioned:
+230103_randresize_full.pth
+
+# ---------------------------
+# Data & outputs
+# ---------------------------
+data/
+data/*
+data2/
+overlays_validation/
+eval/
+eval2/
+results/
+datasets/
+outputs/
+models/
+checkpoints/
+samples/
+
+# ---------------------------
+# Images / geospatial heavy files
+# ---------------------------
+*.tif
+*.tiff
+*.png
+*.jpg
+*.jp2
+*.vrt
+
+# ---------------------------
+# Git
+# ---------------------------
+.git
+.gitignore

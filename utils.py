@@ -163,11 +163,19 @@ def download_tcd_tiles_streaming(save_dir: Path, max_images: int = 3):
     Output per tile:
       save_dir / f"tcd_tile_{i}.tif"
       save_dir / f"tcd_tile_{i}_meta.json"
+
+    Note: We disable image decoding in the dataset to avoid Pillow's
+    JPEG-compressed TIFF issues, and decode manually with cv2 instead.
     """
     from datasets import load_dataset
+    from io import BytesIO
+    from PIL import Image
 
     print("📦 Loading TCD dataset in streaming mode...")
-    ds = load_dataset("restor/tcd", split="train", streaming=True)
+    # Disable automatic image decoding to avoid Pillow TIFF/JPEG issues
+    ds = load_dataset("restor/tcd", split="train", streaming=True).cast_column(
+        "image", {"_type": "Value", "dtype": "binary"}
+    )
 
     save_dir.mkdir(parents=True, exist_ok=True)
 
@@ -175,7 +183,6 @@ def download_tcd_tiles_streaming(save_dir: Path, max_images: int = 3):
 
     for image_info in ds:
         if not is_rangeland(image_info):
-            print("Nope!")
             continue
 
         if count >= max_images:
@@ -188,15 +195,43 @@ def download_tcd_tiles_streaming(save_dir: Path, max_images: int = 3):
         meta_path = save_dir / f"tcd_tile_{count}_meta.json"
 
         # ------------------
-        # Save image (.tif)
+        # Decode image manually to avoid Pillow TIFF/JPEG issues
         # ------------------
-        img = np.array(image_info["image"])
+        try:
+            # Get raw image bytes
+            img_bytes = image_info["image"]["bytes"]
+
+            # Decode with cv2 (more robust for JPEG-compressed TIFFs)
+            img_array = np.frombuffer(img_bytes, dtype=np.uint8)
+            img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+
+            if img is None:
+                # Fallback to PIL if cv2 fails
+                print("  ⚠️  cv2 decode failed, trying PIL...")
+                pil_img = Image.open(BytesIO(img_bytes))
+                img = np.array(pil_img)
+                if img.ndim == 3 and img.shape[2] == 3:
+                    # PIL loads as RGB, cv2 expects BGR
+                    img = cv2.cvtColor(img, cv2.COLOR_RGB_BGR)
+
+            # Convert BGR to RGB for rasterio
+            if img.ndim == 3 and img.shape[2] == 3:
+                img = cv2.cvtColor(img, cv2.COLOR_BGR_RGB)
+
+        except Exception as e:
+            print(f"  ❌ Failed to decode image {image_id}: {e}")
+            print(f"  Skipping tile {count}")
+            continue
+
         h, w = img.shape[:2]
         crs = image_info["crs"]
         bounds = image_info["bounds"]
 
         transform = from_bounds(*bounds, width=w, height=h)
 
+        # ------------------
+        # Save as GeoTIFF
+        # ------------------
         with rasterio.open(
             img_path,
             "w",
@@ -214,7 +249,6 @@ def download_tcd_tiles_streaming(save_dir: Path, max_images: int = 3):
         # ------------------
         # Save metadata JSON
         # ------------------
-        # We store all the important geo/COCO info in a JSON-serializable form
         meta = {
             "image_id": image_id,
             "bounds": bounds,
@@ -222,15 +256,15 @@ def download_tcd_tiles_streaming(save_dir: Path, max_images: int = 3):
             "width": w,
             "height": h,
             "coco_annotations": image_info.get("coco_annotations", []),
-            # keep some extra context if you like:
             "biome": image_info.get("biome"),
+            "biome_name": image_info.get("biome_name"),
             "country": image_info.get("country"),
         }
 
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(meta, f)
 
-        print(f"✅ Saved Australian tile → {img_path}")
+        print(f"✅ Saved tile → {img_path}")
         print(f"📄 Saved metadata → {meta_path}")
 
         count += 1

@@ -143,7 +143,12 @@ def main():
     total_gt_canopy = 0
 
     # === 5–12. Process each tile ===
-    raw_dir = Path("data/tcd/raw")
+    if args.use_test_data:
+        raw_dir = Path("data/tcd/raw_test")
+        print("\n🧪 Using TEST data from data/tcd/raw_test/")
+    else:
+        raw_dir = Path("data/tcd/raw")
+        print("\n📊 Using TRAINING data from data/tcd/raw/")
 
     if len(list(raw_dir.glob("tcd_tile_*.tif"))) == 0:
         raise FileNotFoundError(
@@ -321,6 +326,13 @@ def parse_args():
         default="baseline",
         choices=["baseline", "finetuned"],
         help="Which model weights to use: baseline or finetuned",
+    )
+    ap.add_argument(
+        "--use_test_data",
+        action="store_true",
+        help=(
+            "Run inference on test data (data/tcd/raw_test/) instead of training data"
+        ),
     )
 
     return ap.parse_args()

@@ -1,0 +1,13 @@
+name: canopyAI
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - gdal=3.7.*
+  - rasterio=1.4.*
+  - fiona=1.9.*
+  - geopandas=0.14.*
+  - shapely
+  - pyproj
+  - rtree
+  - affine  

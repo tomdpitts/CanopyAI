@@ -1,0 +1,15 @@
+name: canopyAI-linux64
+channels:
+  - defaults        # heavy compiled stuff from defaults (more stable right now)
+  - conda-forge     # fallback for missing bits
+dependencies:
+  - python=3.11
+  - pip
+  - gdal
+  - rasterio
+  - fiona
+  - geopandas
+  - shapely
+  - pyproj
+  - rtree
+  - affine
