@@ -23,24 +23,99 @@ import cv2
 from detectree2.preprocessing.tiling import tile_data
 
 
-
 def is_australia(x):
-    return (
-        -44 <= x["lat"] <= -10 and
-        112 <= x["lon"] <= 154
-    )
+    return -44 <= x["lat"] <= -10 and 112 <= x["lon"] <= 154
+
+
 aus_tiles = [
-1207, 4347, 4159, 4893, 4406, 2100, 1104, 3956, 2859, 3684, 5001, 3469,
-5012, 4660, 536, 4315, 4506, 3624, 4127, 4963, 423, 1703, 3016, 4643,
-922, 4221, 4955, 4909, 3219, 1671, 195, 4923, 4556, 4086, 1969, 3611,
-4336, 2581, 1033, 314, 2491, 4720, 4421, 5005, 4435, 2654, 62, 4593,
-5057, 1612, 1417, 1278, 2403, 2270, 367, 1339, 1117, 4507, 4040, 577,
-439, 2888, 4326, 1875, 760, 678, 3456, 4108, 1029, 2515, 4996, 876,
-4639, 4933, 2031, 750, 1248, 743, 2293, 3277, 3875, 1077
+    1207,
+    4347,
+    4159,
+    4893,
+    4406,
+    2100,
+    1104,
+    3956,
+    2859,
+    3684,
+    5001,
+    3469,
+    5012,
+    4660,
+    536,
+    4315,
+    4506,
+    3624,
+    4127,
+    4963,
+    423,
+    1703,
+    3016,
+    4643,
+    922,
+    4221,
+    4955,
+    4909,
+    3219,
+    1671,
+    195,
+    4923,
+    4556,
+    4086,
+    1969,
+    3611,
+    4336,
+    2581,
+    1033,
+    314,
+    2491,
+    4720,
+    4421,
+    5005,
+    4435,
+    2654,
+    62,
+    4593,
+    5057,
+    1612,
+    1417,
+    1278,
+    2403,
+    2270,
+    367,
+    1339,
+    1117,
+    4507,
+    4040,
+    577,
+    439,
+    2888,
+    4326,
+    1875,
+    760,
+    678,
+    3456,
+    4108,
+    1029,
+    2515,
+    4996,
+    876,
+    4639,
+    4933,
+    2031,
+    750,
+    1248,
+    743,
+    2293,
+    3277,
+    3875,
+    1077,
 ]
+
 
 def is_really_australia(x):
     return x["image_id"] in aus_tiles
+
 
 rangeland = [
     "West Sudanian savanna",
@@ -59,7 +134,7 @@ rangeland = [
     "Low Monte",
     "Central Andean puna",
     "Central Andean dry puna",
-    "Zambezian and Mopane woodlands"
+    "Zambezian and Mopane woodlands",
 ]
 
 arid_rangeland = [
@@ -71,12 +146,12 @@ arid_rangeland = [
     "Low Monte",
     "Zambezian and Mopane woodlands",
     "East Sudanian savanna",
-    "West Sudanian savanna"
+    "West Sudanian savanna",
 ]
+
 
 def is_rangeland(x):
     return x["biome_name"] in arid_rangeland
-
 
 
 def download_tcd_tiles_streaming(save_dir: Path, max_images: int = 3):
@@ -90,6 +165,7 @@ def download_tcd_tiles_streaming(save_dir: Path, max_images: int = 3):
       save_dir / f"tcd_tile_{i}_meta.json"
     """
     from datasets import load_dataset
+
     print("📦 Loading TCD dataset in streaming mode...")
     ds = load_dataset("restor/tcd", split="train", streaming=True)
 
@@ -161,6 +237,7 @@ def download_tcd_tiles_streaming(save_dir: Path, max_images: int = 3):
 
     print(f"🎯 Finished downloading {count} TCD tiles.")
 
+
 def has_geodata(tif_path: str | Path) -> bool:
     """Return True if GeoTIFF has valid CRS and affine transform."""
     with rasterio.open(tif_path) as ds:
@@ -168,7 +245,7 @@ def has_geodata(tif_path: str | Path) -> bool:
         has_crs = ds.crs is not None
         has_transform = ds.transform != rasterio.Affine.identity()
         return has_crs and has_transform
-    
+
 
 def compute_final_metric(scores, thresh, n_pred, n_gt):
     scores = np.asarray(scores, dtype=float)
@@ -185,9 +262,8 @@ def compute_final_metric(scores, thresh, n_pred, n_gt):
         "mean_overlap": mean_overlap,
         "n_tp": n_tp,
         "n_pred": n_pred,
-        "n_gt": n_gt
+        "n_gt": n_gt,
     }
-
 
 
 def clean_validate_predictions_vs_tcd_segments(
@@ -226,7 +302,14 @@ def clean_validate_predictions_vs_tcd_segments(
     # ---------------------------
     def pixel_to_world_geom(geom, transform):
         """Apply rasterio Affine transform to shapely geometry."""
-        coeffs = [transform.a, transform.b, transform.d, transform.e, transform.c, transform.f]
+        coeffs = [
+            transform.a,
+            transform.b,
+            transform.d,
+            transform.e,
+            transform.c,
+            transform.f,
+        ]
         return affine_transform(geom, coeffs)
 
     # ---------------------------
@@ -310,7 +393,9 @@ def clean_validate_predictions_vs_tcd_segments(
                 polys = []
 
         else:
-            print(f"⚠️ Unknown segmentation format in annotation id={ann.get('id')} — skipping.")
+            print(
+                f"⚠️ Unknown segmentation format in annotation id={ann.get('id')} — skipping."
+            )
             polys = []
 
         for p in polys:
@@ -328,7 +413,9 @@ def clean_validate_predictions_vs_tcd_segments(
     transform = from_bounds(*bounds, width=width, height=height)
 
     gt_world_parts = [pixel_to_world_geom(p, transform) for p in gt_polys_px]
-    gt = gpd.GeoDataFrame({"geometry": gt_world_parts, "category": gt_cats}, crs=image_tif["crs"])
+    gt = gpd.GeoDataFrame(
+        {"geometry": gt_world_parts, "category": gt_cats}, crs=image_tif["crs"]
+    )
     print(f"  → {len(gt)} ground-truth polygons (after normalization)")
 
     # ---------------------------
@@ -379,7 +466,9 @@ def clean_validate_predictions_vs_tcd_segments(
     n_gt_canopy = int(np.sum(gt_cats_arr == 1))
 
     metrics_trees = compute_metrics(scores_trees, iou_thresh_tree, n_pred, n_gt_trees)
-    metrics_canopy = compute_metrics(scores_canopy, iop_thresh_canopy, n_pred, n_gt_canopy)
+    metrics_canopy = compute_metrics(
+        scores_canopy, iop_thresh_canopy, n_pred, n_gt_canopy
+    )
 
     metrics_all = {
         "trees": metrics_trees,
@@ -405,10 +494,19 @@ def clean_validate_predictions_vs_tcd_segments(
 
     return metrics_all, pred, gt, (scores_trees, scores_canopy), coco_annotations
 
-def visualize_validation_results(pred, gt, ious, coco_anns=None, 
-                                 iou_thresh_tree=0.5, iop_thresh_canopy=0.7,
-                                 site_path=None, rgb_path=None,
-                                 tile_name=None, image_id=None):
+
+def visualize_validation_results(
+    pred,
+    gt,
+    ious,
+    coco_anns=None,
+    iou_thresh_tree=0.5,
+    iop_thresh_canopy=0.7,
+    site_path=None,
+    rgb_path=None,
+    tile_name=None,
+    image_id=None,
+):
     """
     Visualize Detectree2 vs TCD polygons over RGB base image.
     """
@@ -431,12 +529,18 @@ def visualize_validation_results(pred, gt, ious, coco_anns=None,
             img = src.read([1, 2, 3])
             img = np.moveaxis(img, 0, -1)
             img = (img - img.min()) / (img.max() - img.min() + 1e-9)
-            extent = [src.bounds.left, src.bounds.right,
-                      src.bounds.bottom, src.bounds.top]
+            extent = [
+                src.bounds.left,
+                src.bounds.right,
+                src.bounds.bottom,
+                src.bounds.top,
+            ]
 
     # === 3. Plot setup ===
     fig, ax = plt.subplots(figsize=(8, 8))
-    ax.set_title(f"Detectree2 vs TCD — IoU ≥ {iou_thresh_tree}, IoP ≥ {iop_thresh_canopy}")
+    ax.set_title(
+        f"Detectree2 vs TCD — IoU ≥ {iou_thresh_tree}, IoP ≥ {iop_thresh_canopy}"
+    )
     ax.set_aspect("equal")
 
     if img is not None:
@@ -446,7 +550,8 @@ def visualize_validation_results(pred, gt, ious, coco_anns=None,
 
     def draw_pred_outline(ax, geom, color):
         from shapely.geometry import Polygon, MultiPolygon, GeometryCollection
-        if geom.is_empty: 
+
+        if geom.is_empty:
             return
         if isinstance(geom, Polygon):
             x, y = geom.exterior.xy
@@ -458,7 +563,6 @@ def visualize_validation_results(pred, gt, ious, coco_anns=None,
         elif isinstance(geom, GeometryCollection):
             for sub in geom.geoms:
                 draw_pred_outline(ax, sub, color)
-
 
     for i, p in enumerate(pred.geometry):
         if not p.is_valid or p.is_empty:
@@ -478,11 +582,11 @@ def visualize_validation_results(pred, gt, ious, coco_anns=None,
 
         # --- Pick color based on which test passes ---
         if score_tree >= iou_thresh_tree:
-            color = "#00F0FF"      # bright teal  → good tree (IoU)
+            color = "#00F0FF"  # bright teal  → good tree (IoU)
         elif score_canopy >= iop_thresh_canopy:
-            color = "#00FF9D"      # neon green  → good canopy (IoP)
+            color = "#00FF9D"  # neon green  → good canopy (IoP)
         else:
-            color = "#FF8800"      # orange      → low-overlap / FP
+            color = "#FF8800"  # orange      → low-overlap / FP
 
         draw_pred_outline(ax, p, color)
 
@@ -500,29 +604,41 @@ def visualize_validation_results(pred, gt, ious, coco_anns=None,
         elif isinstance(g, MultiPolygon):
             geoms = list(g.geoms)
         elif isinstance(g, GeometryCollection):
-            geoms = [geom for geom in g.geoms if isinstance(geom, (Polygon, MultiPolygon))]
+            geoms = [
+                geom for geom in g.geoms if isinstance(geom, (Polygon, MultiPolygon))
+            ]
         else:
             geoms = []
 
         for geom in geoms:
             if isinstance(geom, Polygon):
                 x, y = geom.exterior.xy
-                ax.fill(x, y, facecolor=color, edgecolor=color, linewidth=0.8, alpha=0.25)
+                ax.fill(
+                    x, y, facecolor=color, edgecolor=color, linewidth=0.8, alpha=0.25
+                )
                 ax.plot(x, y, color=color, linewidth=0.8, alpha=0.9)
             elif isinstance(geom, MultiPolygon):
                 for sub in geom.geoms:
                     x, y = sub.exterior.xy
-                    ax.fill(x, y, facecolor=color, edgecolor=color, linewidth=0.8, alpha=0.25)
+                    ax.fill(
+                        x,
+                        y,
+                        facecolor=color,
+                        edgecolor=color,
+                        linewidth=0.8,
+                        alpha=0.25,
+                    )
                     ax.plot(x, y, color=color, linewidth=0.8, alpha=0.9)
 
     # === 6. Legend ===
     import matplotlib.patches as mpatches
+
     legend_elems = [
         mpatches.Patch(color="#00F0FF", label="Tree TP (IoU ≥ 0.5)"),
         mpatches.Patch(color="#00FF9D", label="Canopy TP (IoP ≥ 0.7)"),
         mpatches.Patch(color="#FF8800", label="False Positive / Low Overlap"),
         mpatches.Patch(color="#C266FF", label="Ground Truth — Canopy"),
-        mpatches.Patch(color="#0a20ad", label="Ground Truth — Tree")
+        mpatches.Patch(color="#0a20ad", label="Ground Truth — Tree"),
     ]
 
     ax.legend(handles=legend_elems, loc="lower right", frameon=True, fontsize=8)
@@ -584,8 +700,11 @@ def visualize_validation_results(pred, gt, ious, coco_anns=None,
     # plt.close(fig_gt)
 
     # print(f"🗺️  Saved pure ground-truth overlay → {out_gt_path}")
-    
-def filter_raw_predictions(pred_dir: Path, score_thresh: float = 0.8, overwrite=True) -> None:
+
+
+def filter_raw_predictions(
+    pred_dir: Path, score_thresh: float = 0.8, overwrite=True
+) -> None:
     """
     Filter raw Detectron2 prediction JSONs by confidence score.
 
@@ -616,8 +735,10 @@ def filter_raw_predictions(pred_dir: Path, score_thresh: float = 0.8, overwrite=
 
         print(f"📊 {fpath.name}: kept {after}/{before} predictions (≥ {score_thresh})")
 
-    print(f"✅ Filtering complete — overwrote {len(json_files)} files at ≥ {score_thresh}.")
-    
+    print(
+        f"✅ Filtering complete — overwrote {len(json_files)} files at ≥ {score_thresh}."
+    )
+
 
 def load_tcd_meta_for_tile(img_path: Path):
     """
@@ -629,7 +750,9 @@ def load_tcd_meta_for_tile(img_path: Path):
     """
     meta_path = img_path.with_name(img_path.stem + "_meta.json")
     if not meta_path.exists():
-        print(f"ℹ️  No metadata found for {img_path.name} (no _meta.json) — skipping validation.")
+        print(
+            f"ℹ️  No metadata found for {img_path.name} (no _meta.json) — skipping validation."
+        )
         return None
 
     with open(meta_path, "r", encoding="utf-8") as f:
@@ -640,6 +763,7 @@ def load_tcd_meta_for_tile(img_path: Path):
 # ============================================================
 #   COCO → GeoDataFrame
 # ============================================================
+
 
 def coco_meta_to_geodf(meta: dict) -> gpd.GeoDataFrame:
     width = meta["width"]
@@ -657,9 +781,12 @@ def coco_meta_to_geodf(meta: dict) -> gpd.GeoDataFrame:
 
     def px_to_world(geom):
         coeffs = [
-            transform.a, transform.b,
-            transform.d, transform.e,
-            transform.c, transform.f,
+            transform.a,
+            transform.b,
+            transform.d,
+            transform.e,
+            transform.c,
+            transform.f,
         ]
         return affine_transform(geom, coeffs)
 
@@ -707,11 +834,15 @@ def coco_meta_to_geodf(meta: dict) -> gpd.GeoDataFrame:
 # Tiling
 # -------------------------------------------------------------------
 
-def tile_all_tcd_tiles(raw_dir: Path, tiles_root: Path,
-                       buffer: int = 30,
-                       tile_width: int = 40,
-                       tile_height: int = 40,
-                       threshold: float = 0.0):
+
+def tile_all_tcd_tiles(
+    raw_dir: Path,
+    tiles_root: Path,
+    buffer: int = 30,
+    tile_width: int = 40,
+    tile_height: int = 40,
+    threshold: float = 0.0,
+):
     """
     For each .tif + _meta.json in raw_dir:
 
@@ -769,47 +900,55 @@ def apply_nms_to_geojson(geojson_path: Path, iou_threshold: float = 0.3) -> Path
     Remove duplicate/overlapping predictions using NMS (Non-Maximum Suppression).
     Keeps highest-confidence predictions and removes lower-confidence overlaps.
     """
-    
+
     gdf = gpd.read_file(geojson_path)
-    
+
     if len(gdf) == 0:
         print(f"⚠️ No predictions in {geojson_path}")
         return geojson_path
-    
+
     print(f"📊 NMS input: {len(gdf)} polygons")
-    
+
+    # Fix invalid geometries (e.g. self-intersections) that crash shapely
+    gdf["geometry"] = gdf["geometry"].apply(
+        lambda g: make_valid(g) if not g.is_valid else g
+    )
+    # If make_valid returns a Collection, we might want to keep only Polygons/MultiPolygons
+    # For now, let's assume it returns something usable or that intersection handles it
+    # A safer approach for NMS is to explode if it becomes a collection, but usually it's fine
+
     gdf = gdf.sort_values("Confidence_score", ascending=False).reset_index(drop=True)
-    
+
     keep_indices = set(range(len(gdf)))  # Start with all indices
     removed = 0
-    
+
     for i in range(len(gdf)):
         if i not in keep_indices:
             continue  # Already removed
-        
+
         geom_i = gdf.loc[i, "geometry"]
         conf_i = gdf.loc[i, "Confidence_score"]
-        
+
         for j in range(i + 1, len(gdf)):
             if j not in keep_indices:
                 continue  # Already removed
-            
+
             geom_j = gdf.loc[j, "geometry"]
             conf_j = gdf.loc[j, "Confidence_score"]
-            
+
             intersection = geom_i.intersection(geom_j).area
             union = geom_i.union(geom_j).area
             iou = intersection / union if union > 0 else 0
-            
+
             # Remove LOWER-confidence polygon (j, since sorted descending)
             if iou > iou_threshold:
                 keep_indices.discard(j)  # REMOVE j from keep set
                 removed += 1
                 # print(f"  Removing poly_{j} (conf={conf_j:.3f}) — overlaps with poly_{i} (conf={conf_i:.3f}, IoU={iou:.3f})")
-    
+
     print(f"📊 NMS output: {len(keep_indices)} polygons (removed {removed})")
-    
+
     gdf_dedup = gdf.loc[list(keep_indices)].copy()
     gdf_dedup.to_file(geojson_path, driver="GeoJSON")
-    
+
     return geojson_path

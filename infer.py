@@ -39,6 +39,7 @@ from utils import load_tcd_meta_for_tile
 from utils import apply_nms_to_geojson
 import torch
 import torch.multiprocessing as mp
+
 mp.set_start_method("spawn", force=True)
 
 # Key Hyperparameters
@@ -106,7 +107,7 @@ def main():
     # === 1. Define key paths ===
     home = Path.home()
     site_name = "tcd"
-    site_path = home / "dphil" / "detectree2" / "data" / site_name
+    site_path = home / "dphil" / "canopyAI" / "data" / site_name
     raw_dir = site_path / "raw"
 
     # # === 1b. Download tiles ===
@@ -116,7 +117,7 @@ def main():
     #     print(f"✅ Downloaded {len(tiles_info)} TCD tiles for processing.")
     # else:
     #     print("⏭️ Using existing tiles in raw/")
-    
+
     # === 2. Create output/working directories ===
     pred_tiles_path = ensure_dir(site_path / "tiles_pred")
 
@@ -126,14 +127,14 @@ def main():
         print(f"📦 Model not found locally — downloading from {url} ...")
         wget.download(url, out=str(model_path))
         print("\n✅ Model download complete.")
-        
+
     # === 4. Initialize Detectron2 predictor ===
     print("\n⚙️  Initializing Detectron2 predictor ...")
     cfg = setup_cfg(update_model=str(model_path))
     set_device(cfg)
     predictor = DefaultPredictor(cfg)
     print("✅ Predictor ready.")
-    
+
     # Initialize accumulators
     all_tree_scores = []
     all_canopy_scores = []
@@ -143,19 +144,18 @@ def main():
 
     # === 5–12. Process each tile ===
     raw_dir = Path("data/tcd/raw")
-    
+
     if len(list(raw_dir.glob("tcd_tile_*.tif"))) == 0:
         raise FileNotFoundError(
             f"❌ No TCD tiles found in {raw_dir}.\n"
             "Please run prepare_data.py first to download and tile the dataset."
         )
-    
+
     for img_path in sorted(raw_dir.glob("tcd_tile_*.tif")):
         image_info = load_tcd_meta_for_tile(img_path)
-        
-        image_id = image_info['image_id']
-        
-        
+
+        image_id = image_info["image_id"]
+
         print(f"\n================ Processing {image_id} ================")
         print(f"Biome: {image_info.get('biome_name', 'N/A')}")
 
@@ -175,20 +175,22 @@ def main():
             # Your Detectree2 tiler (no CRS loss if the input GeoTIFF is georeferenced)
             tile_data(
                 str(img_path),
-                chip_dir,        # output directory
+                chip_dir,  # output directory
                 buffer,
                 tile_width,
                 tile_height,
-                dtype_bool=True  # Detectree2 expects this for mask chips
+                dtype_bool=True,  # Detectree2 expects this for mask chips
             )
             print("✅ Tiling complete.")
         except AttributeError as e:
             print(f"⚠️ Non-georeferenced image — skipping CRS: {e}")
-            
+
         # If no tiles were created, just skip this image and continue.
         chips = list(Path(chip_dir).glob("*.tif"))
         if len(chips) == 0:
-            print(f"⚠️  Skipping {image_id} — no tiles produced (likely nodata or invalid raster).")
+            print(
+                f"⚠️  Skipping {image_id} — no tiles produced (likely nodata or invalid raster)."
+            )
             continue
 
         # ------------------------------------------------------------
@@ -202,7 +204,9 @@ def main():
         # 7. Filter raw Detectron2 predictions *inside chip folder*
         # ------------------------------------------------------------
         chip_pred_dir = chip_dir / "predictions"
-        filter_raw_predictions(chip_pred_dir, score_thresh=filter_threshold, overwrite=True)
+        filter_raw_predictions(
+            chip_pred_dir, score_thresh=filter_threshold, overwrite=True
+        )
 
         # ------------------------------------------------------------
         # 8. Reproject tiled predictions → GeoJSON in global CRS
@@ -212,9 +216,7 @@ def main():
         ensure_dir(chip_geo_dir)
 
         project_to_geojson(
-            tiles_path=chip_dir,
-            pred_fold=chip_pred_dir,
-            output_fold=chip_geo_dir
+            tiles_path=chip_dir, pred_fold=chip_pred_dir, output_fold=chip_geo_dir
         )
         print("✅ GeoJSON projection complete.")
 
@@ -226,7 +228,7 @@ def main():
         merge_tile_geojsons(chip_geo_dir, merged_geojson)
         # Apply NMS to remove duplicate overlapping polygons
         apply_nms_to_geojson(merged_geojson, iou_threshold=nms_dedupe_threshold)
-        
+
         # visualize_saved_prediction_with_masks(
         #     img_path,                     # original tile
         #     merged_geojson,               # merged prediction mask JSON
@@ -234,47 +236,51 @@ def main():
         #     image_id
         # )
 
-        metrics_all, pred, gt, scores, coco_anns = clean_validate_predictions_vs_tcd_segments(
-            pred_geojson_path=merged_geojson,
-            image_tif=image_info,
-            iou_thresh_tree=0.5,
-            iop_thresh_canopy=0.7
+        metrics_all, pred, gt, scores, coco_anns = (
+            clean_validate_predictions_vs_tcd_segments(
+                pred_geojson_path=merged_geojson,
+                image_tif=image_info,
+                iou_thresh_tree=0.5,
+                iop_thresh_canopy=0.7,
+            )
         )
-        
+
         if metrics_all is None:
             print(f"⚠️ No GT for tile {image_id} — skipping.")
             continue
         scores_trees, scores_canopy = scores
-        
+
         total_pred += metrics_all["n_pred"]
         total_gt_trees += metrics_all["n_gt_trees"]
         total_gt_canopy += metrics_all["n_gt_canopy"]
-        
-        
 
         # Extend raw overlap score lists
         all_tree_scores.extend(scores_trees.tolist())
         all_canopy_scores.extend(scores_canopy.tolist())
-        
+
         visualize_validation_results(
-            pred, gt, scores,
+            pred,
+            gt,
+            scores,
             coco_anns,
             site_path=site_path,
             rgb_path=img_path,
             tile_name=img_path.stem,
-            image_id=image_id
+            image_id=image_id,
         )
-        
-    final_tree = compute_final_metric(all_tree_scores, thresh=0.5,
-                                n_pred=total_pred, n_gt=total_gt_trees)
 
-    final_canopy = compute_final_metric(all_canopy_scores, thresh=0.7,
-                                    n_pred=total_pred, n_gt=total_gt_canopy)
-    
+    final_tree = compute_final_metric(
+        all_tree_scores, thresh=0.5, n_pred=total_pred, n_gt=total_gt_trees
+    )
+
+    final_canopy = compute_final_metric(
+        all_canopy_scores, thresh=0.7, n_pred=total_pred, n_gt=total_gt_canopy
+    )
+
     print(f"============= Cohort Metrics ================")
     print_metrics("Trees (IoU)", final_tree)
-    print_metrics("Canopy (IoP)", final_canopy)  
-    
+    print_metrics("Canopy (IoP)", final_canopy)
+
 
 def print_metrics(name, m):
     print(f"\n📊 {name} metrics")
@@ -300,13 +306,14 @@ def merge_tile_geojsons(geo_dir: Path, out_file: Path):
 
     print(f"🧩 Merged {len(files)} tile GeoJSONs → {out_file}")
 
+
 # CLI Args
 def parse_args():
-    ap = argparse.ArgumentParser(description="Detectree2 runner")
+    ap = argparse.ArgumentParser(description="CanopyAI runner")
     ap.add_argument(
         "--smoke",
         action="store_true",
-        help="Run non-geospatial smoke test on a single RGB image."
+        help="Run non-geospatial smoke test on a single RGB image.",
     )
     ap.add_argument(
         "--weights",
@@ -315,8 +322,9 @@ def parse_args():
         choices=["baseline", "finetuned"],
         help="Which model weights to use: baseline or finetuned",
     )
-    
+
     return ap.parse_args()
+
 
 def set_device(cfg):
     # Prefer Apple MPS, else CPU (no CUDA on Apple Silicon)
@@ -324,11 +332,13 @@ def set_device(cfg):
     device = "cpu"
     cfg.MODEL.DEVICE = device
     print(f"🖥️ Using device: {device}")
-    cfg.DATALOADER.NUM_WORKERS = 0 
+    cfg.DATALOADER.NUM_WORKERS = 0
     torch.set_num_threads(1)
 
 
-def visualize_saved_prediction_with_masks(img_path, pred_json_path, out_dir, image_id=None):
+def visualize_saved_prediction_with_masks(
+    img_path, pred_json_path, out_dir, image_id=None
+):
     """
     Visualize Detectree2 predictions from JSON over the original RGB image.
     Focuses on segmentation masks rather than bounding boxes.
@@ -411,10 +421,7 @@ def visualize_saved_prediction_with_masks(img_path, pred_json_path, out_dir, ima
 
     # --- Visualization ---
     vis = Visualizer(img[:, :, ::-1], scale=1.0)
-    vis_out = vis.overlay_instances(
-        masks=instances.pred_masks,
-        labels=labels
-    )
+    vis_out = vis.overlay_instances(masks=instances.pred_masks, labels=labels)
 
     # --- Construct output path ---
     out_dir = Path(out_dir)
@@ -444,4 +451,3 @@ if __name__ == "__main__":
         smoke_test(model_path)
     else:
         main()
-        

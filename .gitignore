@@ -4,3 +4,5 @@ venv*
 data2/
 data/*
 overlays_validation
+eval
+eval2
