@@ -1,0 +1,35 @@
+# requirements.txt
+# Core geospatial + utils
+
+torch
+rasterio
+geopandas
+shapely
+fiona
+pyproj
+rtree
+opencv-python
+wget
+requests
+pycocotools
+matplotlib
+datasets
+
+# detectron2 + detectree2 installed from source inside container
+
+# Also needed: PyTorch + Detectron2
+# Latest compatible Python currently: 3.12
+# Requires Pytorch
+
+# Mac build tools for Detectron2: 
+# xcode-select --install  #(if not already installed)
+# brew install cmake ninja pkg-config
+# Linux Singularity recipe will similarly include:
+#apt-get update && apt-get install -y \
+#   git cmake ninja-build build-essential \
+#   libgl1 libglib2.0-0
+
+
+# detectron2 + detectree2 installed from source inside container
+#git+https://github.com/PatBall1/detectree2.git
+#git+https://github.com/facebookresearch/detectron2.git

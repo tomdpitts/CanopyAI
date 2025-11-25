@@ -10,7 +10,6 @@ _BASE_: "base.yaml"
 #  MODEL
 # ------------------------------------------------------------
 MODEL:
-  WEIGHTS: "../230103_randresize_full.pth"
   MASK_ON: True
   BACKBONE:
     FREEZE_AT: 0 # 0 = fine-tune whole backbone

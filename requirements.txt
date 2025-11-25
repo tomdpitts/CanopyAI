@@ -1,29 +1,38 @@
-# requirements.txt
-# Core geospatial + utils
+# canopyAI local development dependencies
+# (matches Dockerfile except for conda-installed libs)
 
-torch
+# Normal install with pip
+# pip install -r requirements.txt
+
+# Stable PyTorch with full MPS support
+# --extra-index-url required for PyTorch wheels
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.3.0
+torchvision==0.18.0
+torchaudio==2.3.0
+
+# --- Geospatial stack (lightweight pip parts only) ---
 rasterio
 geopandas
 shapely
 fiona
 pyproj
 rtree
+affine
+
+# --- Utilities ---
 opencv-python
 wget
 requests
-pycocotools
 matplotlib
+cython
+pycocotools
+duckdb
+pyarrow
+scikit-image==0.20.0
+tqdm
 datasets
+Pillow==9.5.0
 
-# Also needed: PyTorch + Detectron2
-# Latest compatible Python currently: 3.12
-# Requires Pytorch
-
-# Mac build tools for Detectron2: 
-# xcode-select --install  #(if not already installed)
-# brew install cmake ninja pkg-config
-
-# pip install git+https://github.com/PatBall1/detectree2.git
-
-# Not sure this is needed actually:
-# pip install "git+https://github.com/facebookresearch/detectron2.git"
+# NEXT STEP: pip install --no-build-isolation -r detectron_requirements.txt
+# (ignore archive_requirements.txt, deprecated)

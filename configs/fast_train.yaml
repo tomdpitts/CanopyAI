@@ -1,10 +1,6 @@
 # config/fast_train.yaml
 _BASE_: "base.yaml"
 
-MODEL:
-  WEIGHTS: "../230103_randresize_full.pth"
-  MASK_ON: True
-
 SOLVER:
   MAX_ITER: 1200
   STEPS: [400, 800]

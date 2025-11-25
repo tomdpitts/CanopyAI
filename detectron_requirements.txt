@@ -1,0 +1,9 @@
+# IMPORTANT - use flag:
+# pip install --no-build-isolation -r detectron_requirements.txt
+
+
+# Detectron2 (stable release)
+git+https://github.com/facebookresearch/detectron2.git@v0.6
+
+# --- Detectree2 (core library) ---
+git+https://github.com/PatBall1/detectree2.git
