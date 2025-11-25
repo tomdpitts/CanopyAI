@@ -10,3 +10,8 @@ eval2
 .mypy_cache
 __pycache__
 archive*
+
+# Docker/Singularity images (large binary files)
+*.tar.gz
+*.sif
+canopyai.tar.gz

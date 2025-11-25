@@ -34,5 +34,5 @@ tqdm
 datasets
 Pillow==9.5.0
 
-# NEXT STEP: pip install --no-build-isolation -r detectron_requirements.txt
+# NEXT STEP FOR LOCAL DEV: pip install --no-build-isolation -r detectron_requirements.txt
 # (ignore archive_requirements.txt, deprecated)
