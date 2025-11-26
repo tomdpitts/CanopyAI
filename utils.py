@@ -167,14 +167,14 @@ def download_tcd_tiles_streaming(save_dir: Path, max_images: int = 3):
     Note: We disable image decoding in the dataset to avoid Pillow's
     JPEG-compressed TIFF issues, and decode manually with cv2 instead.
     """
-    from datasets import load_dataset
+    from datasets import load_dataset, Image
     from io import BytesIO
-    from PIL import Image
+    from PIL import Image as PILImage
 
     print("📦 Loading TCD dataset in streaming mode...")
     # Disable automatic image decoding to avoid Pillow TIFF/JPEG issues
     ds = load_dataset("restor/tcd", split="train", streaming=True).cast_column(
-        "image", {"_type": "Value", "dtype": "binary"}
+        "image", Image(decode=False)
     )
 
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -212,11 +212,11 @@ def download_tcd_tiles_streaming(save_dir: Path, max_images: int = 3):
                 img = np.array(pil_img)
                 if img.ndim == 3 and img.shape[2] == 3:
                     # PIL loads as RGB, cv2 expects BGR
-                    img = cv2.cvtColor(img, cv2.COLOR_RGB_BGR)
+                    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
 
             # Convert BGR to RGB for rasterio
             if img.ndim == 3 and img.shape[2] == 3:
-                img = cv2.cvtColor(img, cv2.COLOR_BGR_RGB)
+                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
         except Exception as e:
             print(f"  ❌ Failed to decode image {image_id}: {e}")
@@ -907,12 +907,14 @@ def tile_all_tcd_tiles(
 
         # Convert COCO segs → polygons
         crowns_gdf = coco_meta_to_geodf(meta)
-        if crowns_gdf.empty:
-            print(f"⚠️  No polygons found in metadata for {stem}, skipping.")
-            continue
 
         chips_dir = tiles_root / f"{stem}_chips"
         print(f"🧩 Tiling {img_path.name} → {chips_dir}")
+
+        if crowns_gdf.empty:
+            print(f"⚠️  No polygons found in metadata for {stem}, skipping.")
+            print(f"   (Background is learned from non-tree areas in annotated tiles)")
+            continue
 
         tile_data(
             img_path=str(img_path),
@@ -922,6 +924,7 @@ def tile_all_tcd_tiles(
             tile_height=tile_height,
             crowns=crowns_gdf,
             threshold=threshold,
+            nan_threshold=0.4,
             mode="rgb",
         )
 

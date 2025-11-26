@@ -110,14 +110,6 @@ def main():
     site_path = home / "dphil" / "canopyAI" / "data" / site_name
     raw_dir = site_path / "raw"
 
-    # # === 1b. Download tiles ===
-    # if not args.already_downloaded:
-    #     print("🌐 Downloading via HF...")
-    #     tiles_info = download_tcd_tiles_streaming(raw_dir, max_images=max_images)
-    #     print(f"✅ Downloaded {len(tiles_info)} TCD tiles for processing.")
-    # else:
-    #     print("⏭️ Using existing tiles in raw/")
-
     # === 2. Create output/working directories ===
     pred_tiles_path = ensure_dir(site_path / "tiles_pred")
 

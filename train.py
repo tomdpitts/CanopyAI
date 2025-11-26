@@ -12,13 +12,20 @@ for finetuning from previous run:
 """
 
 import argparse
+import os
 from pathlib import Path
 
 import torch
 import torch.multiprocessing as mp
 from detectree2.models.train import register_train_data, MyTrainer
 from detectree2.models.train import setup_cfg
-from utils import download_tcd_tiles_streaming, tile_all_tcd_tiles
+from prepare_data import run_preparation
+import wget
+
+
+def is_running_on_modal():
+    """Detect if running on Modal by checking environment variables."""
+    return os.environ.get("MODAL_ENVIRONMENT") is not None
 
 
 # ============================================================
@@ -40,6 +47,14 @@ def load_preset_cfg(preset: str, weights: str, output_dir: Path):
 
     # ---- Set model weights ----
     if weights == "baseline":
+        # Ensure model is present (download if missing)
+        model_path = Path("230103_randresize_full.pth")
+        if not model_path.exists():
+            url = "https://zenodo.org/records/10522461/files/230103_randresize_full.pth"
+            print(f"📦 Downloading model: {url}")
+            wget.download(url, out=str(model_path))
+            print("\n✅ Model download complete.")
+
         cfg.MODEL.WEIGHTS = "230103_randresize_full.pth"
     elif weights == "finetuned":
         cfg.MODEL.WEIGHTS = str(output_dir / "model_final.pth")
@@ -78,16 +93,28 @@ def train_detectree2(chips_root: Path, output_dir: Path, preset: str, weights: s
     train_name = f"{site_name}_train"
     val_name = f"{site_name}_val"
 
+    # Detect Modal and override output directory if needed
+    if is_running_on_modal():
+        output_dir = Path("/checkpoints")
+        print(f"☁️  Running on Modal: Saving checkpoints to {output_dir}")
+    else:
+        print(f"💾 Running locally: Saving checkpoints to {output_dir}")
+
     cfg = load_preset_cfg(preset, weights, output_dir)
 
     # Explicitly set correct datasets
     cfg.DATASETS.TRAIN = (train_name,)
     cfg.DATASETS.TEST = (val_name,)
 
+    # Disable COCO evaluation during training to avoid assertion errors
+    # The evaluation has a bug with certain dataset configurations
+    cfg.TEST.EVAL_PERIOD = 0  # 0 = disable, or set to large number like 10000
+
     # Freeze config
     cfg.freeze()
 
     print("🚀 Training starting…")
+    print("⚠️  COCO evaluation disabled during training to avoid bugs")
     trainer = MyTrainer(cfg, patience=5)
     trainer.resume_or_load(resume=False)
     trainer.train()
@@ -100,23 +127,19 @@ def train_detectree2(chips_root: Path, output_dir: Path, preset: str, weights: s
 
 def main_worker(rank, args):
     data_root = Path("data/tcd")
-    raw_dir = data_root / "raw"
-    tiles_root = data_root / "tiles_pred"
+    # raw_dir = data_root / "raw"
+    # tiles_root = data_root / "tiles_pred"
     chips_root = data_root / "chips"
     output_dir = data_root / "train_outputs"
 
-    raw_dir.mkdir(exist_ok=True)
-    tiles_root.mkdir(exist_ok=True)
+    # raw_dir.mkdir(parents=True, exist_ok=True)
+    # tiles_root.mkdir(parents=True, exist_ok=True)
 
     # 1. Download
+    # 1. Prepare Data (Download + Tile + Split)
     if not args.already_downloaded:
-        # Full pipeline: download + tile
-        print("🌐 Downloading TCD tiles via HuggingFace…")
-        download_tcd_tiles_streaming(save_dir=raw_dir, max_images=args.max_images)
-
-        print("🧩 Tiling tiles for training…")
-        tile_all_tcd_tiles(raw_dir, chips_root)
-
+        print("🏗️  Running data preparation pipeline...")
+        run_preparation(args)
     else:
         # Nothing to download, nothing to tile
         print("⏭️ Skipping download and tiling (using existing chips)")
@@ -135,6 +158,9 @@ def parse_args():
 
     p.add_argument("--already_downloaded", action="store_true")
     p.add_argument("--max_images", type=int, default=3)
+    p.add_argument(
+        "--train_split", type=float, default=0.8, help="Train/test split ratio"
+    )
 
     p.add_argument("--preset", default="tiny", choices=["tiny", "fast", "full"])
 

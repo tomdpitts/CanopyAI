@@ -67,8 +67,15 @@ def parse_args():
 # ----------------------------------------------------------------------
 
 
-def main():
-    args = parse_args()
+def run_preparation(args):
+    """
+    Run the data preparation pipeline.
+    Args:
+        args: Namespace object with:
+            - already_downloaded (bool)
+            - max_images (int)
+            - train_split (float)
+    """
 
     # === 1. Define directories ===
     data_root = Path("data/tcd")
@@ -151,6 +158,15 @@ def main():
     print("\n🧩 Tiling training tiles for training...")
     tile_all_tcd_tiles(raw_dir, chips_root)
 
+    # === 5. Cleanup empty chip folders ===
+    # If tiling produced no chips (e.g. due to nodata threshold), remove the folder
+    # so detectree2 doesn't try to use it as an empty validation fold.
+    print("\n🧹 Cleaning up empty chip folders...")
+    for chip_dir in chips_root.iterdir():
+        if chip_dir.is_dir() and not any(chip_dir.iterdir()):
+            print(f"  🗑️ Removing empty folder: {chip_dir.name}")
+            chip_dir.rmdir()
+
     print("\n🎉 Dataset preparation complete!")
     print(f"Training chips are in: {chips_root}")
     print(f"Test tiles (raw) are in: {raw_test_dir}")
@@ -158,5 +174,14 @@ def main():
 
 # ----------------------------------------------------------------------
 
+
+def main():
+    args = parse_args()
+    run_preparation(args)
+
+
 if __name__ == "__main__":
     main()
+    import sys
+
+    sys.exit(0)
