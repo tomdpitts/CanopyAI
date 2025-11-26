@@ -75,7 +75,7 @@ data_volume = modal.Volume.from_name("canopyai-data", create_if_missing=True)
 
 @app.function(
     image=image,
-    gpu="T4",
+    gpu="A10G",
     volumes={
         "/checkpoints": volume,
         "/data": data_volume,  # Persistent data storage
