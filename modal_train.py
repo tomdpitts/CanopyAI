@@ -108,6 +108,7 @@ def main(
     max_images: int = 3,
     already_downloaded: bool = False,
     train_split: float = 0.8,
+    run_name: str = None,
 ):
     """
     Run training on Modal.
@@ -131,6 +132,7 @@ def main(
         max_images=max_images,
         already_downloaded=already_downloaded,
         train_split=train_split,
+        run_name=run_name,
     )
 
     print(f"☁️  Submitting training job to Modal...")

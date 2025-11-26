@@ -56,7 +56,7 @@ SOLVER:
   LR_SCHEDULER_NAME: "WarmupCosineLR"
 
   MAX_ITER: 12000              # Optimized for ~1500-2500 chips from 250 tiled images
-  CHECKPOINT_PERIOD: 2000      # Save interval
+  CHECKPOINT_PERIOD: 1000      # Save interval
 
   STEPS: []         # Not used for cosine LR
   GAMMA: 0.1
