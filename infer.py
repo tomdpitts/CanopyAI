@@ -169,7 +169,7 @@ def main():
         tile_height = 40
 
         try:
-            # Your Detectree2 tiler (no CRS loss if the input GeoTIFF is georeferenced)
+            # Detectree2 tiler (preserves CRS if the input GeoTIFF is georeferenced)
             tile_data(
                 str(img_path),
                 chip_dir,  # output directory
@@ -406,7 +406,7 @@ def visualize_saved_prediction_with_masks(
 
     masks = torch.as_tensor(np.stack(masks))  # [N, H, W]
 
-    # --- Dummy boxes (since we mainly care about masks) ---
+    # --- Dummy boxes (masks are the primary output) ---
     boxes = torch.tensor([[0, 0, W, H]], dtype=torch.float32).repeat(len(masks), 1)
 
     # --- Scores / Classes ---

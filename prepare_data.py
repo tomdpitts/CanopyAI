@@ -114,7 +114,7 @@ def run_preparation(args):
         print(f"  🏷️ Creating metadata: {meta_path.name}")
 
         # Extract metadata directly from the downloaded HF example
-        # If not downloaded in this run, metadata is missing, so we load from utils helper
+        # Metadata not downloaded in this run; load from utils helper function
         # → load_tcd_meta_for_tile is unnecessary because infer.py uses meta.json for inference
         raise RuntimeError(
             f"{meta_path} does not exist — but metadata creation "

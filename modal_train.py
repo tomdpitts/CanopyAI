@@ -44,8 +44,8 @@ image = (
         "datasets",
         "Pillow==9.5.0",
     )
-    # Detectron2 (needs no-build-isolation usually, but here we try standard install first
-    # or use run_commands for specific flags if needed.
+    # Detectron2 installation. Standard pip install is attempted first.
+    # Alternative: use run_commands for specific flags if needed.
     # Standard pip install often works in Modal's clean env)
     .pip_install(
         "git+https://github.com/facebookresearch/detectron2.git@v0.6",
@@ -91,13 +91,12 @@ def run_training(args):
     sys.path.insert(0, "/root/canopyAI")
 
     # Import and run training
-    # We import here to ensure it runs in the remote container
+    # Import in function scope to ensure execution in remote container
     from train import main_worker
 
     print(f"🚀 Starting training on Modal with args: {vars(args)}")
 
-    # Ensure output directory exists in the volume
-    # (train.py handles this, but good to be sure)
+    # Output directory creation is handled by train.py
 
     main_worker(0, args)
 

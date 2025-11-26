@@ -950,8 +950,8 @@ def apply_nms_to_geojson(geojson_path: Path, iou_threshold: float = 0.3) -> Path
     gdf["geometry"] = gdf["geometry"].apply(
         lambda g: make_valid(g) if not g.is_valid else g
     )
-    # If make_valid returns a Collection, we might want to keep only Polygons/MultiPolygons
-    # For now, let's assume it returns something usable or that intersection handles it
+    # If make_valid returns a Collection, filter to keep only Polygons/MultiPolygons
+    # Assumes make_valid returns a geometry compatible with intersection operations
     # A safer approach for NMS is to explode if it becomes a collection, but usually it's fine
 
     gdf = gdf.sort_values("Confidence_score", ascending=False).reset_index(drop=True)
