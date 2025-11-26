@@ -69,11 +69,17 @@ image = (
 # Create volume for checkpoints
 volume = modal.Volume.from_name("canopyai-checkpoints", create_if_missing=True)
 
+# Create volume for training data (persistent across runs)
+data_volume = modal.Volume.from_name("canopyai-data", create_if_missing=True)
+
 
 @app.function(
     image=image,
-    gpu="A10G",
-    volumes={"/checkpoints": volume},
+    gpu="T4",
+    volumes={
+        "/checkpoints": volume,
+        "/data": data_volume,  # Persistent data storage
+    },
     timeout=86400,  # 24 hours
 )
 def run_training(args):

@@ -47,15 +47,22 @@ def load_preset_cfg(preset: str, weights: str, output_dir: Path):
 
     # ---- Set model weights ----
     if weights == "baseline":
-        # Ensure model is present (download if missing)
-        model_path = Path("230103_randresize_full.pth")
-        if not model_path.exists():
-            url = "https://zenodo.org/records/10522461/files/230103_randresize_full.pth"
-            print(f"📦 Downloading model: {url}")
-            wget.download(url, out=str(model_path))
-            print("\n✅ Model download complete.")
+        # Determine weights path (use persistent storage on Modal)
+        if is_running_on_modal():
+            weights_path = Path("/checkpoints/230103_randresize_full.pth")
+        else:
+            weights_path = Path("230103_randresize_full.pth")
 
-        cfg.MODEL.WEIGHTS = "230103_randresize_full.pth"
+        # Download if missing
+        if not weights_path.exists():
+            url = "https://zenodo.org/records/10522461/files/230103_randresize_full.pth"
+            print(f"📦 Downloading baseline weights to {weights_path}")
+            wget.download(url, out=str(weights_path))
+            print("\n✅ Model download complete.")
+        else:
+            print(f"✅ Using cached weights: {weights_path}")
+
+        cfg.MODEL.WEIGHTS = str(weights_path)
     elif weights == "finetuned":
         cfg.MODEL.WEIGHTS = str(output_dir / "model_final.pth")
     else:
@@ -113,6 +120,14 @@ def train_detectree2(chips_root: Path, output_dir: Path, preset: str, weights: s
     # Freeze config
     cfg.freeze()
 
+    # Clean up eval cache to avoid stale COCO annotations
+    import shutil
+
+    eval_dir = Path("eval")
+    if eval_dir.exists():
+        print(f"🧹 Cleaning eval cache: {eval_dir}")
+        shutil.rmtree(eval_dir)
+
     print("🚀 Training starting…")
     print("⚠️  COCO evaluation disabled during training to avoid bugs")
     trainer = MyTrainer(cfg, patience=5)
@@ -126,14 +141,25 @@ def train_detectree2(chips_root: Path, output_dir: Path, preset: str, weights: s
 
 
 def main_worker(rank, args):
-    data_root = Path("data/tcd")
-    # raw_dir = data_root / "raw"
-    # tiles_root = data_root / "tiles_pred"
-    chips_root = data_root / "chips"
-    output_dir = data_root / "train_outputs"
+    # Detect Modal and use persistent volume paths
+    if is_running_on_modal():
+        data_root = Path("/data/tcd")
+        output_dir = Path("/checkpoints")
+        print(f"☁️  Running on Modal:")
+        print(f"   Data: {data_root} (persistent volume)")
+        print(f"   Checkpoints: {output_dir} (persistent volume)")
+    else:
+        data_root = Path("data/tcd")
+        output_dir = data_root / "train_outputs"
+        print(f"💾 Running locally:")
+        print(f"   Data: {data_root}")
+        print(f"   Checkpoints: {output_dir}")
 
-    # raw_dir.mkdir(parents=True, exist_ok=True)
-    # tiles_root.mkdir(parents=True, exist_ok=True)
+    chips_root = data_root / "chips"
+
+    # Create directories
+    data_root.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     # 1. Download
     # 1. Prepare Data (Download + Tile + Split)

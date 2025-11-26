@@ -76,9 +76,16 @@ def run_preparation(args):
             - max_images (int)
             - train_split (float)
     """
+    # Import here to avoid circular dependency
+    from train import is_running_on_modal
+
+    # Use persistent volume on Modal
+    if is_running_on_modal():
+        data_root = Path("/data/tcd")
+    else:
+        data_root = Path("data/tcd")
 
     # === 1. Define directories ===
-    data_root = Path("data/tcd")
     raw_dir = data_root / "raw"
     raw_test_dir = data_root / "raw_test"
     chips_root = data_root / "chips"
