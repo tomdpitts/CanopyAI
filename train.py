@@ -113,9 +113,15 @@ def train_detectree2(chips_root: Path, output_dir: Path, preset: str, weights: s
     cfg.DATASETS.TRAIN = (train_name,)
     cfg.DATASETS.TEST = (val_name,)
 
-    # Disable COCO evaluation during training to avoid assertion errors
-    # The evaluation has a bug with certain dataset configurations
-    cfg.TEST.EVAL_PERIOD = 0  # 0 = disable, or set to large number like 10000
+    # Enable COCO evaluation for early stopping
+    # Set eval period to match checkpoint period to avoid too frequent evaluation
+    cfg.TEST.EVAL_PERIOD = cfg.SOLVER.CHECKPOINT_PERIOD
+
+    # Set unique output dir to avoid cache conflicts
+    import time
+
+    unique_suffix = f"_{int(time.time())}"
+    cfg.OUTPUT_DIR = str(output_dir / f"run{unique_suffix}")
 
     # Freeze config
     cfg.freeze()
@@ -129,7 +135,8 @@ def train_detectree2(chips_root: Path, output_dir: Path, preset: str, weights: s
         shutil.rmtree(eval_dir)
 
     print("🚀 Training starting…")
-    print("⚠️  COCO evaluation disabled during training to avoid bugs")
+    print(f"✅ COCO evaluation enabled (every {cfg.TEST.EVAL_PERIOD} iters)")
+    print(f"⏱️  Early stopping patience: 5 evaluations")
     trainer = MyTrainer(cfg, patience=5)
     trainer.resume_or_load(resume=False)
     trainer.train()
