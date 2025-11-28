@@ -148,14 +148,20 @@ def run_preparation(args):
         for tif_path in test_files:
             meta_path = tif_path.with_name(tif_path.stem + "_meta.json")
 
-            # Move .tif
+            # Robust move: Copy then delete (safer on network volumes)
             dest_tif = raw_test_dir / tif_path.name
-            shutil.move(str(tif_path), str(dest_tif))
+            shutil.copy2(str(tif_path), str(dest_tif))
+            if dest_tif.exists():
+                tif_path.unlink()  # Delete source
+            else:
+                print(f"⚠️ Failed to copy {tif_path.name} to test dir")
 
             # Move _meta.json if it exists
             if meta_path.exists():
                 dest_meta = raw_test_dir / meta_path.name
-                shutil.move(str(meta_path), str(dest_meta))
+                shutil.copy2(str(meta_path), str(dest_meta))
+                if dest_meta.exists():
+                    meta_path.unlink()
 
         print("✅ Split complete:")
         print(f"   Training: {len(train_files)} tiles in {raw_dir}")

@@ -9,6 +9,8 @@ Runs the full Detectree2 workflow:
   4. Stitches and cleans crowns if necessary
   5. Writes the output -- Work In Progress
 """
+# Useage quickstart:
+# python infer.py --use_test_data --weights finetuned
 
 from __future__ import annotations
 import os
@@ -30,6 +32,7 @@ import cv2
 import rasterio
 from rasterio.transform import from_bounds
 import pandas as pd
+import geopandas as gpd
 from utils import download_tcd_tiles_streaming
 from utils import clean_validate_predictions_vs_tcd_segments
 from utils import visualize_validation_results
@@ -122,7 +125,20 @@ def main():
 
     # === 4. Initialize Detectron2 predictor ===
     print("\n⚙️  Initializing Detectron2 predictor ...")
-    cfg = setup_cfg(update_model=str(model_path))
+    cfg = setup_cfg()  # Don't set weights yet
+
+    # Load the config used for training if using fine-tuned weights
+    if args.weights == "finetuned":
+        config_path = Path("configs/full_train.yaml")
+        if config_path.exists():
+            print(f"📄 Loading config from {config_path}")
+            cfg.merge_from_file(str(config_path))
+        else:
+            print(f"⚠️ Config {config_path} not found, using defaults")
+
+    # Force the correct weights *after* merging config
+    cfg.MODEL.WEIGHTS = str(model_path)
+
     set_device(cfg)
     predictor = DefaultPredictor(cfg)
     print("✅ Predictor ready.")
@@ -145,16 +161,19 @@ def main():
     if len(list(raw_dir.glob("tcd_tile_*.tif"))) == 0:
         raise FileNotFoundError(
             f"❌ No TCD tiles found in {raw_dir}.\n"
-            "Please run prepare_data.py first to download and tile the dataset."
+            "Please run prepare_data.py first to download the dataset."
         )
 
     for img_path in sorted(raw_dir.glob("tcd_tile_*.tif")):
         image_info = load_tcd_meta_for_tile(img_path)
 
-        image_id = image_info["image_id"]
+        if image_info is not None:
+            image_id = image_info.get("image_id", "unknown")
+        else:
+            image_id = "unknown"
 
         print(f"\n================ Processing {image_id} ================")
-        print(f"Biome: {image_info.get('biome_name', 'N/A')}")
+        print(f"Biome: {image_info.get('biome_name', 'N/A') if image_info else 'N/A'}")
 
         # ------------------------------------------------------------
         # 5. Tile orthomosaic into chips for inference
@@ -165,8 +184,8 @@ def main():
         ensure_dir(chip_dir)
 
         buffer = 30
-        tile_width = 40
-        tile_height = 40
+        tile_width = args.tile_size
+        tile_height = args.tile_size
 
         try:
             # Detectree2 tiler (preserves CRS if the input GeoTIFF is georeferenced)
@@ -202,7 +221,9 @@ def main():
         # ------------------------------------------------------------
         chip_pred_dir = chip_dir / "predictions"
         filter_raw_predictions(
-            chip_pred_dir, score_thresh=filter_threshold, overwrite=True
+            chip_pred_dir,
+            score_thresh=filter_threshold,
+            overwrite=True,
         )
 
         # ------------------------------------------------------------
@@ -226,12 +247,23 @@ def main():
         # Apply NMS to remove duplicate overlapping polygons
         apply_nms_to_geojson(merged_geojson, iou_threshold=nms_dedupe_threshold)
 
-        # visualize_saved_prediction_with_masks(
-        #     img_path,                     # original tile
-        #     merged_geojson,               # merged prediction mask JSON
-        #     overlays_path,
-        #     image_id
-        # )
+        # Skip validation if no ground truth metadata
+        if image_id == "unknown" or image_id == "WON":
+            print(
+                f"⚠️ No ground truth metadata for {img_path.name} — skipping validation metrics."
+            )
+
+            # Use the main visualization function (now handles gt=None)
+            visualize_validation_results(
+                pred=gpd.read_file(merged_geojson),
+                gt=None,
+                ious=None,
+                site_path=site_path,
+                rgb_path=img_path,
+                tile_name=img_path.stem,
+                image_id=image_id,
+            )
+            continue
 
         metrics_all, pred, gt, scores, coco_anns = (
             clean_validate_predictions_vs_tcd_segments(
@@ -325,6 +357,14 @@ def parse_args():
         help=(
             "Run inference on test data (data/tcd/raw_test/) instead of training data"
         ),
+    )
+    ap.add_argument(
+        "--tile_size",
+        type=int,
+        default=40,
+        help="Tile size in meters (default: 40). Reduce this for high-res imagery to avoid downscaling.",
+        # still not 100% clear if this is useful or not tbh
+        # might be worth experimenting with at some point
     )
 
     return ap.parse_args()

@@ -15,3 +15,4 @@ archive*
 *.tar.gz
 *.sif
 canopyai.tar.gz
+.DS_Store

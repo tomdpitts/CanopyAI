@@ -531,8 +531,8 @@ def clean_validate_predictions_vs_tcd_segments(
 
 def visualize_validation_results(
     pred,
-    gt,
-    ious,
+    gt=None,
+    ious=None,
     coco_anns=None,
     iou_thresh_tree=0.5,
     iop_thresh_canopy=0.7,
@@ -543,6 +543,7 @@ def visualize_validation_results(
 ):
     """
     Visualize Detectree2 vs TCD polygons over RGB base image.
+    Handles cases with no Ground Truth (gt=None).
     """
 
     # === 1. Output path ===
@@ -571,10 +572,21 @@ def visualize_validation_results(
             ]
 
     # === 3. Plot setup ===
-    fig, ax = plt.subplots(figsize=(8, 8))
-    ax.set_title(
-        f"Detectree2 vs TCD — IoU ≥ {iou_thresh_tree}, IoP ≥ {iop_thresh_canopy}"
-    )
+    # Calculate figsize to preserve resolution (assuming dpi=100 for calculation)
+    # We want 1 px in image ~= 1 px in output
+    dpi = 100
+    if img is not None:
+        h, w = img.shape[:2]
+        figsize = (w / dpi, h / dpi)
+    else:
+        figsize = (10, 10)
+
+    fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
+
+    title = f"Detectree2 Predictions (IoU ≥ {iou_thresh_tree})"
+    if gt is not None:
+        title += f" vs TCD (IoP ≥ {iop_thresh_canopy})"
+    ax.set_title(title)
     ax.set_aspect("equal")
 
     if img is not None:
@@ -604,18 +616,21 @@ def visualize_validation_results(
 
         # --- Extract per-prediction score ---
         score_tree = score_canopy = 0.0
-        if isinstance(ious, tuple) and len(ious) == 2:
-            scores_trees, scores_canopy = ious
-            if i < len(scores_trees):
-                score_tree = scores_trees[i]
-            if i < len(scores_canopy):
-                score_canopy = scores_canopy[i]
-        elif isinstance(ious, list):
-            if i < len(ious):
-                score_tree = ious[i]  # fallback
+        if ious:
+            if isinstance(ious, tuple) and len(ious) == 2:
+                scores_trees, scores_canopy = ious
+                if i < len(scores_trees):
+                    score_tree = scores_trees[i]
+                if i < len(scores_canopy):
+                    score_canopy = scores_canopy[i]
+            elif isinstance(ious, list):
+                if i < len(ious):
+                    score_tree = ious[i]  # fallback
 
         # --- Pick color based on which test passes ---
-        if score_tree >= iou_thresh_tree:
+        if gt is None:
+            color = "#00F0FF"  # Default teal for predictions when no GT
+        elif score_tree >= iou_thresh_tree:
             color = "#00F0FF"  # bright teal  → good tree (IoU)
         elif score_canopy >= iop_thresh_canopy:
             color = "#00FF9D"  # neon green  → good canopy (IoP)
@@ -624,36 +639,32 @@ def visualize_validation_results(
 
         draw_pred_outline(ax, p, color)
 
-    # === 5. Draw ground-truth crowns & canopy ===
-    for idx, g in enumerate(gt.geometry):
-        if not g.is_valid or g.is_empty:
-            continue
-        # Match color by category (1=tree, 2=canopy)
-        cat = None
-        if coco_anns and idx < len(coco_anns):
-            cat = coco_anns[idx].get("category_id", 1)
-        color = "#C266FF" if cat == 1 else "#0a20ad"  # purple vs dark-blue
-        if isinstance(g, Polygon):
-            geoms = [g]
-        elif isinstance(g, MultiPolygon):
-            geoms = list(g.geoms)
-        elif isinstance(g, GeometryCollection):
-            geoms = [
-                geom for geom in g.geoms if isinstance(geom, (Polygon, MultiPolygon))
-            ]
-        else:
-            geoms = []
+    # === 5. Draw ground-truth crowns & canopy (if available) ===
+    if gt is not None:
+        for idx, g in enumerate(gt.geometry):
+            if not g.is_valid or g.is_empty:
+                continue
+            # Match color by category (1=tree, 2=canopy)
+            cat = None
+            if coco_anns and idx < len(coco_anns):
+                cat = coco_anns[idx].get("category_id", 1)
+            color = "#C266FF" if cat == 1 else "#0a20ad"  # purple vs dark-blue
+            if isinstance(g, Polygon):
+                geoms = [g]
+            elif isinstance(g, MultiPolygon):
+                geoms = list(g.geoms)
+            elif isinstance(g, GeometryCollection):
+                geoms = [
+                    geom
+                    for geom in g.geoms
+                    if isinstance(geom, (Polygon, MultiPolygon))
+                ]
+            else:
+                geoms = []
 
-        for geom in geoms:
-            if isinstance(geom, Polygon):
-                x, y = geom.exterior.xy
-                ax.fill(
-                    x, y, facecolor=color, edgecolor=color, linewidth=0.8, alpha=0.25
-                )
-                ax.plot(x, y, color=color, linewidth=0.8, alpha=0.9)
-            elif isinstance(geom, MultiPolygon):
-                for sub in geom.geoms:
-                    x, y = sub.exterior.xy
+            for geom in geoms:
+                if isinstance(geom, Polygon):
+                    x, y = geom.exterior.xy
                     ax.fill(
                         x,
                         y,
@@ -663,6 +674,18 @@ def visualize_validation_results(
                         alpha=0.25,
                     )
                     ax.plot(x, y, color=color, linewidth=0.8, alpha=0.9)
+                elif isinstance(geom, MultiPolygon):
+                    for sub in geom.geoms:
+                        x, y = sub.exterior.xy
+                        ax.fill(
+                            x,
+                            y,
+                            facecolor=color,
+                            edgecolor=color,
+                            linewidth=0.8,
+                            alpha=0.25,
+                        )
+                        ax.plot(x, y, color=color, linewidth=0.8, alpha=0.9)
 
     # === 6. Legend ===
     import matplotlib.patches as mpatches
@@ -677,8 +700,15 @@ def visualize_validation_results(
 
     ax.legend(handles=legend_elems, loc="lower right", frameon=True, fontsize=8)
 
-    ax.set_xlabel("Easting")
-    ax.set_ylabel("Northing")
+    # Determine axis labels based on CRS
+    xlabel, ylabel = "Easting", "Northing"
+    if rgb_path and Path(rgb_path).exists():
+        with rasterio.open(rgb_path) as src:
+            if src.crs and src.crs.is_geographic:
+                xlabel, ylabel = "Longitude", "Latitude"
+
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
     plt.tight_layout()
     plt.savefig(out_path, dpi=250)
     plt.close(fig)
@@ -774,24 +804,28 @@ def filter_raw_predictions(
     )
 
 
-def load_tcd_meta_for_tile(img_path: Path):
-    """
-    Load TCD metadata for a given .tif tile, if available.
+def load_tcd_meta_for_tile(tile_path: Path):
+    """Load metadata JSON for a given TCD tile (if available)."""
+    # Expected metadata path: data/tcd/raw/tcd_tile_X_meta.json
+    # Or just look for any .json with same stem
+    meta_path = tile_path.with_name(f"{tile_path.stem}_meta.json")
 
-    Returns:
-      dict with keys: width, height, bounds, crs, coco_annotations, ...
-      or None if no _meta.json exists (in which case we skip validation).
-    """
-    meta_path = img_path.with_name(img_path.stem + "_meta.json")
     if not meta_path.exists():
-        print(
-            f"ℹ️  No metadata found for {img_path.name} (no _meta.json) — skipping validation."
-        )
-        return None
+        # Try finding *any* json that matches
+        candidates = list(tile_path.parent.glob(f"{tile_path.stem}*.json"))
+        if candidates:
+            meta_path = candidates[0]
 
-    with open(meta_path, "r", encoding="utf-8") as f:
-        meta = json.load(f)
-    return meta
+    if not meta_path.exists():
+        # Return minimal default metadata for unannotated images
+        return {"image_id": "unknown", "biome_name": "Unknown", "coco_annotations": []}
+
+    try:
+        with open(meta_path, "r") as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"⚠️ Failed to load metadata {meta_path}: {e}")
+        return {"image_id": "unknown", "biome_name": "Unknown", "coco_annotations": []}
 
 
 # ============================================================

@@ -2,12 +2,12 @@
 """
 train.py — Fine-tune Detectree2 using tiny/fast/full YAML presets.
 
-Usage:
+Usage quickstart:
     python train.py --preset tiny   --weights baseline --already_downloaded
     python train.py --preset fast   --weights baseline
     python train.py --preset full   --weights baseline
 
-for finetuning from previous run:
+for finetuning from previous run instead:
     python train.py --weights finetuned
 """
 
