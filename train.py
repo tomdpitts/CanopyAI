@@ -85,10 +85,68 @@ def load_preset_cfg(preset: str, weights: str, output_dir: Path):
         cfg.MODEL.DEVICE = "cpu"
         print("🧠 Using CPU")
 
+    # ---- Multi-scale training (set programmatically to bypass YACS type check) ----
+    if preset == "full":
+        # Override with tuple for multi-scale training
+        # This works because we're setting it directly, not via YAML merge
+        cfg.INPUT.MIN_SIZE_TRAIN = (800, 1024, 1280)
+        cfg.INPUT.MIN_SIZE_TRAIN_SAMPLING = "choice"
+        print("🔍 Multi-scale training enabled: [800, 1024, 1280]px")
+
     cfg.OUTPUT_DIR = str(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     return cfg
+
+
+def build_train_augmentation(cfg):
+    """
+    Custom augmentation pipeline with color jitter for aerial imagery robustness.
+    Adds brightness/contrast/saturation variations to handle different lighting
+    conditions and seasons.
+    """
+    from detectron2.data import transforms as T
+
+    augs = []
+
+    # Resize (respects MIN_SIZE_TRAIN for multi-scale)
+    if isinstance(cfg.INPUT.MIN_SIZE_TRAIN, (list, tuple)):
+        min_size = cfg.INPUT.MIN_SIZE_TRAIN
+    else:
+        min_size = (cfg.INPUT.MIN_SIZE_TRAIN,)
+
+    augs.append(
+        T.ResizeShortestEdge(
+            min_size,
+            cfg.INPUT.MAX_SIZE_TRAIN,
+            sample_style=cfg.INPUT.MIN_SIZE_TRAIN_SAMPLING,
+        )
+    )
+
+    # Random flips
+    if cfg.INPUT.RANDOM_FLIP != "none":
+        augs.append(
+            T.RandomFlip(
+                horizontal=cfg.INPUT.RANDOM_FLIP == "horizontal",
+                vertical=cfg.INPUT.RANDOM_FLIP == "vertical",
+            )
+        )
+
+    # Random crop
+    if cfg.INPUT.CROP.ENABLED:
+        augs.append(T.RandomCrop(cfg.INPUT.CROP.TYPE, cfg.INPUT.CROP.SIZE))
+
+    # Color augmentations (NEW - for aerial imagery robustness)
+    # Apply random brightness adjustment
+    augs.append(T.RandomBrightness(intensity_min=0.8, intensity_max=1.2))
+    # Apply random contrast adjustment
+    augs.append(T.RandomContrast(intensity_min=0.8, intensity_max=1.2))
+    # Apply random saturation adjustment
+    augs.append(T.RandomSaturation(intensity_min=0.8, intensity_max=1.2))
+    # Apply random lighting (PCA-based color jitter)
+    augs.append(T.RandomLighting(scale=0.1))
+
+    return augs
 
 
 # ============================================================
@@ -327,7 +385,35 @@ def train_detectree2(
     else:
         print(f"📝 No existing checkpoints found, starting fresh training")
 
-    trainer = MyTrainer(cfg, patience=5)
+    # Create custom trainer with enhanced augmentations
+    class CustomAugTrainer(MyTrainer):
+        """Extended MyTrainer with custom color augmentations for aerial imagery."""
+
+        @classmethod
+        def build_train_loader(cls, cfg):
+            """Override to use custom augmentation pipeline."""
+            from detectron2.data import (
+                DatasetMapper,
+                build_detection_train_loader,
+            )
+
+            # Create custom mapper with our augmentation pipeline
+            mapper = DatasetMapper(
+                is_train=True,
+                augmentations=build_train_augmentation(cfg),
+                image_format=cfg.INPUT.FORMAT,
+                use_instance_mask=cfg.MODEL.MASK_ON,
+            )
+
+            return build_detection_train_loader(cfg, mapper=mapper)
+
+    # Use custom trainer if full preset (has color augs), else standard
+    if preset == "full":
+        trainer = CustomAugTrainer(cfg, patience=5)
+        print("🎨 Using enhanced color augmentations for aerial imagery")
+    else:
+        trainer = MyTrainer(cfg, patience=5)
+
     trainer.resume_or_load(resume=resume_from_checkpoint)
     trainer.train()
 

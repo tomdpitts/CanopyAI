@@ -1,0 +1,17 @@
+# ============================================================
+#   EXTENDED TRAINING CONFIG — Proper Duration for Fine-Tuning
+#   Key change: Train longer and monitor validation AP, not loss
+# ============================================================
+
+_BASE_: "full_train.yaml"
+
+# Same settings as full_train, but with better monitoring guidance
+SOLVER:
+  MAX_ITER: 15000              # Extended from 12000
+  CHECKPOINT_PERIOD: 500       # Save less frequently (disk space)
+  
+TEST:
+  EVAL_PERIOD: 500             # Evaluate every 500 iterations
+
+
+OUTPUT_DIR: "output_extended"

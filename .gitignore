@@ -22,3 +22,5 @@ BUILD_ON_HPC.md
 
 upscale_comparison.png
 *.pth
+
+sam_output/

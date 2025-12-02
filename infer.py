@@ -106,7 +106,8 @@ def main():
     # Model path
     if args.weights == "finetuned":
         model_path = Path(
-            "data/tcd/train_outputs/model_bravo2.pth"
+            "model_charlie1.pth"
+            # "data/tcd/train_outputs/model_bravo2.pth"
         )  # alpha5 is the latest model from Modal HPC
     else:
         model_path = Path("230103_randresize_full.pth")

@@ -60,13 +60,16 @@ image = (
             "data/",
             "won003*/",
             "venv*/",
-            "*.pth",
             "*.tif",
             "__pycache__",
             ".git",
             ".DS_Store",
             "samples/",
             "train_outputs",
+            "upscale_comparison.png",
+            "sam_vit_b_01ec64.pth",
+            "230103_randresize_full.pth",
+            "model_charlie1.pth",
         ],
     )
 )

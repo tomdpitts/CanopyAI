@@ -28,7 +28,7 @@ MODEL:
 #  INPUT AUGMENTATIONS (HEAVY)
 # ------------------------------------------------------------
 INPUT:
-  # Training image size (single scale for stability)
+  # Training image size (larger for better detail on tree crowns)
   MIN_SIZE_TRAIN: 1024
   MAX_SIZE_TRAIN: 1536
   MIN_SIZE_TEST: 1024
@@ -49,14 +49,14 @@ INPUT:
 SOLVER:
   IMS_PER_BATCH: 8             # total batch size (auto-scales w/ GPUs)
   BASE_LR: 0.00015             # lower LR for fine-tuning on small datasets
-  WARMUP_ITERS: 1000
+  WARMUP_ITERS: 500
   WARMUP_FACTOR: 0.001
 
   # Cosine annealing schedule
   LR_SCHEDULER_NAME: "WarmupCosineLR"
 
   MAX_ITER: 12000              # Optimized for ~1500-2500 chips from 250 tiled images
-  CHECKPOINT_PERIOD: 1000      # Save interval
+  CHECKPOINT_PERIOD: 250      # Save interval
 
   STEPS: []         # Not used for cosine LR
   GAMMA: 0.1
@@ -77,6 +77,6 @@ DATALOADER:
 #  TRAIN / TEST
 # ------------------------------------------------------------
 TEST:
-  EVAL_PERIOD: 500            # More frequent eval for better early stopping
+  EVAL_PERIOD: 250            # More frequent eval for better early stopping
 
 OUTPUT_DIR: "output_full"
