@@ -7,6 +7,8 @@ runs the training logic defined in `train.py`.
 Usage:
     modal run modal_train.py --preset fast --weights baseline
     modal run modal_train.py::list_checkpoints
+
+    modal run --detach modal_train.py --preset full --weights baseline --max-images 500 --already-downloaded
 """
 
 import modal
@@ -56,12 +58,15 @@ image = (
         remote_path="/root/canopyAI",
         ignore=[
             "data/",
+            "won003*/",
             "venv*/",
             "*.pth",
             "*.tif",
             "__pycache__",
             ".git",
             ".DS_Store",
+            "samples/",
+            "train_outputs",
         ],
     )
 )
@@ -109,6 +114,7 @@ def main(
     already_downloaded: bool = False,
     train_split: float = 0.8,
     run_name: str = None,
+    dataset: str = "tcd",
 ):
     """
     Run training on Modal.
@@ -119,6 +125,7 @@ def main(
         max_images: Number of images to download/use
         already_downloaded: Skip download step
         train_split: Train/test split ratio (default 0.8)
+        dataset: 'tcd' (default) or 'won'
     """
 
     # Simple class to mimic argparse Namespace
@@ -133,6 +140,7 @@ def main(
         already_downloaded=already_downloaded,
         train_split=train_split,
         run_name=run_name,
+        dataset=dataset,
     )
 
     print(f"☁️  Submitting training job to Modal...")

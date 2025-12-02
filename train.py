@@ -9,6 +9,9 @@ Usage quickstart:
 
 for finetuning from previous run instead:
     python train.py --weights finetuned
+
+updated:
+    python train.py --preset tiny --weights baseline --already_downloaded --dataset won --run-name whiskey
 """
 
 import argparse
@@ -17,10 +20,13 @@ from pathlib import Path
 
 import torch
 import torch.multiprocessing as mp
-from detectree2.models.train import register_train_data, MyTrainer
+from detectron2.data import DatasetCatalog, MetadataCatalog
+from detectree2.models.train import register_train_data, MyTrainer, get_tree_dicts
 from detectree2.models.train import setup_cfg
+from detectron2.structures import BoxMode
 from prepare_data import run_preparation
 import wget
+import json
 
 
 def is_running_on_modal():
@@ -166,14 +172,80 @@ def find_recent_incomplete_run(output_dir: Path, time_window_minutes: int = 5) -
     return None
 
 
+def get_won_dicts(directory: str):
+    """Load WON dataset from _meta.json files."""
+    directory = Path(directory)
+    dataset_dicts = []
+
+    # Find all meta.json files
+    meta_files = sorted(list(directory.glob("*_meta.json")))
+
+    for meta_path in meta_files:
+        with open(meta_path, "r") as f:
+            meta = json.load(f)
+
+        record = {}
+        record["file_name"] = str(directory / meta["file_name"])
+        record["image_id"] = meta["image_id"]
+        record["height"] = meta["height"]
+        record["width"] = meta["width"]
+
+        objs = []
+        for ann in meta.get("coco_annotations", []):
+            obj = {
+                "bbox": ann["bbox"],
+                "bbox_mode": BoxMode.XYWH_ABS,
+                "segmentation": ann["segmentation"],
+                "category_id": ann["category_id"],
+            }
+            objs.append(obj)
+
+        record["annotations"] = objs
+        dataset_dicts.append(record)
+
+    return dataset_dicts
+
+
 def train_detectree2(
-    chips_root: Path, output_dir: Path, preset: str, weights: str, run_name: str = None
+    train_path: Path,
+    output_dir: Path,
+    preset: str,
+    weights: str,
+    run_name: str = None,
+    dataset: str = "tcd",
+    val_path: Path = None,
 ):
     print("📚 Registering training dataset…")
 
-    site_name = "TCD"
-    val_fold = 1
-    register_train_data(str(chips_root), site_name, val_fold)
+    site_name = "tcd" if dataset == "tcd" else "won"
+
+    if dataset == "won":
+        # WON data is flat (no folds), so we register manually
+        DatasetCatalog.clear()  # Clear existing registrations if any
+        DatasetCatalog.register(
+            f"{site_name}_train", lambda: get_won_dicts(str(train_path))
+        )
+
+        if val_path:
+            DatasetCatalog.register(
+                f"{site_name}_val", lambda: get_won_dicts(str(val_path))
+            )
+        else:
+            # Fallback if no val path provided (shouldn't happen with new logic)
+            print("⚠️ No validation path provided, using training data for validation")
+            DatasetCatalog.register(
+                f"{site_name}_val", lambda: get_won_dicts(str(train_path))
+            )
+
+        # Set metadata (required for COCOEvaluator)
+        MetadataCatalog.get(f"{site_name}_train").set(thing_classes=["tree"])
+        MetadataCatalog.get(f"{site_name}_val").set(thing_classes=["tree"])
+
+        print(f"   Registered {site_name}_train from {train_path}")
+        print(f"   Registered {site_name}_val from {val_path}")
+    else:
+        val_fold = 1
+        register_train_data(str(train_path), site_name, val_fold)
 
     train_name = f"{site_name}_train"
     val_name = f"{site_name}_val"
@@ -215,7 +287,9 @@ def train_detectree2(
             run_dir = output_dir / f"run_{codename}"
             print(f"🆕 Creating new run: {codename}")
 
-    cfg.OUTPUT_DIR = str(run_dir)
+    cfg.OUTPUT_DIR = str(
+        run_dir
+    )  # override output directory with run codename, if provided
 
     # Freeze config
     cfg.freeze()
@@ -266,19 +340,31 @@ def train_detectree2(
 def main_worker(rank, args):
     # Detect Modal and use persistent volume paths
     if is_running_on_modal():
-        data_root = Path("/data/tcd")
+        if args.dataset == "won":
+            # Assuming WON data is mounted or available at /data/won
+            data_root = Path("/data/won")
+        else:
+            data_root = Path("/data/tcd")
         output_dir = Path("/checkpoints")
         print(f"☁️  Running on Modal:")
         print(f"   Data: {data_root} (persistent volume)")
         print(f"   Checkpoints: {output_dir} (persistent volume)")
     else:
-        data_root = Path("data/tcd")
+        if args.dataset == "won":
+            data_root = Path("data/won")
+        else:
+            data_root = Path("data/tcd")
         output_dir = data_root / "train_outputs"
         print(f"💾 Running locally:")
         print(f"   Data: {data_root}")
         print(f"   Checkpoints: {output_dir}")
 
-    chips_root = data_root / "chips"
+    if args.dataset == "won":
+        train_path = data_root / "raw"
+        val_path = data_root / "raw_test"
+    else:
+        train_path = data_root / "chips"
+        val_path = None
 
     # Create directories
     data_root.mkdir(parents=True, exist_ok=True)
@@ -286,20 +372,25 @@ def main_worker(rank, args):
 
     # 1. Download
     # 1. Prepare Data (Download + Tile + Split)
-    if not args.already_downloaded:
-        print("🏗️  Running data preparation pipeline...")
-        run_preparation(args)
+    if args.dataset == "tcd":
+        if not args.already_downloaded:
+            print("🏗️  Running data preparation pipeline...")
+            run_preparation(args)
+        else:
+            # Nothing to download, nothing to tile
+            print("⏭️ Skipping download and tiling (using existing chips)")
     else:
-        # Nothing to download, nothing to tile
-        print("⏭️ Skipping download and tiling (using existing chips)")
+        print(f"⏭️ Skipping TCD preparation (using {args.dataset} dataset)")
 
     # 2. Train
     train_detectree2(
-        chips_root,
+        train_path,
         output_dir,
         preset=args.preset,
         weights=args.weights,
         run_name=args.run_name,
+        dataset=args.dataset,
+        val_path=val_path,
     )
 
 
@@ -332,6 +423,13 @@ def parse_args():
         "--weights",
         default="baseline",
         help="'baseline' | 'finetuned' | /path/to/model.pth",
+    )
+
+    p.add_argument(
+        "--dataset",
+        default="tcd",
+        choices=["tcd", "won"],
+        help="Dataset to use. 'tcd' (default) downloads/tiles TCD data. 'won' uses local data in data/won/raw.",
     )
 
     return p.parse_args()

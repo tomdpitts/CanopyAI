@@ -77,6 +77,6 @@ DATALOADER:
 #  TRAIN / TEST
 # ------------------------------------------------------------
 TEST:
-  EVAL_PERIOD: 1000            # More frequent eval for better early stopping
+  EVAL_PERIOD: 500            # More frequent eval for better early stopping
 
 OUTPUT_DIR: "output_full"

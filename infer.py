@@ -8,9 +8,11 @@ Runs the full Detectree2 workflow:
   3. Projects predictions to GeoJSON
   4. Stitches and cleans crowns if necessary
   5. Writes the output -- Work In Progress
+
+Useage quickstart:
+    python infer.py --use_test_data --weights finetuned --image_path data/tcd/bin_liang/tcd_tile_WON.tif
+
 """
-# Useage quickstart:
-# python infer.py --use_test_data --weights finetuned
 
 from __future__ import annotations
 import os
@@ -103,7 +105,9 @@ def smoke_test(model_path: Path):
 def main():
     # Model path
     if args.weights == "finetuned":
-        model_path = Path("data/tcd/train_outputs/model_final.pth")
+        model_path = Path(
+            "data/tcd/train_outputs/model_bravo2.pth"
+        )  # alpha5 is the latest model from Modal HPC
     else:
         model_path = Path("230103_randresize_full.pth")
 
@@ -151,20 +155,30 @@ def main():
     total_gt_canopy = 0
 
     # === 5–12. Process each tile ===
-    if args.use_test_data:
+    if args.image_path:
+        img_path = Path(args.image_path)
+        if not img_path.exists():
+            raise FileNotFoundError(f"❌ Image not found: {img_path}")
+
+        raw_dir = img_path.parent
+        files_to_process = [img_path]
+        print(f"\n🎯 Processing single image: {img_path}")
+    elif args.use_test_data:
         raw_dir = Path("data/tcd/raw_test")
         print("\n🧪 Using TEST data from data/tcd/raw_test/")
+        files_to_process = sorted(raw_dir.glob("tcd_tile_*.tif"))
     else:
         raw_dir = Path("data/tcd/raw")
         print("\n📊 Using TRAINING data from data/tcd/raw/")
+        files_to_process = sorted(raw_dir.glob("tcd_tile_*.tif"))
 
-    if len(list(raw_dir.glob("tcd_tile_*.tif"))) == 0:
+    if len(files_to_process) == 0:
         raise FileNotFoundError(
             f"❌ No TCD tiles found in {raw_dir}.\n"
             "Please run prepare_data.py first to download the dataset."
         )
 
-    for img_path in sorted(raw_dir.glob("tcd_tile_*.tif")):
+    for img_path in files_to_process:
         image_info = load_tcd_meta_for_tile(img_path)
 
         if image_info is not None:
@@ -365,6 +379,13 @@ def parse_args():
         help="Tile size in meters (default: 40). Reduce this for high-res imagery to avoid downscaling.",
         # still not 100% clear if this is useful or not tbh
         # might be worth experimenting with at some point
+    )
+
+    ap.add_argument(
+        "--image_path",
+        type=str,
+        default=None,
+        help="Path to a single image file to run inference on (overrides --use_test_data)",
     )
 
     return ap.parse_args()
