@@ -47,7 +47,7 @@ INPUT:
 #  SOLVER (LARGE SCALE TRAINING)
 # ------------------------------------------------------------
 SOLVER:
-  IMS_PER_BATCH: 8             # total batch size (auto-scales w/ GPUs)
+  IMS_PER_BATCH: 16             # total batch size (auto-scales w/ GPUs)
   BASE_LR: 0.00015             # lower LR for fine-tuning on small datasets
   WARMUP_ITERS: 500
   WARMUP_FACTOR: 0.001
