@@ -1,0 +1,561 @@
+#!/usr/bin/env python3
+
+"""
+Two-Stage Tree Detection Pipeline: DeepForest + SAM
+---------------------------------------------------
+This script implements a custom 2-stage model that:
+1. Uses DeepForest to detect trees in sparse arid landscapes
+2. Produces bounding boxes around detected trees
+3. Uses SAM (Segment Anything Model) to segment the object within each bounding box
+
+Usage:
+    python foxtrot.py --image_path data/tcd/bin_liang/tcd_tile_WON.tif
+
+Author: CanopyAI
+"""
+
+import argparse
+import os
+import json
+import numpy as np
+import rasterio
+from pathlib import Path
+from segment_anything import sam_model_registry, SamPredictor
+import cv2
+import torch
+from tqdm import tqdm
+from deepforest import main as deepforest_main
+from shapely.geometry import Polygon
+
+# Fix MPS float64 compatibility
+torch.set_default_dtype(torch.float32)
+
+
+def load_image_from_tif(tif_path):
+    """
+    Load image from TIF file and return as RGB numpy array.
+
+    Args:
+        tif_path: Path to input TIF file
+
+    Returns:
+        image: RGB image as (H, W, 3) numpy array
+        crs: Coordinate reference system
+        transform: Geospatial transform
+        bounds: Geographic bounds
+    """
+    with rasterio.open(tif_path) as src:
+        # Read RGB bands (assuming bands 1,2,3 are RGB)
+        image = src.read([1, 2, 3])  # Shape: (3, H, W)
+        image = np.transpose(image, (1, 2, 0))  # Convert to (H, W, 3)
+
+        # Store georeferencing info
+        crs = src.crs
+        transform = src.transform
+        bounds = src.bounds
+
+        print(f"✅ Loaded image: {image.shape}")
+        print(f"   CRS: {crs}")
+        print(f"   Bounds: {bounds}")
+
+    # Normalize image to 0-255 if needed
+    if image.max() > 255:
+        image = (image / image.max() * 255).astype(np.uint8)
+
+    return image, crs, transform, bounds
+
+
+def detect_trees_with_deepforest(image, confidence_threshold=0.3, model_path=None):
+    """
+    Stage 1: Use DeepForest to detect trees and generate bounding boxes.
+
+    Args:
+        image: RGB image as (H, W, 3) numpy array
+        confidence_threshold: Minimum confidence score for detections
+        model_path: Optional path to custom DeepForest model (.pth file)
+
+    Returns:
+        bboxes: List of bounding boxes as [xmin, ymin, xmax, ymax]
+        scores: Confidence scores for each detection
+    """
+    print("\n🌲 Stage 1: Running DeepForest tree detection...")
+
+    # Initialize DeepForest model
+    model = deepforest_main.deepforest()
+
+    # Load model
+    if model_path:
+        print(f"   Loading custom model: {model_path}")
+        # Load custom fine-tuned model
+        model.model.load_state_dict(torch.load(model_path, map_location="cpu"))
+    else:
+        print("   Loading default pretrained model from Hugging Face...")
+        # Load the pretrained model from Hugging Face
+        model.load_model("weecology/deepforest-tree")
+
+    # Convert image to float32 to avoid warning and ensure proper format
+    if image.dtype == np.uint8:
+        image_float = image.astype("float32")
+        print(f"   Converted image from uint8 to float32")
+    else:
+        image_float = image
+
+    print(f"   Image shape: {image_float.shape}")
+    print(f"   Image value range: [{image_float.min():.1f}, {image_float.max():.1f}]")
+
+    # DeepForest expects RGB format for numpy array predictions
+    # For very large images, we might need to process in patches
+    h, w = image_float.shape[:2]
+
+    # If image is very large (>2000px), use predict_tile which handles patches
+    if h > 2000 or w > 2000:
+        print(f"   Large image detected, using patch-based prediction...")
+
+        # Use larger patches and less overlap for faster processing
+        patch_size = 800  # Larger patches = fewer patches
+        patch_overlap = 0.05  # Less overlap = faster
+        stride = int(patch_size * (1 - patch_overlap))
+
+        # Calculate number of patches
+        num_patches_y = (h - patch_size) // stride + 1
+        num_patches_x = (w - patch_size) // stride + 1
+        total_patches = num_patches_y * num_patches_x
+
+        print(
+            f"   Processing {total_patches} patches ({patch_size}px, {int(patch_overlap * 100)}% overlap)..."
+        )
+
+        # Suppress DeepForest warnings about missing image_path
+        import warnings
+
+        warnings.filterwarnings("ignore", message=".*image_path.*")
+        warnings.filterwarnings("ignore", message=".*root_dir.*")
+
+        all_predictions = []
+        patch_count = 0
+
+        for y_start in tqdm(range(0, h, stride), desc="   Rows"):
+            for x_start in range(0, w, stride):
+                y_end = min(y_start + patch_size, h)
+                x_end = min(x_start + patch_size, w)
+
+                # Extract patch
+                patch = image_float[y_start:y_end, x_start:x_end]
+
+                # Skip very small edge patches
+                if patch.shape[0] < 200 or patch.shape[1] < 200:
+                    continue
+
+                # Predict on patch
+                try:
+                    patch_preds = model.predict_image(image=patch)
+
+                    if patch_preds is not None and len(patch_preds) > 0:
+                        # Adjust bounding box coordinates to global image
+                        patch_preds["xmin"] += x_start
+                        patch_preds["xmax"] += x_start
+                        patch_preds["ymin"] += y_start
+                        patch_preds["ymax"] += y_start
+                        all_predictions.append(patch_preds)
+                        patch_count += len(patch_preds)
+                except Exception:
+                    # Silently skip failed patches
+                    continue
+
+        # Re-enable warnings
+        warnings.filterwarnings("default")
+
+        print(f"   Found {patch_count} raw detections across all patches")
+
+        # Combine all predictions
+        if all_predictions:
+            import pandas as pd
+
+            predictions = pd.concat(all_predictions, ignore_index=True)
+        else:
+            predictions = None
+    else:
+        predictions = model.predict_image(image=image_float)
+
+    print(f"   Raw predictions: {len(predictions) if predictions is not None else 0}")
+
+    if predictions is None or len(predictions) == 0:
+        print("⚠️  No trees detected by DeepForest")
+        print(
+            f"   Try lowering --deepforest_confidence (current: {confidence_threshold})"
+        )
+        return [], []
+
+    # Show score distribution before filtering
+    print(
+        f"   Score range: [{predictions['score'].min():.3f}, {predictions['score'].max():.3f}]"
+    )
+
+    # Filter by confidence threshold
+    predictions = predictions[predictions["score"] >= confidence_threshold]
+
+    print(
+        f"✅ DeepForest detected {len(predictions)} trees (conf >= {confidence_threshold})"
+    )
+
+    # Extract bounding boxes and scores
+    bboxes = predictions[["xmin", "ymin", "xmax", "ymax"]].values.tolist()
+    scores = predictions["score"].values.tolist()
+
+    return bboxes, scores
+
+
+def segment_trees_with_sam(image, bboxes, sam_predictor):
+    """
+    Stage 2: Use SAM to segment trees within each bounding box.
+
+    Args:
+        image: RGB image as (H, W, 3) numpy array
+        bboxes: List of bounding boxes as [xmin, ymin, xmax, ymax]
+        sam_predictor: Initialized SAM predictor
+
+    Returns:
+        masks: List of binary masks for each detection
+        bbox_list: Corresponding bounding boxes
+    """
+    print("\n🎯 Stage 2: Running SAM segmentation on detected trees...")
+
+    # Set image for SAM predictor
+    sam_predictor.set_image(image)
+
+    all_masks = []
+    valid_bboxes = []
+
+    for i, bbox in enumerate(tqdm(bboxes, desc="Segmenting trees")):
+        try:
+            # Convert bbox to SAM format [x, y, x2, y2]
+            bbox_array = np.array(bbox)
+
+            # Predict mask using bounding box prompt
+            masks, scores, logits = sam_predictor.predict(
+                point_coords=None,
+                point_labels=None,
+                box=bbox_array[None, :],  # SAM expects (1, 4) shape
+                multimask_output=False,  # Single mask per box
+            )
+
+            # Take the first (and only) mask
+            mask = masks[0]
+            all_masks.append(mask)
+            valid_bboxes.append(bbox)
+
+        except Exception as e:
+            print(f"⚠️  Failed to segment tree {i}: {e}")
+            continue
+
+    print(f"✅ Successfully segmented {len(all_masks)} trees with SAM")
+
+    return all_masks, valid_bboxes
+
+
+def mask_to_polygon(mask, simplify_tolerance=1.0):
+    """
+    Convert binary mask to polygon coordinates.
+
+    Args:
+        mask: Binary mask (H, W)
+        simplify_tolerance: Tolerance for polygon simplification
+
+    Returns:
+        Polygon coordinates or None if conversion fails
+    """
+    mask_uint8 = mask.astype(np.uint8) * 255
+    contours, _ = cv2.findContours(
+        mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+
+    if not contours:
+        return None
+
+    # Use the largest contour
+    largest_contour = max(contours, key=cv2.contourArea)
+
+    # Check minimum area
+    area = cv2.contourArea(largest_contour)
+    if area < 50:  # Minimum 50 pixels
+        return None
+
+    # Convert contour to polygon
+    if len(largest_contour) < 3:
+        return None
+
+    # Reshape contour to polygon coordinates
+    coords = largest_contour.reshape(-1, 2).tolist()
+
+    # Close the polygon
+    if coords[0] != coords[-1]:
+        coords.append(coords[0])
+
+    # Create Shapely polygon and simplify
+    poly = Polygon(coords)
+    if simplify_tolerance > 0:
+        poly = poly.simplify(simplify_tolerance, preserve_topology=True)
+
+    return poly
+
+
+def save_results(masks, bboxes, deepforest_scores, output_dir, tif_stem, crs=None):
+    """
+    Save segmentation results as GeoJSON and visualization.
+
+    Args:
+        masks: List of binary masks
+        bboxes: List of bounding boxes
+        deepforest_scores: DeepForest confidence scores
+        output_dir: Output directory path
+        tif_stem: Stem name of input TIF file
+        crs: Coordinate reference system
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Convert masks to GeoJSON features
+    features = []
+
+    for i, (mask, bbox, score) in enumerate(zip(masks, bboxes, deepforest_scores)):
+        polygon = mask_to_polygon(mask)
+
+        if polygon is None:
+            continue
+
+        # Create feature
+        feature = {
+            "type": "Feature",
+            "id": i,
+            "properties": {
+                "tree_id": i,
+                "deepforest_score": float(score),
+                "area_pixels": float(polygon.area),
+                "bbox": bbox,
+            },
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": [list(polygon.exterior.coords)],
+            },
+        }
+
+        features.append(feature)
+
+    # Create GeoJSON FeatureCollection
+    geojson = {
+        "type": "FeatureCollection",
+        "features": features,
+        "crs": {
+            "type": "name",
+            "properties": {"name": str(crs) if crs else "EPSG:4326"},
+        },
+    }
+
+    # Save GeoJSON
+    output_geojson_path = output_dir / f"{tif_stem}_deepforest_sam.geojson"
+    print(f"\n💾 Saving GeoJSON to {output_geojson_path}...")
+    with open(output_geojson_path, "w") as f:
+        json.dump(geojson, f, indent=2)
+
+    print(f"✅ Saved {len(features)} tree segmentations")
+
+    return output_geojson_path, features
+
+
+def create_visualization(image, masks, bboxes, output_dir, tif_stem):
+    """
+    Create visualization showing both bounding boxes and segmentation masks.
+
+    Args:
+        image: RGB image
+        masks: List of binary masks
+        bboxes: List of bounding boxes
+        output_dir: Output directory
+        tif_stem: Stem name of input TIF file
+    """
+    print("\n🎨 Creating visualization...")
+
+    vis_image = image.copy()
+
+    # Draw each detection
+    for i, (mask, bbox) in enumerate(zip(masks, bboxes)):
+        # Generate random color for this tree
+        color = tuple(np.random.randint(50, 255, 3).tolist())
+
+        # Draw bounding box (from DeepForest)
+        xmin, ymin, xmax, ymax = [int(c) for c in bbox]
+        cv2.rectangle(vis_image, (xmin, ymin), (xmax, ymax), color, 2)
+
+        # Draw segmentation mask (from SAM)
+        # Create colored overlay
+        overlay = vis_image.copy()
+        mask_colored = np.zeros_like(vis_image)
+        mask_colored[mask] = color
+
+        # Blend mask with image
+        alpha = 0.4
+        vis_image = cv2.addWeighted(vis_image, 1, mask_colored, alpha, 0)
+
+        # Draw mask contour
+        mask_uint8 = mask.astype(np.uint8) * 255
+        contours, _ = cv2.findContours(
+            mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        cv2.drawContours(vis_image, contours, -1, color, 2)
+
+    # Save visualization
+    vis_output_path = output_dir / f"{tif_stem}_deepforest_sam_visualization.png"
+    cv2.imwrite(str(vis_output_path), cv2.cvtColor(vis_image, cv2.COLOR_RGB2BGR))
+
+    print(f"✅ Saved visualization to {vis_output_path}")
+
+    return vis_output_path
+
+
+def main(args):
+    """
+    Main pipeline execution.
+    """
+    tif_path = Path(args.image_path)
+
+    if not tif_path.exists():
+        raise FileNotFoundError(f"❌ Image not found: {tif_path}")
+
+    print(f"\n{'=' * 60}")
+    print(f"🚀 Two-Stage Tree Detection: DeepForest + SAM")
+    print(f"{'=' * 60}")
+    print(f"Input: {tif_path}")
+    print(f"Output: {args.output_dir}")
+    print(f"{'=' * 60}\n")
+
+    # Load image
+    print("📁 Loading image...")
+    image, crs, transform, bounds = load_image_from_tif(tif_path)
+
+    # Stage 1: DeepForest detection
+    bboxes, deepforest_scores = detect_trees_with_deepforest(
+        image,
+        confidence_threshold=args.deepforest_confidence,
+        model_path=args.deepforest_model,
+    )
+
+    if len(bboxes) == 0:
+        print("\n❌ No trees detected. Exiting.")
+        return
+
+    # Initialize SAM
+    print(f"\n🔧 Loading SAM model from {args.sam_checkpoint}...")
+    if not Path(args.sam_checkpoint).exists():
+        raise FileNotFoundError(
+            f"❌ SAM checkpoint not found: {args.sam_checkpoint}\n"
+            f"Download it from: https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth"
+        )
+
+    sam = sam_model_registry[args.sam_model](checkpoint=args.sam_checkpoint)
+
+    # Auto-detect device
+    if args.device == "auto":
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif torch.backends.mps.is_available():
+            device = "mps"
+        else:
+            device = "cpu"
+    else:
+        device = args.device
+
+    print(f"🖥️  Using device: {device}")
+    sam.to(device=device)
+    sam_predictor = SamPredictor(sam)
+
+    # Stage 2: SAM segmentation
+    masks, valid_bboxes = segment_trees_with_sam(image, bboxes, sam_predictor)
+
+    if len(masks) == 0:
+        print("\n❌ No trees successfully segmented. Exiting.")
+        return
+
+    # Filter scores to match valid bboxes
+    valid_scores = [deepforest_scores[i] for i in range(len(bboxes)) if i < len(masks)]
+
+    # Save results
+    output_geojson_path, features = save_results(
+        masks, valid_bboxes, valid_scores, args.output_dir, tif_path.stem, crs
+    )
+
+    # Create visualization
+    vis_path = create_visualization(
+        image, masks, valid_bboxes, Path(args.output_dir), tif_path.stem
+    )
+
+    # Print summary
+    print(f"\n{'=' * 60}")
+    print(f"✅ Pipeline Complete!")
+    print(f"{'=' * 60}")
+    print(f"Trees detected (DeepForest): {len(bboxes)}")
+    print(f"Trees segmented (SAM):       {len(masks)}")
+    print(f"Valid features saved:        {len(features)}")
+    print(f"\nOutputs:")
+    print(f"  📄 GeoJSON:      {output_geojson_path}")
+    print(f"  🖼️  Visualization: {vis_path}")
+    print(f"{'=' * 60}\n")
+
+
+def parse_args():
+    """Parse command line arguments."""
+    ap = argparse.ArgumentParser(
+        description="Two-Stage Tree Detection: DeepForest + SAM",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+
+    ap.add_argument(
+        "--image_path",
+        type=str,
+        required=True,
+        help="Path to input TIF file",
+    )
+
+    ap.add_argument(
+        "--output_dir",
+        type=str,
+        default="foxtrot_output",
+        help="Output directory for results (default: foxtrot_output)",
+    )
+
+    ap.add_argument(
+        "--sam_checkpoint",
+        type=str,
+        default="sam_vit_b_01ec64.pth",
+        help="Path to SAM checkpoint (default: sam_vit_b_01ec64.pth)",
+    )
+
+    ap.add_argument(
+        "--sam_model",
+        type=str,
+        default="vit_b",
+        choices=["vit_b", "vit_l", "vit_h"],
+        help="SAM model type (default: vit_b)",
+    )
+
+    ap.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        choices=["auto", "cuda", "cpu", "mps"],
+        help="Device to run inference on (default: auto)",
+    )
+
+    ap.add_argument(
+        "--deepforest_confidence",
+        type=float,
+        default=0.3,
+        help="Minimum confidence threshold for DeepForest detections (default: 0.3)",
+    )
+
+    return ap.parse_args()
+
+
+if __name__ == "__main__":
+    os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+    args = parse_args()
+    main(args)

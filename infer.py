@@ -49,8 +49,8 @@ mp.set_start_method("spawn", force=True)
 
 # Key Hyperparameters
 
-filter_threshold = 0.65
-nms_dedupe_threshold = 0.18
+filter_threshold = 0.18
+nms_dedupe_threshold = 0.3
 
 
 # --------------------------------------------------
@@ -106,7 +106,7 @@ def main():
     # Model path
     if args.weights == "finetuned":
         model_path = Path(
-            "model_delta17.pth"
+            "model_echo29.pth"
             # "data/tcd/train_outputs/model_bravo2.pth"
         )  # alpha5 is the latest model from Modal HPC
     else:

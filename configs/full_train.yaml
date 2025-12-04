@@ -77,6 +77,7 @@ DATALOADER:
 #  TRAIN / TEST
 # ------------------------------------------------------------
 TEST:
+  DETECTIONS_PER_IMAGE: 300   # Max detections per image (default: 100)
   EVAL_PERIOD: 250            # More frequent eval for better early stopping
 
 OUTPUT_DIR: "output_full"

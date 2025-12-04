@@ -40,7 +40,7 @@ image = (
     .pip_install(
         "torch==2.3.0",
         "torchvision==0.18.0",
-        "pytorch-lightning==1.9.5",  # Compatible with deepforest 1.3.x
+        "pytorch-lightning>=2.1.0,<3.0.0",  # Updated for DeepForest 2.0.0 compatibility
         "rasterio",
         "geopandas",
         "shapely",
@@ -49,9 +49,9 @@ image = (
         "numpy",
         "pillow",
         "pycocotools",
-        "albumentations==1.3.1",  # Pinned - newer versions removed functional module
+        "albumentations>=2.0.0",  # Updated for DeepForest 2.0.0 compatibility
         "wandb",
-        "deepforest==1.3.1",  # Pinned version compatible with PL 1.9.5
+        "deepforest==2.0.0",  # Upgraded to match local env and get load_model() API
     )
     .add_local_dir(
         "..",  # Parent directory (canopyAI)
@@ -94,6 +94,7 @@ def train_deepforest_modal(
     patience=5,
     wandb_project=None,
     run_name=None,
+    dataset="tcd",
 ):
     """Train DeepForest on Modal with TCD data."""
 
@@ -112,25 +113,68 @@ def train_deepforest_modal(
     print(f"   Batch size: {batch_size}")
     print(f"   Learning rate: {lr}")
 
-    # Extract TCD images if they exist in the volume
-    tcd_archive = "/data/tcd_images.tar.gz"
-    if os.path.exists(tcd_archive):
-        print("\n📦 Extracting TCD images from volume...")
-        os.makedirs("/data/images", exist_ok=True)
-        with tarfile.open(tcd_archive, "r:gz") as tar:
-            tar.extractall("/data/images")
-        print("   ✅ Images extracted to /data/images/")
+    # Extract image tarballs from volume if they exist
+    image_archives = [
+        "/data/tcd_images.tar.gz",
+        "/data/won_images.tar.gz",
+    ]
 
-    # Training and validation CSVs should be in data volume
-    train_csv = "/data/annotations_train.csv"
-    val_csv = "/data/annotations_val.csv"
+    print("\n📦 Extracting images from volume...")
+    os.makedirs("/data/images", exist_ok=True)
 
-    # Check files exist
+    for archive in image_archives:
+        if os.path.exists(archive):
+            dataset_name = os.path.basename(archive).replace("_images.tar.gz", "")
+            print(f"   Extracting {dataset_name}...")
+            with tarfile.open(archive, "r:gz") as tar:
+                tar.extractall("/data/images")
+            print(f"   ✅ {dataset_name} extracted")
+        else:
+            print(f"   ⚠️  {os.path.basename(archive)} not found, skipping")
+
+    print("   All available images extracted to /data/images/")
+
+    # Select dataset based on flag
+    print(f"\n📊 Dataset: {dataset}")
+
+    if dataset == "tcd":
+        train_csv = "/data/tcd_train.csv"
+        val_csv = "/data/tcd_val.csv"
+    elif dataset == "won":
+        train_csv = "/data/won_train.csv"
+        val_csv = "/data/won_val.csv"
+    elif dataset == "both":
+        # Combine TCD and WON datasets
+        print("   Combining TCD and WON datasets...")
+        import pandas as pd
+
+        tcd_train = pd.read_csv("/data/tcd_train.csv")
+        won_train = pd.read_csv("/data/won_train.csv")
+        combined_train = pd.concat([tcd_train, won_train], ignore_index=True)
+        train_csv = "/tmp/combined_train.csv"
+        combined_train.to_csv(train_csv, index=False)
+
+        tcd_val = pd.read_csv("/data/tcd_val.csv")
+        won_val = pd.read_csv("/data/won_val.csv")
+        combined_val = pd.concat([tcd_val, won_val], ignore_index=True)
+        val_csv = "/tmp/combined_val.csv"
+        combined_val.to_csv(val_csv, index=False)
+
+        print(f"   ✅ Combined: {len(combined_train)} train + {len(combined_val)} val")
+    else:
+        raise ValueError(f"Invalid dataset: {dataset}. Must be 'tcd', 'won', or 'both'")
+
+    # Check if CSVs exist
     if not os.path.exists(train_csv):
         raise FileNotFoundError(
             f"Training CSV not found: {train_csv}\n"
-            "Upload with: modal volume put canopyai-deepforest-data annotations_train.csv /annotations_train.csv"
+            f"Upload with: modal volume put canopyai-deepforest-data <local-file> {train_csv}"
         )
+
+    if not os.path.exists(val_csv):
+        print(f"   ⚠️  Validation CSV not found: {val_csv}")
+        print("   Training without validation")
+        val_csv = None
 
     # Fix image paths in CSVs to point to extracted images
     print("\n🔧 Fixing image paths in CSVs...")
@@ -183,8 +227,14 @@ def main(
     patience: int = 5,
     wandb_project: str = None,
     run_name: str = None,
+    dataset: str = "tcd",
 ):
-    """Launch DeepForest training on Modal."""
+    """
+    Launch DeepForest training on Modal.
+
+    Args:
+        dataset: Which dataset to train on ('tcd', 'won', or 'both')
+    """
 
     print("☁️  Submitting DeepForest training job to Modal...")
 
@@ -195,12 +245,16 @@ def main(
         patience=patience,
         wandb_project=wandb_project,
         run_name=run_name,
+        dataset=dataset,
     )
 
     if results:
         print("\n📊 Final validation results:")
         for k, v in results.items():
-            print(f"   {k}: {v:.4f}")
+            if isinstance(v, (int, float)):
+                print(f"   {k}: {v:.4f}")
+            else:
+                print(f"   {k}: {v}")
 
 
 @app.function(volumes={"/checkpoints": checkpoint_volume})
