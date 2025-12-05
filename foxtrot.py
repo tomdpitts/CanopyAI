@@ -17,6 +17,9 @@ Author: CanopyAI
 import argparse
 import os
 import json
+import tempfile
+import gc
+import shutil
 import numpy as np
 import rasterio
 from pathlib import Path
@@ -205,52 +208,128 @@ def detect_trees_with_deepforest(image, confidence_threshold=0.3, model_path=Non
     return bboxes, scores
 
 
-def segment_trees_with_sam(image, bboxes, sam_predictor):
+def segment_trees_with_sam(
+    image, bboxes, sam_predictor, batch_size=500, cache_dir=None
+):
     """
     Stage 2: Use SAM to segment trees within each bounding box.
+    Uses batch processing with disk caching to avoid OOM errors.
 
     Args:
         image: RGB image as (H, W, 3) numpy array
         bboxes: List of bounding boxes as [xmin, ymin, xmax, ymax]
         sam_predictor: Initialized SAM predictor
+        batch_size: Number of trees to process per batch before flushing to disk
+        cache_dir: Directory for caching masks (temp dir if None)
 
     Returns:
-        masks: List of binary masks for each detection
-        bbox_list: Corresponding bounding boxes
+        cache_files: List of paths to cached mask files
+        valid_bboxes: Corresponding bounding boxes
     """
     print("\n🎯 Stage 2: Running SAM segmentation on detected trees...")
+    print(f"   Using batch size: {batch_size}")
+
+    # Create cache directory
+    if cache_dir is None:
+        cache_dir = tempfile.mkdtemp(prefix="foxtrot_cache_")
+        print(f"   Created temp cache: {cache_dir}")
+    else:
+        cache_dir = Path(cache_dir)
+        cache_dir.mkdir(exist_ok=True, parents=True)
+        print(f"   Using cache: {cache_dir}")
+
+    cache_dir = Path(cache_dir)
 
     # Set image for SAM predictor
     sam_predictor.set_image(image)
 
-    all_masks = []
+    cache_files = []
     valid_bboxes = []
 
-    for i, bbox in enumerate(tqdm(bboxes, desc="Segmenting trees")):
-        try:
-            # Convert bbox to SAM format [x, y, x2, y2]
-            bbox_array = np.array(bbox)
+    # Process in batches
+    num_batches = (len(bboxes) + batch_size - 1) // batch_size
+    print(f"   Processing {len(bboxes)} trees in {num_batches} batches\n")
 
-            # Predict mask using bounding box prompt
-            masks, scores, logits = sam_predictor.predict(
-                point_coords=None,
-                point_labels=None,
-                box=bbox_array[None, :],  # SAM expects (1, 4) shape
-                multimask_output=False,  # Single mask per box
-            )
+    for batch_idx in range(num_batches):
+        start_idx = batch_idx * batch_size
+        end_idx = min((batch_idx + 1) * batch_size, len(bboxes))
+        batch_bboxes = bboxes[start_idx:end_idx]
 
-            # Take the first (and only) mask
-            mask = masks[0]
-            all_masks.append(mask)
-            valid_bboxes.append(bbox)
+        print(
+            f"📦 Batch {batch_idx + 1}/{num_batches}: Processing trees {start_idx}-{end_idx - 1}"
+        )
 
-        except Exception as e:
-            print(f"⚠️  Failed to segment tree {i}: {e}")
-            continue
+        batch_masks = []
+        batch_valid_bboxes = []
 
-    print(f"✅ Successfully segmented {len(all_masks)} trees with SAM")
+        # Process this batch
+        for bbox in tqdm(batch_bboxes, desc=f"  Segmenting", leave=False):
+            try:
+                # Convert bbox to SAM format [x, y, x2, y2]
+                bbox_array = np.array(bbox)
 
-    return all_masks, valid_bboxes
+                # Predict mask using bounding box prompt
+                masks, scores, logits = sam_predictor.predict(
+                    point_coords=None,
+                    point_labels=None,
+                    box=bbox_array[None, :],  # SAM expects (1, 4) shape
+                    multimask_output=False,  # Single mask per box
+                )
+
+                # Take the first (and only) mask
+                mask = masks[0]
+                batch_masks.append(mask)
+                batch_valid_bboxes.append(bbox)
+
+            except Exception as e:
+                print(f"⚠️  Failed to segment tree: {e}")
+                continue
+
+        # Save batch to disk using numpy compression (~95% size reduction)
+        batch_file = cache_dir / f"batch_{batch_idx:04d}.npz"
+        np.savez_compressed(
+            batch_file,
+            masks=np.array(batch_masks, dtype=bool),
+            bboxes=np.array(batch_valid_bboxes, dtype=np.float32),
+        )
+
+        cache_files.append(batch_file)
+        valid_bboxes.extend(batch_valid_bboxes)
+
+        # Report file size
+        file_size_mb = batch_file.stat().st_size / (1024**2)
+        print(
+            f"   ✓ Saved {len(batch_masks)} masks to {batch_file.name} ({file_size_mb:.1f}MB)"
+        )
+
+        # Clear batch from memory
+        del batch_masks
+        del batch_valid_bboxes
+        gc.collect()
+
+    print(f"\n✅ Successfully segmented {len(valid_bboxes)} trees with SAM")
+    print(f"   Cached in {len(cache_files)} batch files")
+
+    return cache_files, valid_bboxes
+
+
+def load_masks_from_cache(cache_files):
+    """
+    Generator to load masks from cache files one at a time.
+    Reduces memory footprint by loading masks on-demand.
+
+    Args:
+        cache_files: List of cache file paths
+
+    Yields:
+        mask: Binary mask array
+    """
+    for cache_file in cache_files:
+        # Load compressed numpy arrays
+        with np.load(cache_file) as data:
+            masks = data["masks"]
+            for mask in masks:
+                yield mask
 
 
 def mask_to_polygon(mask, simplify_tolerance=1.0):
@@ -299,12 +378,15 @@ def mask_to_polygon(mask, simplify_tolerance=1.0):
     return poly
 
 
-def save_results(masks, bboxes, deepforest_scores, output_dir, tif_stem, crs=None):
+def save_results(
+    cache_files, bboxes, deepforest_scores, output_dir, tif_stem, crs=None
+):
     """
     Save segmentation results as GeoJSON and visualization.
+    Loads masks from cache to minimize memory usage.
 
     Args:
-        masks: List of binary masks
+        cache_files: List of cache file paths containing masks
         bboxes: List of bounding boxes
         deepforest_scores: DeepForest confidence scores
         output_dir: Output directory path
@@ -317,7 +399,11 @@ def save_results(masks, bboxes, deepforest_scores, output_dir, tif_stem, crs=Non
     # Convert masks to GeoJSON features
     features = []
 
-    for i, (mask, bbox, score) in enumerate(zip(masks, bboxes, deepforest_scores)):
+    # Load masks one at a time from cache
+    mask_generator = load_masks_from_cache(cache_files)
+
+    for i, (bbox, score) in enumerate(zip(bboxes, deepforest_scores)):
+        mask = next(mask_generator)
         polygon = mask_to_polygon(mask)
 
         if polygon is None:
@@ -362,13 +448,14 @@ def save_results(masks, bboxes, deepforest_scores, output_dir, tif_stem, crs=Non
     return output_geojson_path, features
 
 
-def create_visualization(image, masks, bboxes, output_dir, tif_stem):
+def create_visualization(image, cache_files, bboxes, output_dir, tif_stem):
     """
     Create visualization showing both bounding boxes and segmentation masks.
+    Loads masks from cache to minimize memory usage.
 
     Args:
         image: RGB image
-        masks: List of binary masks
+        cache_files: List of cache file paths containing masks
         bboxes: List of bounding boxes
         output_dir: Output directory
         tif_stem: Stem name of input TIF file
@@ -377,8 +464,13 @@ def create_visualization(image, masks, bboxes, output_dir, tif_stem):
 
     vis_image = image.copy()
 
+    # Load masks one at a time from cache
+    mask_generator = load_masks_from_cache(cache_files)
+
     # Draw each detection
-    for i, (mask, bbox) in enumerate(zip(masks, bboxes)):
+    for i, bbox in enumerate(bboxes):
+        mask = next(mask_generator)
+
         # Generate random color for this tree
         color = tuple(np.random.randint(50, 255, 3).tolist())
 
@@ -387,8 +479,7 @@ def create_visualization(image, masks, bboxes, output_dir, tif_stem):
         cv2.rectangle(vis_image, (xmin, ymin), (xmax, ymax), color, 1)
 
         # Draw segmentation mask (from SAM)
-        # Create colored overlay
-        overlay = vis_image.copy()
+        # Create colored mask overlay
         mask_colored = np.zeros_like(vis_image)
         mask_colored[mask] = color
 
@@ -422,10 +513,11 @@ def main(args):
         raise FileNotFoundError(f"❌ Image not found: {tif_path}")
 
     print(f"\n{'=' * 60}")
-    print(f"🚀 Two-Stage Tree Detection: DeepForest + SAM")
+    print("🚀 Two-Stage Tree Detection: DeepForest + SAM")
     print(f"{'=' * 60}")
     print(f"Input: {tif_path}")
     print(f"Output: {args.output_dir}")
+    print(f"Batch size: {args.batch_size}")
     print(f"{'=' * 60}\n")
 
     # Load image
@@ -448,7 +540,7 @@ def main(args):
     if not Path(args.sam_checkpoint).exists():
         raise FileNotFoundError(
             f"❌ SAM checkpoint not found: {args.sam_checkpoint}\n"
-            f"Download it from: https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth"
+            "Download: https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth"  # noqa: E501
         )
 
     sam = sam_model_registry[args.sam_model](checkpoint=args.sam_checkpoint)
@@ -457,8 +549,8 @@ def main(args):
     if args.device == "auto":
         if torch.cuda.is_available():
             device = "cuda"
-        # elif torch.backends.mps.is_available():
-        #     device = "mps"
+        elif torch.backends.mps.is_available():
+            device = "mps"
         else:
             device = "cpu"
     else:
@@ -468,34 +560,46 @@ def main(args):
     sam.to(device=device)
     sam_predictor = SamPredictor(sam)
 
-    # Stage 2: SAM segmentation
-    masks, valid_bboxes = segment_trees_with_sam(image, bboxes, sam_predictor)
+    # Stage 2: SAM segmentation with batch processing
+    cache_files, valid_bboxes = segment_trees_with_sam(
+        image,
+        bboxes,
+        sam_predictor,
+        batch_size=args.batch_size,
+        cache_dir=args.cache_dir,
+    )
 
-    if len(masks) == 0:
+    if len(valid_bboxes) == 0:
         print("\n❌ No trees successfully segmented. Exiting.")
         return
 
     # Filter scores to match valid bboxes
-    valid_scores = [deepforest_scores[i] for i in range(len(bboxes)) if i < len(masks)]
+    valid_scores = deepforest_scores[: len(valid_bboxes)]
 
-    # Save results
+    # Save results (loads masks from cache)
     output_geojson_path, features = save_results(
-        masks, valid_bboxes, valid_scores, args.output_dir, tif_path.stem, crs
+        cache_files, valid_bboxes, valid_scores, args.output_dir, tif_path.stem, crs
     )
 
-    # Create visualization
+    # Create visualization (loads masks from cache)
     vis_path = create_visualization(
-        image, masks, valid_bboxes, Path(args.output_dir), tif_path.stem
+        image, cache_files, valid_bboxes, Path(args.output_dir), tif_path.stem
     )
+
+    # Cleanup cache if using temp directory
+    if args.cache_dir is None and cache_files:
+        cache_dir = cache_files[0].parent
+        print(f"\n🧹 Cleaning up temp cache: {cache_dir}")
+        shutil.rmtree(cache_dir, ignore_errors=True)
 
     # Print summary
     print(f"\n{'=' * 60}")
-    print(f"✅ Pipeline Complete!")
+    print("✅ Pipeline Complete!")
     print(f"{'=' * 60}")
     print(f"Trees detected (DeepForest): {len(bboxes)}")
-    print(f"Trees segmented (SAM):       {len(masks)}")
+    print(f"Trees segmented (SAM):       {len(valid_bboxes)}")
     print(f"Valid features saved:        {len(features)}")
-    print(f"\nOutputs:")
+    print("\nOutputs:")
     print(f"  📄 GeoJSON:      {output_geojson_path}")
     print(f"  🖼️  Visualization: {vis_path}")
     print(f"{'=' * 60}\n")
@@ -556,7 +660,24 @@ def parse_args():
         "--deepforest_model",
         type=str,
         default=None,
-        help="Path to custom DeepForest model (.pth file). If not provided, uses default pretrained model",
+        help="Path to custom DeepForest model (.pth file). "
+        "If not provided, uses default pretrained model",
+    )
+
+    ap.add_argument(
+        "--batch_size",
+        type=int,
+        default=500,
+        help="Number of trees to process per batch (default: 500). "
+        "Lower values use less memory but may be slower",
+    )
+
+    ap.add_argument(
+        "--cache_dir",
+        type=str,
+        default=None,
+        help="Directory for caching masks. "
+        "If not provided, uses a temporary directory that is cleaned up after",
     )
 
     return ap.parse_args()
