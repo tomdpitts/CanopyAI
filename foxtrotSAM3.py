@@ -100,7 +100,6 @@ def main():
         print(f"📦 Reading custom model: {model_path}")
         model_bytes = model_path.read_bytes()
 
-    # Connect to Modal and run pipeline
     print("\n☁️  Connecting to Modal...")
     try:
         run_pipeline = modal.Function.from_name(
@@ -112,12 +111,15 @@ def main():
         return
 
     print("🔄 Running pipeline on Modal GPU (this may take a few minutes)...")
-    result = run_pipeline.remote(
-        image_bytes=image_bytes,
-        text_prompt=args.text_prompt,
-        deepforest_model_bytes=model_bytes,
-        deepforest_confidence=args.deepforest_confidence,
-    )
+
+    # Enable log streaming from Modal
+    with modal.enable_output():
+        result = run_pipeline.remote(
+            image_bytes=image_bytes,
+            text_prompt=args.text_prompt,
+            deepforest_model_bytes=model_bytes,
+            deepforest_confidence=args.deepforest_confidence,
+        )
 
     # Save results locally
     output_dir.mkdir(parents=True, exist_ok=True)

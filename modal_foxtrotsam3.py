@@ -105,9 +105,10 @@ def mask_to_polygon(mask, simplify_tolerance=1.0):
 
 @app.function(
     image=sam3_image,
-    gpu="A10G",
+    gpu="A10G",  # Batch processing + disk caching avoids OOM
     timeout=3600,
     memory=32768,
+    secrets=[modal.Secret.from_name("huggingface")],
 )
 def run_pipeline(
     image_bytes: bytes,
@@ -135,18 +136,17 @@ def run_pipeline(
     import torch
     import rasterio
     from pathlib import Path
-    from PIL import Image
+    import os
     from deepforest import main as deepforest_main
     from sam3.model_builder import build_sam3_image_model
-    from sam3.model.sam3_image_processor import Sam3Processor
 
-    print("🚀 Starting SAM3 pipeline on Modal GPU")
-    print(f"   Text prompt: {text_prompt or '(none - bbox only)'}")
+    print("🚀 Starting SAM3 pipeline on Modal GPU", flush=True)
+    print(f"   Text prompt: {text_prompt or '(none - bbox only)'}", flush=True)
 
     # =========================================================================
     # 1. Load image from bytes
     # =========================================================================
-    print("\n📁 Loading image...")
+    print("\n📁 Loading image...", flush=True)
     with tempfile.NamedTemporaryFile(suffix=".tif", delete=False) as f:
         f.write(image_bytes)
         tif_path = f.name
@@ -163,12 +163,12 @@ def run_pipeline(
         else:
             image = image.astype(np.uint8)
 
-    print(f"   ✅ Image shape: {image.shape}, dtype: {image.dtype}")
+    print(f"   ✅ Image shape: {image.shape}, dtype: {image.dtype}", flush=True)
 
     # =========================================================================
-    # 2. DeepForest detection
+    # 2. DeepForest detection (same patch-based approach as foxtrot.py)
     # =========================================================================
-    print("\n🌲 Running DeepForest detection...")
+    print("\n🌲 Running DeepForest detection...", flush=True)
     model = deepforest_main.deepforest()
 
     if deepforest_model_bytes:
@@ -177,125 +177,221 @@ def run_pipeline(
             f.write(deepforest_model_bytes)
             model_path = f.name
         model.model.load_state_dict(torch.load(model_path, map_location="cpu"))
-        print("   Using custom model")
+        print("   Using custom model", flush=True)
     else:
         model.load_model("weecology/deepforest-tree")
-        print("   Using pretrained model")
+        print("   Using pretrained model", flush=True)
 
-    # Predict - DeepForest 2.0 expects uint8 for predict_tile, float32 for predict_image
-    if image.shape[0] > 2000 or image.shape[1] > 2000:
-        print("   Large image, using patch-based prediction...")
-        predictions = model.predict_tile(
-            image=image,  # uint8 for predict_tile
-            patch_size=400,
-            patch_overlap=0.05,
-        )
-    else:
-        predictions = model.predict_image(image=image.astype("float32"))
+    # Move model to GPU for predict_tile
+    if torch.cuda.is_available():
+        model.to("cuda")
+        print("   Model moved to CUDA", flush=True)
+
+    # Use predict_tile with GPU batch strategy instead of manual patch loop
+    # dataloader_strategy='batch' loads entire image into GPU for parallel patch processing
+    print("   Running predict_tile with GPU batch strategy...", flush=True)
+
+    import warnings
+
+    warnings.filterwarnings("ignore", message=".*image_path.*")
+    warnings.filterwarnings("ignore", message=".*root_dir.*")
+
+    # Save image to temp file for predict_tile (it needs a path)
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+        import cv2
+
+        cv2.imwrite(f.name, cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
+        temp_image_path = f.name
+
+    predictions = model.predict_tile(
+        path=temp_image_path,
+        patch_size=400,
+        patch_overlap=0.05,
+        dataloader_strategy="batch",  # GPU batch processing
+    )
+
+    # Clean up temp file
+    os.unlink(temp_image_path)
+    warnings.filterwarnings("default")
 
     if predictions is None or len(predictions) == 0:
-        print("   ⚠️ No trees detected")
+        print("   ⚠️ No trees detected", flush=True)
         return {
             "geojson": json.dumps({"type": "FeatureCollection", "features": []}),
             "visualization": b"",
-            "stats": {"detected": 0, "segmented": 0},
+            "stats": {"detected": 0, "segmented": 0, "features": 0},
         }
+
+    print(f"   Raw predictions: {len(predictions)}", flush=True)
+    print(
+        f"   Score range: [{predictions['score'].min():.3f}, {predictions['score'].max():.3f}]",
+        flush=True,
+    )
 
     # Filter by confidence
     predictions = predictions[predictions["score"] >= deepforest_confidence]
     bboxes = predictions[["xmin", "ymin", "xmax", "ymax"]].values.tolist()
     scores = predictions["score"].values.tolist()
 
-    print(f"   ✅ Detected {len(bboxes)} trees")
+    print(
+        f"   ✅ Detected {len(bboxes)} trees (conf >= {deepforest_confidence})",
+        flush=True,
+    )
 
     # =========================================================================
-    # 3. SAM3 segmentation
+    # 3. SAM3 segmentation with batch processing (using SAM1-like API)
     # =========================================================================
-    print("\n🎯 Running SAM3 segmentation...")
+    print("\n🎯 Running SAM3 segmentation...", flush=True)
 
-    # Load SAM3 model
-    sam3_model = build_sam3_image_model()
-    processor = Sam3Processor(sam3_model)
+    # Load SAM3 model with interactive predictor enabled (SAM1-like box prompting)
+    sam3_model = build_sam3_image_model(enable_inst_interactivity=True)
 
-    # Convert numpy to PIL for SAM3
-    pil_image = Image.fromarray(image)
-    inference_state = processor.set_image(pil_image)
+    # Access the interactive predictor (SAM1-like API)
+    predictor = sam3_model.inst_interactive_predictor
+    if predictor is None:
+        raise RuntimeError("SAM3 inst_interactive_predictor not available")
 
-    all_masks = []
+    img_h, img_w = image.shape[:2]
+
+    # Set image ONCE (expensive backbone forward pass)
+    print("   Loading image into SAM3 backbone...", flush=True)
+    predictor.set_image(image)  # numpy array in HWC format
+    print("   Image loaded, starting segmentation...", flush=True)
+
+    # Batch processing config
+    import gc
+
+    batch_size = 50  # Smaller batches for SAM3's higher memory usage
+    cache_dir = Path(tempfile.mkdtemp(prefix="sam3_cache_"))
+    print(f"   Created temp cache: {cache_dir}", flush=True)
+
+    cache_files = []
     valid_bboxes = []
     valid_scores = []
 
+    # Process in batches
+    num_batches = (len(bboxes) + batch_size - 1) // batch_size
+    print(f"   Processing {len(bboxes)} trees in {num_batches} batches\n", flush=True)
+
     from tqdm import tqdm
 
-    for i, (bbox, score) in enumerate(tqdm(zip(bboxes, scores), total=len(bboxes))):
-        try:
-            if text_prompt is not None:
-                # Use text prompt
-                output = processor.set_text_prompt(
-                    state=inference_state,
-                    prompt=text_prompt,
+    for batch_idx in range(num_batches):
+        start_idx = batch_idx * batch_size
+        end_idx = min((batch_idx + 1) * batch_size, len(bboxes))
+        batch_bboxes = bboxes[start_idx:end_idx]
+        batch_scores_list = scores[start_idx:end_idx]
+
+        print(
+            f"📦 Batch {batch_idx + 1}/{num_batches}: Processing trees {start_idx}-{end_idx - 1}",
+            flush=True,
+        )
+
+        batch_masks = []
+        batch_valid_bboxes = []
+        batch_valid_scores = []
+
+        for j, (bbox, score) in enumerate(
+            tqdm(
+                zip(batch_bboxes, batch_scores_list),
+                total=len(batch_bboxes),
+                leave=False,
+            )
+        ):
+            try:
+                # Box prompt in XYXY format (same as SAM1)
+                xmin, ymin, xmax, ymax = bbox
+                box_array = np.array([xmin, ymin, xmax, ymax])
+
+                # Predict mask for this specific box (SAM1-like behavior)
+                masks, iou_scores, low_res_masks = predictor.predict(
+                    box=box_array,
+                    multimask_output=False,  # Single mask for unambiguous box
                 )
-                masks = output["masks"]
-                # Find mask that best overlaps with bbox
-                if len(masks) > 0:
-                    # Take the first mask for now (could refine with IoU)
-                    mask = (
-                        masks[0].cpu().numpy() if hasattr(masks[0], "cpu") else masks[0]
-                    )
-                else:
-                    continue
-            else:
-                # Use bbox-only (like SAM1)
-                bbox_array = np.array(bbox)
-                output = processor.set_box_prompt(
-                    state=inference_state,
-                    box=bbox_array,
-                )
-                masks = output["masks"]
-                if len(masks) > 0:
-                    mask = (
-                        masks[0].cpu().numpy() if hasattr(masks[0], "cpu") else masks[0]
-                    )
-                else:
-                    continue
 
-            all_masks.append(mask)
-            valid_bboxes.append(bbox)
-            valid_scores.append(score)
+                # Debug: show first mask info
+                if start_idx + j == 0:
+                    print(f"   DEBUG: masks shape: {masks.shape}", flush=True)
+                    print(f"   DEBUG: iou_scores: {iou_scores}", flush=True)
 
-        except Exception as e:
-            print(f"   ⚠️ Failed to segment tree {i}: {e}")
-            continue
+                # Take the best mask (first one since multimask_output=False)
+                if masks is not None and len(masks) > 0:
+                    mask = masks[0] > 0  # Convert to boolean
 
-    print(f"   ✅ Segmented {len(all_masks)} trees")
+                    batch_masks.append(mask)
+                    batch_valid_bboxes.append(bbox)
+                    batch_valid_scores.append(score)
+
+            except Exception as e:
+                print(f"   ⚠️ Failed tree {start_idx + j}: {e}", flush=True)
+                continue
+
+        # Save batch to disk
+        if batch_masks:
+            batch_file = cache_dir / f"batch_{batch_idx:04d}.npz"
+            np.savez_compressed(
+                batch_file,
+                masks=np.array(batch_masks, dtype=bool),
+                bboxes=np.array(batch_valid_bboxes, dtype=np.float32),
+                scores=np.array(batch_valid_scores, dtype=np.float32),
+            )
+            cache_files.append(batch_file)
+            valid_bboxes.extend(batch_valid_bboxes)
+            valid_scores.extend(batch_valid_scores)
+
+            file_size_mb = batch_file.stat().st_size / (1024**2)
+            print(
+                f"   ✓ Saved {len(batch_masks)} masks to {batch_file.name} ({file_size_mb:.1f}MB)",
+                flush=True,
+            )
+
+        # Clear batch from memory
+        del batch_masks
+        del batch_valid_bboxes
+        del batch_valid_scores
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    print(
+        f"\n✅ Successfully segmented {len(valid_bboxes)} trees with SAM3", flush=True
+    )
+    print(f"   Cached in {len(cache_files)} batch files", flush=True)
 
     # =========================================================================
-    # 4. Create GeoJSON
+    # 4. Create GeoJSON (load masks from cache)
     # =========================================================================
     print("\n📄 Creating GeoJSON...")
     features = []
 
-    for i, (mask, bbox, score) in enumerate(zip(all_masks, valid_bboxes, valid_scores)):
-        polygon = mask_to_polygon(mask)
-        if polygon is None:
-            continue
+    # Load masks from cache files one at a time
+    mask_idx = 0
+    for cache_file in cache_files:
+        with np.load(cache_file) as data:
+            masks = data["masks"]
+            cache_bboxes = data["bboxes"]
+            cache_scores = data["scores"]
+            for mask, bbox, score in zip(masks, cache_bboxes, cache_scores):
+                polygon = mask_to_polygon(mask)
+                if polygon is None:
+                    mask_idx += 1
+                    continue
 
-        feature = {
-            "type": "Feature",
-            "id": i,
-            "properties": {
-                "tree_id": i,
-                "deepforest_score": float(score),
-                "area_pixels": float(polygon.area),
-                "bbox": bbox,
-                "text_prompt": text_prompt,
-            },
-            "geometry": {
-                "type": "Polygon",
-                "coordinates": [list(polygon.exterior.coords)],
-            },
-        }
-        features.append(feature)
+                feature = {
+                    "type": "Feature",
+                    "id": mask_idx,
+                    "properties": {
+                        "tree_id": mask_idx,
+                        "deepforest_score": float(score),
+                        "area_pixels": float(polygon.area),
+                        "bbox": bbox.tolist(),
+                        "text_prompt": text_prompt,
+                    },
+                    "geometry": {
+                        "type": "Polygon",
+                        "coordinates": [list(polygon.exterior.coords)],
+                    },
+                }
+                features.append(feature)
+                mask_idx += 1
 
     geojson = {
         "type": "FeatureCollection",
@@ -304,37 +400,48 @@ def run_pipeline(
     }
 
     # =========================================================================
-    # 5. Create visualization
+    # 5. Create visualization (load masks from cache)
     # =========================================================================
     print("\n🎨 Creating visualization...")
     vis_image = image.copy()
 
-    for i, (mask, bbox) in enumerate(zip(all_masks, valid_bboxes)):
-        color = tuple(np.random.randint(50, 255, 3).tolist())
+    mask_idx = 0
+    for cache_file in cache_files:
+        with np.load(cache_file) as data:
+            masks = data["masks"]
+            cache_bboxes = data["bboxes"]
+            for mask, bbox in zip(masks, cache_bboxes):
+                color = tuple(np.random.randint(50, 255, 3).tolist())
 
-        # Draw bbox
-        xmin, ymin, xmax, ymax = [int(c) for c in bbox]
-        cv2.rectangle(vis_image, (xmin, ymin), (xmax, ymax), color, 1)
+                # Draw bbox
+                xmin, ymin, xmax, ymax = [int(c) for c in bbox]
+                cv2.rectangle(vis_image, (xmin, ymin), (xmax, ymax), color, 1)
 
-        # Draw mask overlay
-        mask_colored = np.zeros_like(vis_image)
-        mask_colored[mask] = color
-        vis_image = cv2.addWeighted(vis_image, 1, mask_colored, 0.1, 0)
+                # Draw mask overlay
+                mask_colored = np.zeros_like(vis_image)
+                mask_colored[mask] = color
+                vis_image = cv2.addWeighted(vis_image, 1, mask_colored, 0.05, 0)
 
-        # Draw contour
-        mask_uint8 = mask.astype(np.uint8) * 255
-        contours, _ = cv2.findContours(
-            mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-        )
-        cv2.drawContours(vis_image, contours, -1, color, 1)
+                # Draw contour
+                mask_uint8 = mask.astype(np.uint8) * 255
+                contours, _ = cv2.findContours(
+                    mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+                )
+                cv2.drawContours(vis_image, contours, -1, color, 1)
+                mask_idx += 1
 
     # Encode as PNG
     vis_bgr = cv2.cvtColor(vis_image, cv2.COLOR_RGB2BGR)
     _, png_bytes = cv2.imencode(".png", vis_bgr)
 
+    # Cleanup cache
+    import shutil
+
+    shutil.rmtree(cache_dir, ignore_errors=True)
+
     print("\n✅ Pipeline complete!")
     print(f"   Trees detected: {len(bboxes)}")
-    print(f"   Trees segmented: {len(all_masks)}")
+    print(f"   Trees segmented: {len(valid_bboxes)}")
     print(f"   Features in GeoJSON: {len(features)}")
 
     return {
@@ -342,7 +449,7 @@ def run_pipeline(
         "visualization": png_bytes.tobytes(),
         "stats": {
             "detected": len(bboxes),
-            "segmented": len(all_masks),
+            "segmented": len(valid_bboxes),
             "features": len(features),
         },
     }
