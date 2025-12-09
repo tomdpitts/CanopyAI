@@ -7,6 +7,8 @@ image_path, xmin, ymin, xmax, ymax, label
 
 Usage:
     python prepare_deepforest_data.py --data_dir data/tcd/raw --output train_annotations.csv
+
+Note: modal_deepforest.py will update file paths in csv to support uploaded data paths.
 """
 
 import argparse
