@@ -65,6 +65,19 @@ def parse_args():
         "If not provided, uses default pretrained model",
     )
 
+    ap.add_argument(
+        "--enhance_contrast",
+        action="store_true",
+        help="Enhance image contrast by 20%% before SAM3 segmentation",
+    )
+
+    ap.add_argument(
+        "--saturation_boost",
+        type=int,
+        default=0,
+        help="Percentage to boost color saturation (e.g., 20 for 20%% increase)",
+    )
+
     return ap.parse_args()
 
 
@@ -119,6 +132,8 @@ def main():
             text_prompt=args.text_prompt,
             deepforest_model_bytes=model_bytes,
             deepforest_confidence=args.deepforest_confidence,
+            enhance_contrast_enabled=args.enhance_contrast,
+            saturation_boost=args.saturation_boost,
         )
 
     # Save results locally

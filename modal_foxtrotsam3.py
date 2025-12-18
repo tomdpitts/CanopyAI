@@ -73,6 +73,94 @@ sam3_image = (
 )
 
 
+def enhance_contrast(image, factor=1.2):
+    """
+    Enhance image contrast by a factor.
+
+    Args:
+        image: RGB image as numpy array (H, W, C), uint8
+        factor: Contrast multiplier (1.2 = 20% increase)
+
+    Returns:
+        Contrast-enhanced image as numpy array, uint8
+    """
+    # Convert to float for manipulation
+    img_float = image.astype(np.float32)
+
+    # Calculate mean (per-channel or global)
+    mean = img_float.mean()
+
+    # Apply contrast: (pixel - mean) * factor + mean
+    enhanced = (img_float - mean) * factor + mean
+
+    # Clip to valid range and convert back to uint8
+    enhanced = np.clip(enhanced, 0, 255).astype(np.uint8)
+
+    return enhanced
+
+
+def enhance_saturation(image, boost_percent=20):
+    """
+    Enhance image color saturation.
+
+    Args:
+        image: RGB image as numpy array (H, W, C), uint8
+        boost_percent: Percentage to boost saturation (20 = 20% increase)
+
+    Returns:
+        Saturation-enhanced image as numpy array, uint8
+    """
+    import cv2
+
+    # Convert RGB to HSV
+    hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV).astype(np.float32)
+
+    # Boost saturation channel
+    factor = 1.0 + (boost_percent / 100.0)
+    hsv[:, :, 1] = hsv[:, :, 1] * factor
+
+    # Clip to valid range
+    hsv[:, :, 1] = np.clip(hsv[:, :, 1], 0, 255)
+
+    # Convert back to RGB
+    hsv = hsv.astype(np.uint8)
+    enhanced = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
+
+    return enhanced
+
+
+def crop_bbox_with_buffer(image, bbox, buffer_ratio=0.25):
+    """
+    Crop image region around bbox with buffer.
+
+    Args:
+        image: Full image (H, W, C) numpy array
+        bbox: [xmin, ymin, xmax, ymax] in pixel coords
+        buffer_ratio: Buffer as fraction of bbox size (0.25 = 25% on each side = 150% total)
+
+    Returns:
+        crop: Cropped image patch
+        crop_coords: (x1, y1, x2, y2) crop coords in original image
+    """
+    img_h, img_w = image.shape[:2]
+    xmin, ymin, xmax, ymax = bbox
+
+    # Calculate buffer in pixels
+    bbox_w = xmax - xmin
+    bbox_h = ymax - ymin
+    buffer_x = bbox_w * buffer_ratio
+    buffer_y = bbox_h * buffer_ratio
+
+    # Expand bbox with buffer, clamp to image bounds
+    x1 = max(0, int(xmin - buffer_x))
+    y1 = max(0, int(ymin - buffer_y))
+    x2 = min(img_w, int(xmax + buffer_x))
+    y2 = min(img_h, int(ymax + buffer_y))
+
+    crop = image[y1:y2, x1:x2].copy()
+    return crop, (x1, y1, x2, y2)
+
+
 def mask_to_polygon(mask, simplify_tolerance=1.0):
     """Convert binary mask to polygon coordinates."""
     import cv2
@@ -105,7 +193,7 @@ def mask_to_polygon(mask, simplify_tolerance=1.0):
 
 @app.function(
     image=sam3_image,
-    gpu="A10G",  # Batch processing + disk caching avoids OOM
+    gpu="A100-40GB",  # Need 40GB for DeepForest + SAM3 together
     timeout=3600,
     memory=32768,
     secrets=[modal.Secret.from_name("huggingface")],
@@ -115,6 +203,8 @@ def run_pipeline(
     text_prompt: str | None = None,
     deepforest_model_bytes: bytes | None = None,
     deepforest_confidence: float = 0.3,
+    enhance_contrast_enabled: bool = False,
+    saturation_boost: int = 0,
 ) -> dict:
     """
     Run full DeepForest + SAM3 pipeline on Modal GPU.
@@ -124,6 +214,8 @@ def run_pipeline(
         text_prompt: Optional text prompt for SAM3 (None = bbox-only)
         deepforest_model_bytes: Optional custom DeepForest model weights
         deepforest_confidence: Confidence threshold for DeepForest
+        enhance_contrast_enabled: If True, enhance contrast by 20% before SAM3
+        saturation_boost: Percentage to boost saturation (0 = disabled)
 
     Returns:
         dict with keys:
@@ -137,8 +229,10 @@ def run_pipeline(
     import rasterio
     from pathlib import Path
     import os
+    from PIL import Image
     from deepforest import main as deepforest_main
     from sam3.model_builder import build_sam3_image_model
+    from sam3.model.sam3_image_processor import Sam3Processor
 
     print("🚀 Starting SAM3 pipeline on Modal GPU", flush=True)
     print(f"   Text prompt: {text_prompt or '(none - bbox only)'}", flush=True)
@@ -207,7 +301,7 @@ def run_pipeline(
         path=temp_image_path,
         patch_size=400,
         patch_overlap=0.05,
-        dataloader_strategy="batch",  # GPU batch processing
+        dataloader_strategy="single",  # One patch at a time on GPU (lower memory)
     )
 
     # Clean up temp file
@@ -239,29 +333,36 @@ def run_pipeline(
     )
 
     # =========================================================================
-    # 3. SAM3 segmentation with batch processing (using SAM1-like API)
+    # 3. SAM3 segmentation with batch processing
     # =========================================================================
     print("\n🎯 Running SAM3 segmentation...", flush=True)
 
-    # Load SAM3 model with interactive predictor enabled (SAM1-like box prompting)
-    sam3_model = build_sam3_image_model(enable_inst_interactivity=True)
+    # Load SAM3 model and create processor
+    sam3_model = build_sam3_image_model()
+    processor = Sam3Processor(sam3_model)
 
-    # Access the interactive predictor (SAM1-like API)
-    predictor = sam3_model.inst_interactive_predictor
-    if predictor is None:
-        raise RuntimeError("SAM3 inst_interactive_predictor not available")
+    # Optionally enhance image before segmentation
+    # Keep original image for visualization
+    needs_enhancement = enhance_contrast_enabled or saturation_boost > 0
+    original_image = image.copy() if needs_enhancement else image
 
+    if enhance_contrast_enabled:
+        print("   🔆 Enhancing contrast by 20%...", flush=True)
+        image = enhance_contrast(image, factor=1.2)
+
+    if saturation_boost > 0:
+        print(f"   🎨 Boosting saturation by {saturation_boost}%...", flush=True)
+        image = enhance_saturation(image, boost_percent=saturation_boost)
+
+    # Get image dimensions for mask mapping
     img_h, img_w = image.shape[:2]
 
-    # Set image ONCE (expensive backbone forward pass)
-    print("   Loading image into SAM3 backbone...", flush=True)
-    predictor.set_image(image)  # numpy array in HWC format
-    print("   Image loaded, starting segmentation...", flush=True)
+    print("   Processing each tree crop independently...", flush=True)
 
     # Batch processing config
     import gc
 
-    batch_size = 50  # Smaller batches for SAM3's higher memory usage
+    batch_size = 50
     cache_dir = Path(tempfile.mkdtemp(prefix="sam3_cache_"))
     print(f"   Created temp cache: {cache_dir}", flush=True)
 
@@ -282,7 +383,7 @@ def run_pipeline(
         batch_scores_list = scores[start_idx:end_idx]
 
         print(
-            f"📦 Batch {batch_idx + 1}/{num_batches}: Processing trees {start_idx}-{end_idx - 1}",
+            f"📦 Batch {batch_idx + 1}/{num_batches}: trees {start_idx}-{end_idx - 1}",
             flush=True,
         )
 
@@ -297,32 +398,106 @@ def run_pipeline(
                 leave=False,
             )
         ):
+            tree_idx = start_idx + j
             try:
-                # Box prompt in XYXY format (same as SAM1)
-                xmin, ymin, xmax, ymax = bbox
-                box_array = np.array([xmin, ymin, xmax, ymax])
-
-                # Predict mask for this specific box (SAM1-like behavior)
-                masks, iou_scores, low_res_masks = predictor.predict(
-                    box=box_array,
-                    multimask_output=False,  # Single mask for unambiguous box
+                # 1. Crop image region with 25% buffer (150% total size)
+                crop, (crop_x1, crop_y1, crop_x2, crop_y2) = crop_bbox_with_buffer(
+                    image, bbox, buffer_ratio=0.25
                 )
+                crop_h, crop_w = crop.shape[:2]
 
-                # Debug: show first mask info
-                if start_idx + j == 0:
-                    print(f"   DEBUG: masks shape: {masks.shape}", flush=True)
-                    print(f"   DEBUG: iou_scores: {iou_scores}", flush=True)
+                # Skip tiny crops that might cause issues
+                if crop_h < 10 or crop_w < 10:
+                    print(
+                        f"   SKIP tree {tree_idx}: crop too small ({crop_w}x{crop_h})",
+                        flush=True,
+                    )
+                    continue
 
-                # Take the best mask (first one since multimask_output=False)
-                if masks is not None and len(masks) > 0:
-                    mask = masks[0] > 0  # Convert to boolean
+                # 2. Create new SAM3 processor state for cropped image
+                crop_pil = Image.fromarray(crop)
+                crop_state = processor.set_image(crop_pil)
 
-                    batch_masks.append(mask)
-                    batch_valid_bboxes.append(bbox)
-                    batch_valid_scores.append(score)
+                # 3. Calculate local bbox within crop (it will be centered due to buffer)
+                local_xmin = bbox[0] - crop_x1
+                local_ymin = bbox[1] - crop_y1
+                local_xmax = bbox[2] - crop_x1
+                local_ymax = bbox[3] - crop_y1
+
+                # 4. Normalize to [cx, cy, w, h] for SAM3
+                cx = (local_xmin + local_xmax) / 2 / crop_w
+                cy = (local_ymin + local_ymax) / 2 / crop_h
+                w = (local_xmax - local_xmin) / crop_w
+                h = (local_ymax - local_ymin) / crop_h
+                normalized_box = [cx, cy, w, h]
+
+                # 5. Run SAM3 on crop with box prompt
+                if text_prompt is not None:
+                    state = processor.set_text_prompt(
+                        prompt=text_prompt, state=crop_state
+                    )
+                    state = processor.add_geometric_prompt(
+                        box=normalized_box, label=True, state=state
+                    )
+                else:
+                    state = processor.add_geometric_prompt(
+                        box=normalized_box, label=True, state=crop_state
+                    )
+
+                # 6. Extract mask and map back to original coords
+                if "masks" in state and len(state["masks"]) > 0:
+                    masks_tensor = state["masks"]
+                    num_masks = len(masks_tensor)
+
+                    # Find best mask by overlap with local bbox
+                    best_mask = None
+                    best_overlap = 0
+
+                    for m_idx in range(min(num_masks, 5)):
+                        m = masks_tensor[m_idx].squeeze().cpu().numpy()
+
+                        # Resize mask to crop size if needed
+                        if m.shape != (crop_h, crop_w):
+                            m_pil = Image.fromarray(m.astype(np.uint8) * 255)
+                            m_pil = m_pil.resize((crop_w, crop_h), Image.NEAREST)
+                            m = np.array(m_pil) > 127
+
+                        # Calculate overlap with local bbox region
+                        local_bbox_mask = np.zeros((crop_h, crop_w), dtype=bool)
+                        lx1, ly1 = max(0, int(local_xmin)), max(0, int(local_ymin))
+                        lx2, ly2 = (
+                            min(crop_w, int(local_xmax)),
+                            min(crop_h, int(local_ymax)),
+                        )
+                        local_bbox_mask[ly1:ly2, lx1:lx2] = True
+
+                        intersection = np.logical_and(m, local_bbox_mask).sum()
+                        if intersection > best_overlap:
+                            best_overlap = intersection
+                            best_mask = m
+
+                    if best_mask is not None and best_overlap > 0:
+                        # Map mask back to original image coordinates
+                        full_mask = np.zeros((img_h, img_w), dtype=bool)
+                        full_mask[crop_y1:crop_y2, crop_x1:crop_x2] = best_mask
+
+                        batch_masks.append(full_mask)
+                        batch_valid_bboxes.append(bbox)
+                        batch_valid_scores.append(score)
+                    else:
+                        print(
+                            f"   SKIP tree {tree_idx}: {num_masks} masks, "
+                            f"best_overlap={best_overlap} pixels",
+                            flush=True,
+                        )
+                else:
+                    print(
+                        f"   SKIP tree {tree_idx}: SAM3 returned 0 masks",
+                        flush=True,
+                    )
 
             except Exception as e:
-                print(f"   ⚠️ Failed tree {start_idx + j}: {e}", flush=True)
+                print(f"   ⚠️ Failed tree {tree_idx}: {e}", flush=True)
                 continue
 
         # Save batch to disk
@@ -403,7 +578,7 @@ def run_pipeline(
     # 5. Create visualization (load masks from cache)
     # =========================================================================
     print("\n🎨 Creating visualization...")
-    vis_image = image.copy()
+    vis_image = original_image.copy()
 
     mask_idx = 0
     for cache_file in cache_files:
@@ -462,6 +637,8 @@ def main(
     deepforest_model: str = None,
     deepforest_confidence: float = 0.3,
     output_dir: str = "sam3_output",
+    enhance_contrast: bool = False,
+    saturation_boost: int = 0,
 ):
     """
     Test the SAM3 pipeline from command line.
@@ -485,6 +662,8 @@ def main(
         text_prompt=text_prompt if text_prompt else None,
         deepforest_model_bytes=model_bytes,
         deepforest_confidence=deepforest_confidence,
+        enhance_contrast_enabled=enhance_contrast,
+        saturation_boost=saturation_boost,
     )
 
     # Save results
