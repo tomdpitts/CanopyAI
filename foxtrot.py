@@ -249,7 +249,7 @@ def segment_trees_sam(
     bboxes,
     scores,
     tile_size=1024,
-    tile_overlap=0.0,
+    tile_overlap=0.1,  # 10% overlap prevents edge clipping
     cache_dir=None,
     batch_size=500,
 ):
@@ -262,7 +262,7 @@ def segment_trees_sam(
         bboxes: List of bounding boxes in global coordinates
         scores: List of confidence scores
         tile_size: Size of SAM tiles (default 1024px - SAM's native)
-        tile_overlap: Overlap between tiles (default 0.0)
+        tile_overlap: Overlap between tiles (default 0.1 = 10% prevents edge clipping)
         cache_dir: Directory for caching masks (temp dir if None)
         batch_size: Number of masks per cache file
 
@@ -307,12 +307,13 @@ def segment_trees_sam(
     total_boxes = len(bboxes)
     tiles_with_boxes = 0
 
-    # Process tiles
+    # Process tiles with overlap to prevent edge clipping
+    # Overlap ensures trees near edges get full context
     y_starts = range(0, h, stride) if h > tile_size else [0]
     x_starts = range(0, w, stride) if w > tile_size else [0]
 
-    # Padding to prevent edge clipping - SAM will see beyond tile bounds
-    tile_padding = 128  # pixels of context beyond tile boundary
+    overlap_pct = tile_overlap * 100
+    print(f"   Tile overlap: {overlap_pct:.0f}% (prevents edge clipping)")
 
     for y_start in tqdm(list(y_starts), desc="   SAM tiles"):
         for x_start in x_starts:
@@ -332,13 +333,8 @@ def segment_trees_sam(
 
             tiles_with_boxes += 1
 
-            # Extract PADDED tile for SAM (allows masks to extend beyond boundary)
-            pad_y_start = max(0, y_start - tile_padding)
-            pad_y_end = min(h, y_end + tile_padding)
-            pad_x_start = max(0, x_start - tile_padding)
-            pad_x_end = min(w, x_end + tile_padding)
-
-            tile_rgb = image[pad_y_start:pad_y_end, pad_x_start:pad_x_end]
+            # Extract tile at NATIVE 1024px (no padding/resizing)
+            tile_rgb = image[y_start:y_end, x_start:x_end]
 
             # Progress logging
             pct = len(processed_boxes) / total_boxes * 100
@@ -350,15 +346,15 @@ def segment_trees_sam(
             # Set SAM image (expensive - done once per tile)
             sam_predictor.set_image(tile_rgb)
 
-            # Convert global boxes to padded-tile-relative coordinates
+            # Convert global boxes to tile-relative coordinates
             local_boxes = []
             for i in tile_box_indices:
                 box = bboxes[i]
                 local_box = [
-                    max(0, box[0] - pad_x_start),
-                    max(0, box[1] - pad_y_start),
-                    min(tile_rgb.shape[1], box[2] - pad_x_start),
-                    min(tile_rgb.shape[0], box[3] - pad_y_start),
+                    max(0, box[0] - x_start),
+                    max(0, box[1] - y_start),
+                    min(tile_rgb.shape[1], box[2] - x_start),
+                    min(tile_rgb.shape[0], box[3] - y_start),
                 ]
                 local_boxes.append(local_box)
 
@@ -384,16 +380,15 @@ def segment_trees_sam(
                 print(f"⚠️  SAM failed on tile ({x_start}, {y_start}): {e}")
                 continue
 
-            # Store results as SPARSE masks with PADDED bounds
+            # Store results as SPARSE masks
             for local_mask, box_idx in zip(tile_masks, tile_box_indices):
-                # Store the local mask (padded tile size) with padded bounds
                 all_masks.append(local_mask)
                 all_processed_bboxes.append(bboxes[box_idx])
                 all_processed_scores.append(scores[box_idx])
 
-            # Store PADDED tile bounds for this batch of masks
-            # Now bounds = (pad_y_start, pad_y_end, pad_x_start, pad_x_end, h, w)
-            tile_bounds = (pad_y_start, pad_y_end, pad_x_start, pad_x_end, h, w)
+            # Store tile bounds for sparse mask reconstruction
+            # bounds = (y_start, y_end, x_start, x_end, h, w)
+            tile_bounds = (y_start, y_end, x_start, x_end, h, w)
             for _ in range(len(tile_masks)):
                 all_tile_bounds.append(tile_bounds)
 
@@ -828,6 +823,7 @@ def main(args):
         all_bboxes,
         all_scores,
         tile_size=args.sam_tile_size,
+        tile_overlap=args.sam_tile_overlap,
         cache_dir=args.cache_dir,
         batch_size=args.batch_size,
     )
@@ -1006,6 +1002,14 @@ def parse_args():
         default=1024,
         help="SAM tile size in pixels (default: 1024). "
         "SAM internally uses 1024x1024, so this matches its native resolution.",
+    )
+
+    ap.add_argument(
+        "--sam_tile_overlap",
+        type=float,
+        default=0.15,
+        help="SAM tile overlap as fraction (default: 0.1 = 10%%). "
+        "Overlap prevents mask clipping at tile edges.",
     )
 
     ap.add_argument(
