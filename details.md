@@ -80,8 +80,38 @@ All three experiments (Hotel, India, Juliet) show the same pattern:
 4. **Evaluation bug** - Model might be predicting but evaluation fails
 5. **Confidence threshold issue** - All predictions below 0.0 confidence
 
-**Next steps:**
+**Next steps (DeepForest issue):**
 - Check if pretrained weights are actually loading
 - Verify image normalization in training data
 - Test model immediately after loading pretrained weights (before any training)
 - Check if raw model outputs exist (even with low confidence)
+
+**Status**: DeepForest training approach abandoned after Juliet; focusing on Detectree2 for training and DeepForest baseline for detection-only.
+
+---
+
+## Planned Experiments (Not Yet Executed)
+
+The following experiments are planned but have not been run:
+
+- **Kilo**: 
+- **Lima**: 
+- **Mike**: 
+- **November**: DeepForest
+
+---
+
+## Oscar
+- 2 stage DeepForest + SAM3 pipeline
+- **50 epochs** of DeepForest training
+- Training on DeepForest, SAM3 frozen
+- Uses SAM3 (SAM2.1) for segmentation with text prompt support
+- Modal cloud GPU deployment for both training and inference
+- Tested inference on multiple TCD sites: BRU162, CAN091, CAN095, CAN117
+- Features:
+  - Optional text prompts for open-vocabulary segmentation
+  - Contrast enhancement option (20%)
+  - Saturation boost option (configurable %)
+  - Visualization always uses original (unenhanced) image
+- **Result**: Successfully trained DeepForest model that makes predictions (unlike Hotel/India/Juliet)
+- **Files**: `foxtrotSAM3.py`, `modal_foxtrotsam3.py`, `model_oscar50.pth`

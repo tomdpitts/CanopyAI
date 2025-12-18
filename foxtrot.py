@@ -68,166 +68,121 @@ def load_image_from_tif(tif_path):
     return image, crs, transform, bounds
 
 
-def detect_trees_with_deepforest(image, confidence_threshold=0.3, model_path=None):
+def compute_iou(box1, box2):
+    """Compute Intersection over Union between two boxes [xmin, ymin, xmax, ymax]."""
+    x1 = max(box1[0], box2[0])
+    y1 = max(box1[1], box2[1])
+    x2 = min(box1[2], box2[2])
+    y2 = min(box1[3], box2[3])
+
+    intersection = max(0, x2 - x1) * max(0, y2 - y1)
+    area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
+    area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
+    union = area1 + area2 - intersection
+
+    iou = intersection / union if union > 0 else 0
+
+    # Also compute coverage: what fraction of each box is covered by intersection
+    coverage1 = intersection / area1 if area1 > 0 else 0
+    coverage2 = intersection / area2 if area2 > 0 else 0
+
+    return iou, coverage1, coverage2
+
+
+def apply_nms(bboxes, scores, iou_threshold=0.5, coverage_threshold=0.6):
     """
-    Stage 1: Use DeepForest to detect trees and generate bounding boxes.
+    Apply Non-Maximum Suppression to remove overlapping detections.
+    Suppresses if IoU > iou_threshold OR if one box is >coverage_threshold
+    covered by another (handles small boxes inside larger ones).
 
     Args:
-        image: RGB image as (H, W, 3) numpy array
-        confidence_threshold: Minimum confidence score for detections
-        model_path: Optional path to custom DeepForest model (.pth file)
+        bboxes: List of bounding boxes [xmin, ymin, xmax, ymax]
+        scores: List of confidence scores
+        iou_threshold: IoU threshold for suppression (default 0.5)
+        coverage_threshold: Coverage threshold - suppress if box is this
+                           fraction covered by another (default 0.6)
 
     Returns:
-        bboxes: List of bounding boxes as [xmin, ymin, xmax, ymax]
-        scores: Confidence scores for each detection
+        keep_indices: List of indices to keep
     """
-    print("\n🌲 Stage 1: Running DeepForest tree detection...")
+    if len(bboxes) == 0:
+        return []
 
-    # Initialize DeepForest model
-    model = deepforest_main.deepforest()
+    # Sort by score (descending)
+    indices = np.argsort(scores)[::-1].tolist()
+    keep = []
 
-    # Load model
-    if model_path:
-        print(f"   Loading custom model: {model_path}")
-        # Load custom fine-tuned model
-        model.model.load_state_dict(torch.load(model_path, map_location="cpu"))
-    else:
-        print("   Loading default pretrained model from Hugging Face...")
-        # Load the pretrained model from Hugging Face
-        model.load_model("weecology/deepforest-tree")
+    while indices:
+        # Keep the highest scoring box
+        current = indices.pop(0)
+        keep.append(current)
 
-    # Convert image to float32 to avoid warning and ensure proper format
-    if image.dtype == np.uint8:
-        image_float = image.astype("float32")
-        print(f"   Converted image from uint8 to float32")
-    else:
-        image_float = image
+        # Remove boxes with high IoU overlap OR high coverage
+        remaining = []
+        for idx in indices:
+            iou, coverage_current, coverage_idx = compute_iou(
+                bboxes[current], bboxes[idx]
+            )
+            # Suppress if: high IoU OR the candidate box is mostly covered
+            if iou < iou_threshold and coverage_idx < coverage_threshold:
+                remaining.append(idx)
+        indices = remaining
 
-    print(f"   Image shape: {image_float.shape}")
-    print(f"   Image value range: [{image_float.min():.1f}, {image_float.max():.1f}]")
-
-    # DeepForest expects RGB format for numpy array predictions
-    # For very large images, we might need to process in patches
-    h, w = image_float.shape[:2]
-
-    # If image is very large (>2000px), use predict_tile which handles patches
-    if h > 2000 or w > 2000:
-        print(f"   Large image detected, using patch-based prediction...")
-
-        # Use larger patches and less overlap for faster processing
-        patch_size = 400  # Larger patches = fewer patches
-        patch_overlap = 0.05  # Less overlap = faster
-        stride = int(patch_size * (1 - patch_overlap))
-
-        # Calculate number of patches
-        num_patches_y = (h - patch_size) // stride + 1
-        num_patches_x = (w - patch_size) // stride + 1
-        total_patches = num_patches_y * num_patches_x
-
-        print(
-            f"   Processing {total_patches} patches ({patch_size}px, {int(patch_overlap * 100)}% overlap)..."
-        )
-
-        # Suppress DeepForest warnings about missing image_path
-        import warnings
-
-        warnings.filterwarnings("ignore", message=".*image_path.*")
-        warnings.filterwarnings("ignore", message=".*root_dir.*")
-
-        all_predictions = []
-        patch_count = 0
-
-        for y_start in tqdm(range(0, h, stride), desc="   Rows"):
-            for x_start in range(0, w, stride):
-                y_end = min(y_start + patch_size, h)
-                x_end = min(x_start + patch_size, w)
-
-                # Extract patch
-                patch = image_float[y_start:y_end, x_start:x_end]
-
-                # Skip very small edge patches
-                if patch.shape[0] < 200 or patch.shape[1] < 200:
-                    continue
-
-                # Predict on patch
-                try:
-                    patch_preds = model.predict_image(image=patch)
-
-                    if patch_preds is not None and len(patch_preds) > 0:
-                        # Adjust bounding box coordinates to global image
-                        patch_preds["xmin"] += x_start
-                        patch_preds["xmax"] += x_start
-                        patch_preds["ymin"] += y_start
-                        patch_preds["ymax"] += y_start
-                        all_predictions.append(patch_preds)
-                        patch_count += len(patch_preds)
-                except Exception:
-                    # Silently skip failed patches
-                    continue
-
-        # Re-enable warnings
-        warnings.filterwarnings("default")
-
-        print(f"   Found {patch_count} raw detections across all patches")
-
-        # Combine all predictions
-        if all_predictions:
-            import pandas as pd
-
-            predictions = pd.concat(all_predictions, ignore_index=True)
-        else:
-            predictions = None
-    else:
-        predictions = model.predict_image(image=image_float)
-
-    print(f"   Raw predictions: {len(predictions) if predictions is not None else 0}")
-
-    if predictions is None or len(predictions) == 0:
-        print("⚠️  No trees detected by DeepForest")
-        print(
-            f"   Try lowering --deepforest_confidence (current: {confidence_threshold})"
-        )
-        return [], []
-
-    # Show score distribution before filtering
-    print(
-        f"   Score range: [{predictions['score'].min():.3f}, {predictions['score'].max():.3f}]"
-    )
-
-    # Filter by confidence threshold
-    predictions = predictions[predictions["score"] >= confidence_threshold]
-
-    print(
-        f"✅ DeepForest detected {len(predictions)} trees (conf >= {confidence_threshold})"
-    )
-
-    # Extract bounding boxes and scores
-    bboxes = predictions[["xmin", "ymin", "xmax", "ymax"]].values.tolist()
-    scores = predictions["score"].values.tolist()
-
-    return bboxes, scores
+    return keep
 
 
-def segment_trees_with_sam(
-    image, bboxes, sam_predictor, batch_size=500, cache_dir=None
+def detect_and_segment_per_tile(
+    image,
+    sam_predictor,
+    confidence_threshold=0.3,
+    model_path=None,
+    patch_size=400,
+    patch_overlap=0.05,
+    cache_dir=None,
+    batch_size=500,
 ):
     """
-    Stage 2: Use SAM to segment trees within each bounding box.
-    Uses batch processing with disk caching to avoid OOM errors.
+    Unified DeepForest + SAM pipeline that processes both on the SAME tiles.
+    This preserves image resolution for SAM (which downscales to 1024px internally).
 
     Args:
         image: RGB image as (H, W, 3) numpy array
-        bboxes: List of bounding boxes as [xmin, ymin, xmax, ymax]
-        sam_predictor: Initialized SAM predictor
-        batch_size: Number of trees to process per batch before flushing to disk
+        sam_predictor: Initialized SamPredictor
+        confidence_threshold: Minimum confidence score for DeepForest detections
+        model_path: Optional path to custom DeepForest model (.pth file)
+        patch_size: Size of each tile (default 400px)
+        patch_overlap: Overlap between tiles (default 0.05 = 5%)
         cache_dir: Directory for caching masks (temp dir if None)
+        batch_size: Number of masks per cache file
 
     Returns:
         cache_files: List of paths to cached mask files
-        valid_bboxes: Corresponding bounding boxes
+        all_bboxes: List of bounding boxes (global coordinates)
+        all_scores: List of confidence scores
     """
-    print("\n🎯 Stage 2: Running SAM segmentation on detected trees...")
-    print(f"   Using batch size: {batch_size}")
+    import pandas as pd
+    import warnings
+
+    print("\n🌲🎯 Running unified DeepForest + SAM per-tile pipeline...")
+
+    # Initialize DeepForest model
+    df_model = deepforest_main.deepforest()
+
+    if model_path:
+        print(f"   Loading custom DeepForest model: {model_path}")
+        df_model.model.load_state_dict(torch.load(model_path, map_location="cpu"))
+    else:
+        print("   Loading default DeepForest model from Hugging Face...")
+        df_model.load_model("weecology/deepforest-tree")
+
+    # Convert image to float32 for DeepForest
+    if image.dtype == np.uint8:
+        image_float = image.astype("float32")
+    else:
+        image_float = image
+
+    h, w = image.shape[:2]
+    stride = int(patch_size * (1 - patch_overlap))
 
     # Create cache directory
     if cache_dir is None:
@@ -236,81 +191,185 @@ def segment_trees_with_sam(
     else:
         cache_dir = Path(cache_dir)
         cache_dir.mkdir(exist_ok=True, parents=True)
-        print(f"   Using cache: {cache_dir}")
-
     cache_dir = Path(cache_dir)
 
-    # Set image for SAM predictor
-    sam_predictor.set_image(image)
+    # Calculate tile count
+    num_tiles_y = max(1, (h - patch_size) // stride + 1) if h > patch_size else 1
+    num_tiles_x = max(1, (w - patch_size) // stride + 1) if w > patch_size else 1
+    total_tiles = num_tiles_y * num_tiles_x
 
+    print(f"   Image size: {w}x{h}")
+    print(f"   Tile size: {patch_size}px, overlap: {int(patch_overlap * 100)}%")
+    print(f"   Processing {total_tiles} tiles (DeepForest → SAM per tile)\n")
+
+    # Suppress DeepForest warnings
+    warnings.filterwarnings("ignore", message=".*image_path.*")
+    warnings.filterwarnings("ignore", message=".*root_dir.*")
+
+    # Accumulate results across tiles
+    all_masks = []
+    all_bboxes = []
+    all_scores = []
     cache_files = []
-    valid_bboxes = []
+    tile_count = 0
+    tree_count = 0
 
-    # Process in batches
-    num_batches = (len(bboxes) + batch_size - 1) // batch_size
-    print(f"   Processing {len(bboxes)} trees in {num_batches} batches\n")
+    # Process tiles
+    y_starts = range(0, h, stride) if h > patch_size else [0]
+    x_starts = range(0, w, stride) if w > patch_size else [0]
 
-    for batch_idx in range(num_batches):
-        start_idx = batch_idx * batch_size
-        end_idx = min((batch_idx + 1) * batch_size, len(bboxes))
-        batch_bboxes = bboxes[start_idx:end_idx]
+    for y_start in tqdm(list(y_starts), desc="   Tile rows"):
+        for x_start in x_starts:
+            y_end = min(y_start + patch_size, h)
+            x_end = min(x_start + patch_size, w)
 
-        print(
-            f"📦 Batch {batch_idx + 1}/{num_batches}: Processing trees {start_idx}-{end_idx - 1}"
-        )
+            # Extract tile
+            tile = image_float[y_start:y_end, x_start:x_end]
+            tile_rgb = image[y_start:y_end, x_start:x_end]  # uint8 for SAM
 
-        batch_masks = []
-        batch_valid_bboxes = []
-
-        # Process this batch
-        for bbox in tqdm(batch_bboxes, desc=f"  Segmenting", leave=False):
-            try:
-                # Convert bbox to SAM format [x, y, x2, y2]
-                bbox_array = np.array(bbox)
-
-                # Predict mask using bounding box prompt
-                masks, scores, logits = sam_predictor.predict(
-                    point_coords=None,
-                    point_labels=None,
-                    box=bbox_array[None, :],  # SAM expects (1, 4) shape
-                    multimask_output=False,  # Single mask per box
-                )
-
-                # Take the first (and only) mask
-                mask = masks[0]
-                batch_masks.append(mask)
-                batch_valid_bboxes.append(bbox)
-
-            except Exception as e:
-                print(f"⚠️  Failed to segment tree: {e}")
+            # Skip very small edge tiles
+            if tile.shape[0] < 200 or tile.shape[1] < 200:
                 continue
 
-        # Save batch to disk using numpy compression (~95% size reduction)
-        batch_file = cache_dir / f"batch_{batch_idx:04d}.npz"
+            tile_count += 1
+
+            # === STAGE 1: DeepForest on this tile ===
+            try:
+                tile_preds = df_model.predict_image(image=tile)
+            except Exception:
+                continue
+
+            if tile_preds is None or len(tile_preds) == 0:
+                continue
+
+            # Filter by confidence
+            tile_preds = tile_preds[tile_preds["score"] >= confidence_threshold]
+            if len(tile_preds) == 0:
+                continue
+
+            # === STAGE 2: SAM on this tile with detected boxes ===
+            # Set SAM image to this tile (preserve full resolution)
+            sam_predictor.set_image(tile_rgb)
+
+            # Get local bounding boxes (relative to tile)
+            local_boxes = tile_preds[["xmin", "ymin", "xmax", "ymax"]].values
+            tile_scores = tile_preds["score"].values.tolist()
+
+            # Transform boxes for SAM
+            transformed_boxes = sam_predictor.transform.apply_boxes_torch(
+                torch.as_tensor(
+                    local_boxes, device=sam_predictor.device, dtype=torch.float32
+                ),
+                tile_rgb.shape[:2],
+            )
+
+            # Run SAM prediction on tile
+            try:
+                masks, _, _ = sam_predictor.predict_torch(
+                    point_coords=None,
+                    point_labels=None,
+                    boxes=transformed_boxes,
+                    multimask_output=False,
+                )
+                # masks: (N, 1, tile_H, tile_W) -> (N, tile_H, tile_W)
+                tile_masks = masks.cpu().numpy().squeeze(1)
+            except Exception as e:
+                print(f"⚠️  SAM failed on tile ({x_start}, {y_start}): {e}")
+                continue
+
+            # Convert local masks to global masks and store results
+            for i, (local_mask, local_box, score) in enumerate(
+                zip(tile_masks, local_boxes, tile_scores)
+            ):
+                # Create full-size mask
+                full_mask = np.zeros((h, w), dtype=bool)
+                full_mask[y_start:y_end, x_start:x_end] = local_mask
+
+                # Convert local box to global coordinates
+                global_box = [
+                    local_box[0] + x_start,
+                    local_box[1] + y_start,
+                    local_box[2] + x_start,
+                    local_box[3] + y_start,
+                ]
+
+                all_masks.append(full_mask)
+                all_bboxes.append(global_box)
+                all_scores.append(score)
+                tree_count += 1
+
+            # Flush to disk periodically to avoid OOM
+            if len(all_masks) >= batch_size:
+                batch_file = cache_dir / f"batch_{len(cache_files):04d}.npz"
+                np.savez_compressed(
+                    batch_file,
+                    masks=np.array(all_masks, dtype=bool),
+                    bboxes=np.array(all_bboxes, dtype=np.float32),
+                )
+                cache_files.append(batch_file)
+                file_size_mb = batch_file.stat().st_size / (1024**2)
+                print(f"   💾 Cached {len(all_masks)} masks ({file_size_mb:.1f}MB)")
+                all_masks = []
+                all_bboxes_for_cache = all_bboxes.copy()
+                all_bboxes = []  # Clear for next batch (but keep scores)
+
+    # Flush remaining masks
+    if len(all_masks) > 0:
+        batch_file = cache_dir / f"batch_{len(cache_files):04d}.npz"
         np.savez_compressed(
             batch_file,
-            masks=np.array(batch_masks, dtype=bool),
-            bboxes=np.array(batch_valid_bboxes, dtype=np.float32),
+            masks=np.array(all_masks, dtype=bool),
+            bboxes=np.array(all_bboxes, dtype=np.float32),
         )
-
         cache_files.append(batch_file)
-        valid_bboxes.extend(batch_valid_bboxes)
-
-        # Report file size
         file_size_mb = batch_file.stat().st_size / (1024**2)
-        print(
-            f"   ✓ Saved {len(batch_masks)} masks to {batch_file.name} ({file_size_mb:.1f}MB)"
-        )
+        print(f"   💾 Cached final {len(all_masks)} masks ({file_size_mb:.1f}MB)")
 
-        # Clear batch from memory
-        del batch_masks
-        del batch_valid_bboxes
-        gc.collect()
+    # Re-enable warnings
+    warnings.filterwarnings("default")
 
-    print(f"\n✅ Successfully segmented {len(valid_bboxes)} trees with SAM")
-    print(f"   Cached in {len(cache_files)} batch files")
+    print(f"\n✅ Processed {tile_count} tiles, found {tree_count} trees (before NMS)")
+    print(f"   Results cached in {len(cache_files)} files")
 
-    return cache_files, valid_bboxes
+    # Load all results from cache for NMS
+    all_masks_loaded = []
+    all_bboxes_loaded = []
+    for cf in cache_files:
+        with np.load(cf) as data:
+            all_masks_loaded.extend(list(data["masks"]))
+            all_bboxes_loaded.extend(data["bboxes"].tolist())
+
+    # Apply NMS to remove overlapping detections from tile boundaries
+    print(f"\n🔄 Applying NMS (IoU threshold=0.5)...")
+    keep_indices = apply_nms(all_bboxes_loaded, all_scores, iou_threshold=0.5)
+
+    # Filter results
+    final_masks = [all_masks_loaded[i] for i in keep_indices]
+    final_bboxes = [all_bboxes_loaded[i] for i in keep_indices]
+    final_scores = [all_scores[i] for i in keep_indices]
+
+    removed_count = len(all_bboxes_loaded) - len(keep_indices)
+    print(f"   Removed {removed_count} overlapping detections")
+    print(f"   Keeping {len(keep_indices)} unique trees")
+
+    # Clear old cache files and save filtered results
+    for old_file in cache_files:
+        old_file.unlink(missing_ok=True)
+
+    cache_files = []
+    if len(final_masks) > 0:
+        # Save all filtered masks in batches
+        for batch_start in range(0, len(final_masks), batch_size):
+            batch_end = min(batch_start + batch_size, len(final_masks))
+            batch_file = cache_dir / f"nms_batch_{len(cache_files):04d}.npz"
+            np.savez_compressed(
+                batch_file,
+                masks=np.array(final_masks[batch_start:batch_end], dtype=bool),
+                bboxes=np.array(final_bboxes[batch_start:batch_end], dtype=np.float32),
+            )
+            cache_files.append(batch_file)
+
+    return cache_files, final_bboxes, final_scores
 
 
 def load_masks_from_cache(cache_files):
@@ -467,12 +526,12 @@ def create_visualization(image, cache_files, bboxes, output_dir, tif_stem):
     # Load masks one at a time from cache
     mask_generator = load_masks_from_cache(cache_files)
 
+    # Soft magenta color for all trees (RGB)
+    color = (200, 100, 180)
+
     # Draw each detection
     for i, bbox in enumerate(bboxes):
         mask = next(mask_generator)
-
-        # Generate random color for this tree
-        color = tuple(np.random.randint(50, 255, 3).tolist())
 
         # Draw bounding box (from DeepForest)
         xmin, ymin, xmax, ymax = [int(c) for c in bbox]
@@ -483,8 +542,8 @@ def create_visualization(image, cache_files, bboxes, output_dir, tif_stem):
         mask_colored = np.zeros_like(vis_image)
         mask_colored[mask] = color
 
-        # Blend mask with image
-        alpha = 0.1
+        # Blend mask with image (alpha=0 means no fill, only contours)
+        alpha = 0
         vis_image = cv2.addWeighted(vis_image, 1, mask_colored, alpha, 0)
 
         # Draw mask contour
@@ -513,7 +572,7 @@ def main(args):
         raise FileNotFoundError(f"❌ Image not found: {tif_path}")
 
     print(f"\n{'=' * 60}")
-    print("🚀 Two-Stage Tree Detection: DeepForest + SAM")
+    print("🚀 Unified DeepForest + SAM Pipeline (Per-Tile)")
     print(f"{'=' * 60}")
     print(f"Input: {tif_path}")
     print(f"Output: {args.output_dir}")
@@ -524,18 +583,7 @@ def main(args):
     print("📁 Loading image...")
     image, crs, transform, bounds = load_image_from_tif(tif_path)
 
-    # Stage 1: DeepForest detection
-    bboxes, deepforest_scores = detect_trees_with_deepforest(
-        image,
-        confidence_threshold=args.deepforest_confidence,
-        model_path=args.deepforest_model,
-    )
-
-    if len(bboxes) == 0:
-        print("\n❌ No trees detected. Exiting.")
-        return
-
-    # Initialize SAM
+    # Initialize SAM first (needed by unified function)
     print(f"\n🔧 Loading SAM model from {args.sam_checkpoint}...")
     if not Path(args.sam_checkpoint).exists():
         raise FileNotFoundError(
@@ -560,21 +608,19 @@ def main(args):
     sam.to(device=device)
     sam_predictor = SamPredictor(sam)
 
-    # Stage 2: SAM segmentation with batch processing
-    cache_files, valid_bboxes = segment_trees_with_sam(
+    # Run unified DeepForest + SAM per-tile pipeline
+    cache_files, valid_bboxes, valid_scores = detect_and_segment_per_tile(
         image,
-        bboxes,
         sam_predictor,
-        batch_size=args.batch_size,
+        confidence_threshold=args.deepforest_confidence,
+        model_path=args.deepforest_model,
         cache_dir=args.cache_dir,
+        batch_size=args.batch_size,
     )
 
     if len(valid_bboxes) == 0:
-        print("\n❌ No trees successfully segmented. Exiting.")
+        print("\n❌ No trees detected or segmented. Exiting.")
         return
-
-    # Filter scores to match valid bboxes
-    valid_scores = deepforest_scores[: len(valid_bboxes)]
 
     # Save results (loads masks from cache)
     output_geojson_path, features = save_results(
@@ -596,9 +642,8 @@ def main(args):
     print(f"\n{'=' * 60}")
     print("✅ Pipeline Complete!")
     print(f"{'=' * 60}")
-    print(f"Trees detected (DeepForest): {len(bboxes)}")
-    print(f"Trees segmented (SAM):       {len(valid_bboxes)}")
-    print(f"Valid features saved:        {len(features)}")
+    print(f"Trees detected & segmented: {len(valid_bboxes)}")
+    print(f"Valid features saved:       {len(features)}")
     print("\nOutputs:")
     print(f"  📄 GeoJSON:      {output_geojson_path}")
     print(f"  🖼️  Visualization: {vis_path}")
