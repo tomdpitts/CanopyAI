@@ -20,6 +20,7 @@ import json
 import tempfile
 import gc
 import shutil
+import time
 import numpy as np
 import rasterio
 from pathlib import Path
@@ -89,7 +90,7 @@ def compute_iou(box1, box2):
     return iou, coverage1, coverage2
 
 
-def apply_nms(bboxes, scores, iou_threshold=0.5, coverage_threshold=0.6):
+def apply_nms(bboxes, scores, iou_threshold=0.5, coverage_threshold=0.5):
     """
     Apply Non-Maximum Suppression to remove overlapping detections.
     Suppresses if IoU > iou_threshold OR if one box is >coverage_threshold
@@ -100,7 +101,7 @@ def apply_nms(bboxes, scores, iou_threshold=0.5, coverage_threshold=0.6):
         scores: List of confidence scores
         iou_threshold: IoU threshold for suppression (default 0.5)
         coverage_threshold: Coverage threshold - suppress if box is this
-                           fraction covered by another (default 0.6)
+                           fraction covered by another (default 0.5)
 
     Returns:
         keep_indices: List of indices to keep
@@ -300,6 +301,7 @@ def segment_trees_sam(
     all_masks = []
     all_processed_bboxes = []
     all_processed_scores = []
+    all_tile_bounds = []  # Store tile bounds for sparse mask reconstruction
     cache_files = []
 
     total_boxes = len(bboxes)
@@ -308,6 +310,9 @@ def segment_trees_sam(
     # Process tiles
     y_starts = range(0, h, stride) if h > tile_size else [0]
     x_starts = range(0, w, stride) if w > tile_size else [0]
+
+    # Padding to prevent edge clipping - SAM will see beyond tile bounds
+    tile_padding = 128  # pixels of context beyond tile boundary
 
     for y_start in tqdm(list(y_starts), desc="   SAM tiles"):
         for x_start in x_starts:
@@ -327,8 +332,13 @@ def segment_trees_sam(
 
             tiles_with_boxes += 1
 
-            # Extract tile
-            tile_rgb = image[y_start:y_end, x_start:x_end]
+            # Extract PADDED tile for SAM (allows masks to extend beyond boundary)
+            pad_y_start = max(0, y_start - tile_padding)
+            pad_y_end = min(h, y_end + tile_padding)
+            pad_x_start = max(0, x_start - tile_padding)
+            pad_x_end = min(w, x_end + tile_padding)
+
+            tile_rgb = image[pad_y_start:pad_y_end, pad_x_start:pad_x_end]
 
             # Progress logging
             pct = len(processed_boxes) / total_boxes * 100
@@ -340,15 +350,15 @@ def segment_trees_sam(
             # Set SAM image (expensive - done once per tile)
             sam_predictor.set_image(tile_rgb)
 
-            # Convert global boxes to local (tile-relative) coordinates
+            # Convert global boxes to padded-tile-relative coordinates
             local_boxes = []
             for i in tile_box_indices:
                 box = bboxes[i]
                 local_box = [
-                    max(0, box[0] - x_start),
-                    max(0, box[1] - y_start),
-                    min(tile_rgb.shape[1], box[2] - x_start),
-                    min(tile_rgb.shape[0], box[3] - y_start),
+                    max(0, box[0] - pad_x_start),
+                    max(0, box[1] - pad_y_start),
+                    min(tile_rgb.shape[1], box[2] - pad_x_start),
+                    min(tile_rgb.shape[0], box[3] - pad_y_start),
                 ]
                 local_boxes.append(local_box)
 
@@ -374,27 +384,29 @@ def segment_trees_sam(
                 print(f"⚠️  SAM failed on tile ({x_start}, {y_start}): {e}")
                 continue
 
-            # Store results as SPARSE masks (tile region only, not full image)
+            # Store results as SPARSE masks with PADDED bounds
             for local_mask, box_idx in zip(tile_masks, tile_box_indices):
-                # Store sparse: (local_mask, tile_bounds) instead of full_mask
-                # This reduces memory from ~41MB to ~1MB per mask
-                all_masks.append(local_mask)  # Tile-sized, not full-image
+                # Store the local mask (padded tile size) with padded bounds
+                all_masks.append(local_mask)
                 all_processed_bboxes.append(bboxes[box_idx])
                 all_processed_scores.append(scores[box_idx])
 
-            # Store tile bounds for this batch of masks
-            # We track bounds per-mask by storing them alongside
-            tile_bounds = (y_start, y_end, x_start, x_end, h, w)
+            # Store PADDED tile bounds for this batch of masks
+            # Now bounds = (pad_y_start, pad_y_end, pad_x_start, pad_x_end, h, w)
+            tile_bounds = (pad_y_start, pad_y_end, pad_x_start, pad_x_end, h, w)
             for _ in range(len(tile_masks)):
                 all_tile_bounds.append(tile_bounds)
 
             # Flush to disk periodically
             if len(all_masks) >= batch_size:
                 batch_file = cache_dir / f"batch_{len(cache_files):04d}.npz"
-                # Pack masks as object array since they may have different shapes
+                # Create object array for variable-shaped masks
+                masks_arr = np.empty(len(all_masks), dtype=object)
+                for i, m in enumerate(all_masks):
+                    masks_arr[i] = m
                 np.savez_compressed(
                     batch_file,
-                    masks=np.array(all_masks, dtype=object),
+                    masks=masks_arr,
                     bboxes=np.array(all_processed_bboxes, dtype=np.float32),
                     bounds=np.array(all_tile_bounds, dtype=np.int32),
                 )
@@ -408,9 +420,12 @@ def segment_trees_sam(
     # Flush remaining
     if len(all_masks) > 0:
         batch_file = cache_dir / f"batch_{len(cache_files):04d}.npz"
+        masks_arr = np.empty(len(all_masks), dtype=object)
+        for i, m in enumerate(all_masks):
+            masks_arr[i] = m
         np.savez_compressed(
             batch_file,
-            masks=np.array(all_masks, dtype=object),
+            masks=masks_arr,
             bboxes=np.array(all_processed_bboxes, dtype=np.float32),
             bounds=np.array(all_tile_bounds, dtype=np.int32),
         )
@@ -433,8 +448,13 @@ def segment_trees_sam(
             all_bboxes_loaded.extend(data["bboxes"].tolist())
 
     # Apply NMS
-    print("\n🔄 Applying NMS (IoU=0.5, coverage=0.6)...")
-    keep_indices = apply_nms(all_bboxes_loaded, all_processed_scores, iou_threshold=0.5)
+    print("\n🔄 Applying NMS (IoU=0.5, coverage=0.5)...")
+    keep_indices = apply_nms(
+        all_bboxes_loaded,
+        all_processed_scores,
+        iou_threshold=0.5,
+        coverage_threshold=0.5,
+    )
     keep_set = set(keep_indices)
 
     removed = len(all_bboxes_loaded) - len(keep_indices)
@@ -445,7 +465,7 @@ def segment_trees_sam(
     final_bboxes = [all_bboxes_loaded[i] for i in keep_indices]
     final_scores = [all_processed_scores[i] for i in keep_indices]
 
-    # Stream masks to new cache files without loading all into memory
+    # Stream sparse masks to new cache files
     # Build mapping from global index to position in final output
     keep_order = {idx: pos for pos, idx in enumerate(keep_indices)}
 
@@ -453,44 +473,55 @@ def segment_trees_sam(
     new_cache_files = []
     current_batch_masks = []
     current_batch_bboxes = []
+    current_batch_bounds = []
     masks_written = 0
 
-    print("   Filtering and re-caching masks...")
+    print("   Filtering and re-caching sparse masks...")
 
     global_idx = 0
     for cf in cache_files:
-        with np.load(cf) as data:
+        with np.load(cf, allow_pickle=True) as data:
             masks = data["masks"]
+            bounds = data["bounds"]
             for local_idx in range(len(masks)):
                 if global_idx in keep_set:
                     # Get the position this mask should be in final output
                     pos = keep_order[global_idx]
                     current_batch_masks.append((pos, masks[local_idx]))
                     current_batch_bboxes.append((pos, final_bboxes[pos]))
+                    current_batch_bounds.append((pos, bounds[local_idx]))
 
-                    # Flush batch when full (use smaller batch for memory)
+                    # Flush batch when full
                     if len(current_batch_masks) >= batch_size:
                         # Sort by position to maintain order
                         current_batch_masks.sort(key=lambda x: x[0])
                         current_batch_bboxes.sort(key=lambda x: x[0])
+                        current_batch_bounds.sort(key=lambda x: x[0])
 
                         batch_file = cache_dir / f"nms_{len(new_cache_files):04d}.npz"
+                        # Create object array for variable-shaped masks
+                        masks_list = [m for _, m in current_batch_masks]
+                        masks_arr = np.empty(len(masks_list), dtype=object)
+                        for i, m in enumerate(masks_list):
+                            masks_arr[i] = m
                         np.savez_compressed(
                             batch_file,
-                            masks=np.array(
-                                [m for _, m in current_batch_masks], dtype=bool
-                            ),
+                            masks=masks_arr,
                             bboxes=np.array(
                                 [b for _, b in current_batch_bboxes], dtype=np.float32
+                            ),
+                            bounds=np.array(
+                                [b for _, b in current_batch_bounds], dtype=np.int32
                             ),
                         )
                         new_cache_files.append(batch_file)
                         masks_written += len(current_batch_masks)
                         print(
-                            f"   💾 Saved batch {len(new_cache_files)}: {masks_written}/{len(keep_indices)} masks"
+                            f"   💾 Saved batch {len(new_cache_files)}: {masks_written}/{len(keep_indices)}"
                         )
                         current_batch_masks = []
                         current_batch_bboxes = []
+                        current_batch_bounds = []
 
                 global_idx += 1
 
@@ -498,16 +529,22 @@ def segment_trees_sam(
     if current_batch_masks:
         current_batch_masks.sort(key=lambda x: x[0])
         current_batch_bboxes.sort(key=lambda x: x[0])
+        current_batch_bounds.sort(key=lambda x: x[0])
 
         batch_file = cache_dir / f"nms_{len(new_cache_files):04d}.npz"
+        masks_list = [m for _, m in current_batch_masks]
+        masks_arr = np.empty(len(masks_list), dtype=object)
+        for i, m in enumerate(masks_list):
+            masks_arr[i] = m
         np.savez_compressed(
             batch_file,
-            masks=np.array([m for _, m in current_batch_masks], dtype=bool),
+            masks=masks_arr,
             bboxes=np.array([b for _, b in current_batch_bboxes], dtype=np.float32),
+            bounds=np.array([b for _, b in current_batch_bounds], dtype=np.int32),
         )
         new_cache_files.append(batch_file)
         masks_written += len(current_batch_masks)
-        print(f"   💾 Saved final batch: {masks_written}/{len(keep_indices)} masks")
+        print(f"   💾 Saved final batch: {masks_written}/{len(keep_indices)}")
 
     # Clear old cache files
     for old_file in cache_files:
@@ -519,20 +556,25 @@ def segment_trees_sam(
 def load_masks_from_cache(cache_files):
     """
     Generator to load masks from cache files one at a time.
-    Reduces memory footprint by loading masks on-demand.
+    Reconstructs full-image masks from sparse format on-demand.
 
     Args:
         cache_files: List of cache file paths
 
     Yields:
-        mask: Binary mask array
+        mask: Full-size binary mask array
     """
     for cache_file in cache_files:
         # Load compressed numpy arrays
-        with np.load(cache_file) as data:
+        with np.load(cache_file, allow_pickle=True) as data:
             masks = data["masks"]
-            for mask in masks:
-                yield mask
+            bounds = data["bounds"]
+            for local_mask, bound in zip(masks, bounds):
+                # Reconstruct full-size mask from sparse
+                y_start, y_end, x_start, x_end, h, w = bound
+                full_mask = np.zeros((h, w), dtype=bool)
+                full_mask[y_start:y_end, x_start:x_end] = local_mask
+                yield full_mask
 
 
 def mask_to_polygon(mask, simplify_tolerance=1.0):
@@ -760,19 +802,26 @@ def main(args):
 
     sam_predictor = SamPredictor(sam)
 
+    # Track timing for each stage
+    timings = {}
+    pipeline_start = time.time()
+
     # Pass 1: DeepForest detection at native 400px tiles
+    df_start = time.time()
     all_bboxes, all_scores = detect_trees_deepforest(
         image,
         model_path=args.deepforest_model,
         tile_size=args.df_tile_size,
         confidence_threshold=args.deepforest_confidence,
     )
+    timings["DeepForest"] = time.time() - df_start
 
     if len(all_bboxes) == 0:
         print("\n❌ No trees detected by DeepForest. Exiting.")
         return
 
-    # Pass 2: SAM segmentation at native 1024px tiles
+    # Pass 2: SAM segmentation at native 1024px tiles (includes NMS)
+    sam_start = time.time()
     cache_files, valid_bboxes, valid_scores = segment_trees_sam(
         image,
         sam_predictor,
@@ -782,6 +831,7 @@ def main(args):
         cache_dir=args.cache_dir,
         batch_size=args.batch_size,
     )
+    timings["SAM + NMS"] = time.time() - sam_start
 
     if len(valid_bboxes) == 0:
         print("\n❌ No trees detected or segmented. Exiting.")
@@ -830,14 +880,18 @@ def main(args):
             print(f"   ✅ {len(valid_bboxes)} trees remaining after shadow removal")
 
     # Save results (loads masks from cache)
+    save_start = time.time()
     output_geojson_path, features = save_results(
         cache_files, valid_bboxes, valid_scores, args.output_dir, tif_path.stem, crs
     )
+    timings["Save GeoJSON"] = time.time() - save_start
 
     # Create visualization (loads masks from cache)
+    vis_start = time.time()
     vis_path = create_visualization(
         image, cache_files, valid_bboxes, Path(args.output_dir), tif_path.stem
     )
+    timings["Visualization"] = time.time() - vis_start
 
     # Cleanup cache if using temp directory
     if args.cache_dir is None and cache_files:
@@ -845,12 +899,26 @@ def main(args):
         print(f"\n🧹 Cleaning up temp cache: {cache_dir}")
         shutil.rmtree(cache_dir, ignore_errors=True)
 
-    # Print summary
+    # Calculate total time
+    total_time = time.time() - pipeline_start
+
+    # Print summary with timings
     print(f"\n{'=' * 60}")
     print("✅ Pipeline Complete!")
     print(f"{'=' * 60}")
     print(f"Trees detected & segmented: {len(valid_bboxes)}")
     print(f"Valid features saved:       {len(features)}")
+    print("\n⏱️  Timing:")
+    for stage, duration in timings.items():
+        if duration >= 60:
+            print(f"  {stage:20s} {duration / 60:5.1f} min")
+        else:
+            print(f"  {stage:20s} {duration:5.1f} s")
+    print(f"  {'─' * 28}")
+    if total_time >= 60:
+        print(f"  {'TOTAL':20s} {total_time / 60:5.1f} min")
+    else:
+        print(f"  {'TOTAL':20s} {total_time:5.1f} s")
     print("\nOutputs:")
     print(f"  📄 GeoJSON:      {output_geojson_path}")
     print(f"  🖼️  Visualization: {vis_path}")
@@ -919,8 +987,8 @@ def parse_args():
     ap.add_argument(
         "--batch_size",
         type=int,
-        default=500,
-        help="Number of trees to process per batch (default: 500). "
+        default=50,
+        help="Number of trees to process per batch (default: 50). "
         "Lower values use less memory but may be slower",
     )
 
