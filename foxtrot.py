@@ -526,8 +526,8 @@ def create_visualization(image, cache_files, bboxes, output_dir, tif_stem):
     # Load masks one at a time from cache
     mask_generator = load_masks_from_cache(cache_files)
 
-    # Soft magenta color for all trees (RGB)
-    color = (200, 100, 180)
+    # Petrol blue
+    color = (33, 100, 119)
 
     # Draw each detection
     for i, bbox in enumerate(bboxes):
@@ -621,6 +621,48 @@ def main(args):
     if len(valid_bboxes) == 0:
         print("\n❌ No trees detected or segmented. Exiting.")
         return
+
+    # Optional: VLM shadow filtering
+    if args.vlm_shadow_filter:
+        from vlm_shadow_filter import filter_shadows
+
+        shadow_indices = filter_shadows(image, valid_bboxes, valid_scores)
+
+        if shadow_indices:
+            # Remove shadows from results
+            print(f"   Removing {len(shadow_indices)} shadow detections...")
+            keep_mask = np.ones(len(valid_bboxes), dtype=bool)
+            keep_mask[shadow_indices] = False
+            keep_indices = np.where(keep_mask)[0].tolist()
+
+            # Filter bboxes and scores
+            valid_bboxes = [valid_bboxes[i] for i in keep_indices]
+            valid_scores = [valid_scores[i] for i in keep_indices]
+
+            # Reload and filter masks from cache
+            all_masks = []
+            for cf in cache_files:
+                with np.load(cf) as data:
+                    all_masks.extend(list(data["masks"]))
+            filtered_masks = [all_masks[i] for i in keep_indices]
+
+            # Clear old cache and save filtered
+            for old_file in cache_files:
+                old_file.unlink(missing_ok=True)
+            cache_files = []
+            if filtered_masks:
+                cache_dir = (
+                    Path(args.cache_dir) if args.cache_dir else Path(tempfile.mkdtemp())
+                )
+                batch_file = cache_dir / "vlm_filtered_batch.npz"
+                np.savez_compressed(
+                    batch_file,
+                    masks=np.array(filtered_masks, dtype=bool),
+                    bboxes=np.array(valid_bboxes, dtype=np.float32),
+                )
+                cache_files = [batch_file]
+
+            print(f"   ✅ {len(valid_bboxes)} trees remaining after shadow removal")
 
     # Save results (loads masks from cache)
     output_geojson_path, features = save_results(
@@ -723,6 +765,13 @@ def parse_args():
         default=None,
         help="Directory for caching masks. "
         "If not provided, uses a temporary directory that is cleaned up after",
+    )
+
+    ap.add_argument(
+        "--vlm_shadow_filter",
+        action="store_true",
+        help="Use VLM (Moondream 2) to filter shadow false positives. "
+        "Requires: pip install moondream",
     )
 
     return ap.parse_args()
