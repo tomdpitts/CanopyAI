@@ -131,48 +131,39 @@ def apply_nms(bboxes, scores, iou_threshold=0.5, coverage_threshold=0.6):
     return keep
 
 
-def detect_and_segment_per_tile(
+def detect_trees_deepforest(
     image,
-    sam_predictor,
-    confidence_threshold=0.3,
     model_path=None,
-    patch_size=400,
-    patch_overlap=0.05,
-    cache_dir=None,
-    batch_size=500,
+    tile_size=400,
+    tile_overlap=0.05,
+    confidence_threshold=0.3,
 ):
     """
-    Unified DeepForest + SAM pipeline that processes both on the SAME tiles.
-    This preserves image resolution for SAM (which downscales to 1024px internally).
+    Pass 1: Run DeepForest detection on 400px tiles.
 
     Args:
         image: RGB image as (H, W, 3) numpy array
-        sam_predictor: Initialized SamPredictor
-        confidence_threshold: Minimum confidence score for DeepForest detections
         model_path: Optional path to custom DeepForest model (.pth file)
-        patch_size: Size of each tile (default 400px)
-        patch_overlap: Overlap between tiles (default 0.05 = 5%)
-        cache_dir: Directory for caching masks (temp dir if None)
-        batch_size: Number of masks per cache file
+        tile_size: Size of each tile (default 400px - DeepForest's native)
+        tile_overlap: Overlap between tiles (default 0.05 = 5%)
+        confidence_threshold: Minimum confidence score for detections
 
     Returns:
-        cache_files: List of paths to cached mask files
-        all_bboxes: List of bounding boxes (global coordinates)
+        all_bboxes: List of bounding boxes in global coordinates [xmin, ymin, xmax, ymax]
         all_scores: List of confidence scores
     """
-    import pandas as pd
     import warnings
 
-    print("\n🌲🎯 Running unified DeepForest + SAM per-tile pipeline...")
+    print("\n🌲 Pass 1: DeepForest Detection...")
 
     # Initialize DeepForest model
     df_model = deepforest_main.deepforest()
 
     if model_path:
-        print(f"   Loading custom DeepForest model: {model_path}")
+        print(f"   Loading custom model: {model_path}")
         df_model.model.load_state_dict(torch.load(model_path, map_location="cpu"))
     else:
-        print("   Loading default DeepForest model from Hugging Face...")
+        print("   Loading default model from Hugging Face...")
         df_model.load_model("weecology/deepforest-tree")
 
     # Convert image to float32 for DeepForest
@@ -182,50 +173,36 @@ def detect_and_segment_per_tile(
         image_float = image
 
     h, w = image.shape[:2]
-    stride = int(patch_size * (1 - patch_overlap))
-
-    # Create cache directory
-    if cache_dir is None:
-        cache_dir = tempfile.mkdtemp(prefix="foxtrot_cache_")
-        print(f"   Created temp cache: {cache_dir}")
-    else:
-        cache_dir = Path(cache_dir)
-        cache_dir.mkdir(exist_ok=True, parents=True)
-    cache_dir = Path(cache_dir)
+    stride = int(tile_size * (1 - tile_overlap))
 
     # Calculate tile count
-    num_tiles_y = max(1, (h - patch_size) // stride + 1) if h > patch_size else 1
-    num_tiles_x = max(1, (w - patch_size) // stride + 1) if w > patch_size else 1
+    num_tiles_y = max(1, (h - tile_size) // stride + 1) if h > tile_size else 1
+    num_tiles_x = max(1, (w - tile_size) // stride + 1) if w > tile_size else 1
     total_tiles = num_tiles_y * num_tiles_x
 
     print(f"   Image size: {w}x{h}")
-    print(f"   Tile size: {patch_size}px, overlap: {int(patch_overlap * 100)}%")
-    print(f"   Processing {total_tiles} tiles (DeepForest → SAM per tile)\n")
+    print(f"   Tile size: {tile_size}px, overlap: {int(tile_overlap * 100)}%")
+    print(f"   Processing {total_tiles} tiles\n")
 
     # Suppress DeepForest warnings
     warnings.filterwarnings("ignore", message=".*image_path.*")
     warnings.filterwarnings("ignore", message=".*root_dir.*")
 
-    # Accumulate results across tiles
-    all_masks = []
     all_bboxes = []
     all_scores = []
-    cache_files = []
     tile_count = 0
-    tree_count = 0
 
     # Process tiles
-    y_starts = range(0, h, stride) if h > patch_size else [0]
-    x_starts = range(0, w, stride) if w > patch_size else [0]
+    y_starts = range(0, h, stride) if h > tile_size else [0]
+    x_starts = range(0, w, stride) if w > tile_size else [0]
 
-    for y_start in tqdm(list(y_starts), desc="   Tile rows"):
+    for y_start in tqdm(list(y_starts), desc="   DF tiles"):
         for x_start in x_starts:
-            y_end = min(y_start + patch_size, h)
-            x_end = min(x_start + patch_size, w)
+            y_end = min(y_start + tile_size, h)
+            x_end = min(x_start + tile_size, w)
 
             # Extract tile
             tile = image_float[y_start:y_end, x_start:x_end]
-            tile_rgb = image[y_start:y_end, x_start:x_end]  # uint8 for SAM
 
             # Skip very small edge tiles
             if tile.shape[0] < 200 or tile.shape[1] < 200:
@@ -233,7 +210,7 @@ def detect_and_segment_per_tile(
 
             tile_count += 1
 
-            # === STAGE 1: DeepForest on this tile ===
+            # Run DeepForest prediction
             try:
                 tile_preds = df_model.predict_image(image=tile)
             except Exception:
@@ -247,13 +224,133 @@ def detect_and_segment_per_tile(
             if len(tile_preds) == 0:
                 continue
 
-            # === STAGE 2: SAM on this tile with detected boxes ===
-            # Set SAM image to this tile (preserve full resolution)
+            # Convert local boxes to global coordinates
+            for _, row in tile_preds.iterrows():
+                global_box = [
+                    row["xmin"] + x_start,
+                    row["ymin"] + y_start,
+                    row["xmax"] + x_start,
+                    row["ymax"] + y_start,
+                ]
+                all_bboxes.append(global_box)
+                all_scores.append(row["score"])
+
+    warnings.filterwarnings("default")
+
+    print(f"\n✅ DeepForest: {tile_count} tiles, {len(all_bboxes)} detections")
+
+    return all_bboxes, all_scores
+
+
+def segment_trees_sam(
+    image,
+    sam_predictor,
+    bboxes,
+    scores,
+    tile_size=1024,
+    tile_overlap=0.0,
+    cache_dir=None,
+    batch_size=500,
+):
+    """
+    Pass 2: Run SAM segmentation on 1024px tiles with batched bboxes.
+
+    Args:
+        image: RGB image as (H, W, 3) numpy array (uint8)
+        sam_predictor: Initialized SamPredictor
+        bboxes: List of bounding boxes in global coordinates
+        scores: List of confidence scores
+        tile_size: Size of SAM tiles (default 1024px - SAM's native)
+        tile_overlap: Overlap between tiles (default 0.0)
+        cache_dir: Directory for caching masks (temp dir if None)
+        batch_size: Number of masks per cache file
+
+    Returns:
+        cache_files: List of paths to cached mask files
+        final_bboxes: List of bounding boxes (post-NMS)
+        final_scores: List of confidence scores (post-NMS)
+    """
+    print("\n🎯 Pass 2: SAM Segmentation...")
+
+    h, w = image.shape[:2]
+    stride = int(tile_size * (1 - tile_overlap))
+
+    # Create cache directory
+    if cache_dir is None:
+        cache_dir = tempfile.mkdtemp(prefix="foxtrot_cache_")
+        print(f"   Created temp cache: {cache_dir}")
+    else:
+        cache_dir = Path(cache_dir)
+        cache_dir.mkdir(exist_ok=True, parents=True)
+    cache_dir = Path(cache_dir)
+
+    # Calculate tile count
+    num_tiles_y = max(1, (h - tile_size) // stride + 1) if h > tile_size else 1
+    num_tiles_x = max(1, (w - tile_size) // stride + 1) if w > tile_size else 1
+    total_tiles = num_tiles_y * num_tiles_x
+
+    print(f"   Tile size: {tile_size}px (SAM native)")
+    print(f"   Processing {total_tiles} tiles with {len(bboxes)} boxes\n")
+
+    # Pre-compute box centers for tile assignment
+    box_centers = [((b[0] + b[2]) / 2, (b[1] + b[3]) / 2) for b in bboxes]
+
+    # Track which boxes have been processed
+    processed_boxes = set()
+    all_masks = []
+    all_processed_bboxes = []
+    all_processed_scores = []
+    cache_files = []
+
+    total_boxes = len(bboxes)
+    tiles_with_boxes = 0
+
+    # Process tiles
+    y_starts = range(0, h, stride) if h > tile_size else [0]
+    x_starts = range(0, w, stride) if w > tile_size else [0]
+
+    for y_start in tqdm(list(y_starts), desc="   SAM tiles"):
+        for x_start in x_starts:
+            y_end = min(y_start + tile_size, h)
+            x_end = min(x_start + tile_size, w)
+
+            # Find boxes whose CENTER falls within this tile
+            tile_box_indices = []
+            for i, (cx, cy) in enumerate(box_centers):
+                if i not in processed_boxes:
+                    if x_start <= cx < x_end and y_start <= cy < y_end:
+                        tile_box_indices.append(i)
+                        processed_boxes.add(i)
+
+            if not tile_box_indices:
+                continue
+
+            tiles_with_boxes += 1
+
+            # Extract tile
+            tile_rgb = image[y_start:y_end, x_start:x_end]
+
+            # Progress logging
+            pct = len(processed_boxes) / total_boxes * 100
+            print(
+                f"   Tile ({x_start},{y_start}): {len(tile_box_indices)} boxes "
+                f"| {len(processed_boxes)}/{total_boxes} total ({pct:.0f}%)"
+            )
+
+            # Set SAM image (expensive - done once per tile)
             sam_predictor.set_image(tile_rgb)
 
-            # Get local bounding boxes (relative to tile)
-            local_boxes = tile_preds[["xmin", "ymin", "xmax", "ymax"]].values
-            tile_scores = tile_preds["score"].values.tolist()
+            # Convert global boxes to local (tile-relative) coordinates
+            local_boxes = []
+            for i in tile_box_indices:
+                box = bboxes[i]
+                local_box = [
+                    max(0, box[0] - x_start),
+                    max(0, box[1] - y_start),
+                    min(tile_rgb.shape[1], box[2] - x_start),
+                    min(tile_rgb.shape[0], box[3] - y_start),
+                ]
+                local_boxes.append(local_box)
 
             # Transform boxes for SAM
             transformed_boxes = sam_predictor.transform.apply_boxes_torch(
@@ -263,7 +360,7 @@ def detect_and_segment_per_tile(
                 tile_rgb.shape[:2],
             )
 
-            # Run SAM prediction on tile
+            # Run SAM batch prediction
             try:
                 masks, _, _ = sam_predictor.predict_torch(
                     point_coords=None,
@@ -277,99 +374,146 @@ def detect_and_segment_per_tile(
                 print(f"⚠️  SAM failed on tile ({x_start}, {y_start}): {e}")
                 continue
 
-            # Convert local masks to global masks and store results
-            for i, (local_mask, local_box, score) in enumerate(
-                zip(tile_masks, local_boxes, tile_scores)
-            ):
-                # Create full-size mask
-                full_mask = np.zeros((h, w), dtype=bool)
-                full_mask[y_start:y_end, x_start:x_end] = local_mask
+            # Store results as SPARSE masks (tile region only, not full image)
+            for local_mask, box_idx in zip(tile_masks, tile_box_indices):
+                # Store sparse: (local_mask, tile_bounds) instead of full_mask
+                # This reduces memory from ~41MB to ~1MB per mask
+                all_masks.append(local_mask)  # Tile-sized, not full-image
+                all_processed_bboxes.append(bboxes[box_idx])
+                all_processed_scores.append(scores[box_idx])
 
-                # Convert local box to global coordinates
-                global_box = [
-                    local_box[0] + x_start,
-                    local_box[1] + y_start,
-                    local_box[2] + x_start,
-                    local_box[3] + y_start,
-                ]
+            # Store tile bounds for this batch of masks
+            # We track bounds per-mask by storing them alongside
+            tile_bounds = (y_start, y_end, x_start, x_end, h, w)
+            for _ in range(len(tile_masks)):
+                all_tile_bounds.append(tile_bounds)
 
-                all_masks.append(full_mask)
-                all_bboxes.append(global_box)
-                all_scores.append(score)
-                tree_count += 1
-
-            # Flush to disk periodically to avoid OOM
+            # Flush to disk periodically
             if len(all_masks) >= batch_size:
                 batch_file = cache_dir / f"batch_{len(cache_files):04d}.npz"
+                # Pack masks as object array since they may have different shapes
                 np.savez_compressed(
                     batch_file,
-                    masks=np.array(all_masks, dtype=bool),
-                    bboxes=np.array(all_bboxes, dtype=np.float32),
+                    masks=np.array(all_masks, dtype=object),
+                    bboxes=np.array(all_processed_bboxes, dtype=np.float32),
+                    bounds=np.array(all_tile_bounds, dtype=np.int32),
                 )
                 cache_files.append(batch_file)
-                file_size_mb = batch_file.stat().st_size / (1024**2)
-                print(f"   💾 Cached {len(all_masks)} masks ({file_size_mb:.1f}MB)")
+                mb = batch_file.stat().st_size / (1024**2)
+                print(f"   💾 Cached {len(all_masks)} masks ({mb:.1f}MB)")
                 all_masks = []
-                all_bboxes_for_cache = all_bboxes.copy()
-                all_bboxes = []  # Clear for next batch (but keep scores)
+                all_processed_bboxes = []
+                all_tile_bounds = []
 
-    # Flush remaining masks
+    # Flush remaining
     if len(all_masks) > 0:
         batch_file = cache_dir / f"batch_{len(cache_files):04d}.npz"
         np.savez_compressed(
             batch_file,
-            masks=np.array(all_masks, dtype=bool),
-            bboxes=np.array(all_bboxes, dtype=np.float32),
+            masks=np.array(all_masks, dtype=object),
+            bboxes=np.array(all_processed_bboxes, dtype=np.float32),
+            bounds=np.array(all_tile_bounds, dtype=np.int32),
         )
         cache_files.append(batch_file)
-        file_size_mb = batch_file.stat().st_size / (1024**2)
-        print(f"   💾 Cached final {len(all_masks)} masks ({file_size_mb:.1f}MB)")
+        mb = batch_file.stat().st_size / (1024**2)
+        print(f"   💾 Cached final {len(all_masks)} masks ({mb:.1f}MB)")
 
-    # Re-enable warnings
-    warnings.filterwarnings("default")
+    # Check for unprocessed boxes (edge cases)
+    unprocessed = len(bboxes) - len(processed_boxes)
+    if unprocessed > 0:
+        print(f"   ⚠️  {unprocessed} boxes not processed (outside tile bounds)")
 
-    print(f"\n✅ Processed {tile_count} tiles, found {tree_count} trees (before NMS)")
+    print(f"\n✅ SAM: {len(processed_boxes)} trees segmented")
     print(f"   Results cached in {len(cache_files)} files")
 
-    # Load all results from cache for NMS
-    all_masks_loaded = []
+    # Load bboxes for NMS
     all_bboxes_loaded = []
     for cf in cache_files:
         with np.load(cf) as data:
-            all_masks_loaded.extend(list(data["masks"]))
             all_bboxes_loaded.extend(data["bboxes"].tolist())
 
-    # Apply NMS to remove overlapping detections from tile boundaries
-    print(f"\n🔄 Applying NMS (IoU threshold=0.5)...")
-    keep_indices = apply_nms(all_bboxes_loaded, all_scores, iou_threshold=0.5)
+    # Apply NMS
+    print("\n🔄 Applying NMS (IoU=0.5, coverage=0.6)...")
+    keep_indices = apply_nms(all_bboxes_loaded, all_processed_scores, iou_threshold=0.5)
+    keep_set = set(keep_indices)
 
-    # Filter results
-    final_masks = [all_masks_loaded[i] for i in keep_indices]
-    final_bboxes = [all_bboxes_loaded[i] for i in keep_indices]
-    final_scores = [all_scores[i] for i in keep_indices]
-
-    removed_count = len(all_bboxes_loaded) - len(keep_indices)
-    print(f"   Removed {removed_count} overlapping detections")
+    removed = len(all_bboxes_loaded) - len(keep_indices)
+    print(f"   Removed {removed} overlapping detections")
     print(f"   Keeping {len(keep_indices)} unique trees")
 
-    # Clear old cache files and save filtered results
+    # Filter results
+    final_bboxes = [all_bboxes_loaded[i] for i in keep_indices]
+    final_scores = [all_processed_scores[i] for i in keep_indices]
+
+    # Stream masks to new cache files without loading all into memory
+    # Build mapping from global index to position in final output
+    keep_order = {idx: pos for pos, idx in enumerate(keep_indices)}
+
+    # Prepare output batches
+    new_cache_files = []
+    current_batch_masks = []
+    current_batch_bboxes = []
+    masks_written = 0
+
+    print("   Filtering and re-caching masks...")
+
+    global_idx = 0
+    for cf in cache_files:
+        with np.load(cf) as data:
+            masks = data["masks"]
+            for local_idx in range(len(masks)):
+                if global_idx in keep_set:
+                    # Get the position this mask should be in final output
+                    pos = keep_order[global_idx]
+                    current_batch_masks.append((pos, masks[local_idx]))
+                    current_batch_bboxes.append((pos, final_bboxes[pos]))
+
+                    # Flush batch when full (use smaller batch for memory)
+                    if len(current_batch_masks) >= batch_size:
+                        # Sort by position to maintain order
+                        current_batch_masks.sort(key=lambda x: x[0])
+                        current_batch_bboxes.sort(key=lambda x: x[0])
+
+                        batch_file = cache_dir / f"nms_{len(new_cache_files):04d}.npz"
+                        np.savez_compressed(
+                            batch_file,
+                            masks=np.array(
+                                [m for _, m in current_batch_masks], dtype=bool
+                            ),
+                            bboxes=np.array(
+                                [b for _, b in current_batch_bboxes], dtype=np.float32
+                            ),
+                        )
+                        new_cache_files.append(batch_file)
+                        masks_written += len(current_batch_masks)
+                        print(
+                            f"   💾 Saved batch {len(new_cache_files)}: {masks_written}/{len(keep_indices)} masks"
+                        )
+                        current_batch_masks = []
+                        current_batch_bboxes = []
+
+                global_idx += 1
+
+    # Flush remaining
+    if current_batch_masks:
+        current_batch_masks.sort(key=lambda x: x[0])
+        current_batch_bboxes.sort(key=lambda x: x[0])
+
+        batch_file = cache_dir / f"nms_{len(new_cache_files):04d}.npz"
+        np.savez_compressed(
+            batch_file,
+            masks=np.array([m for _, m in current_batch_masks], dtype=bool),
+            bboxes=np.array([b for _, b in current_batch_bboxes], dtype=np.float32),
+        )
+        new_cache_files.append(batch_file)
+        masks_written += len(current_batch_masks)
+        print(f"   💾 Saved final batch: {masks_written}/{len(keep_indices)} masks")
+
+    # Clear old cache files
     for old_file in cache_files:
         old_file.unlink(missing_ok=True)
 
-    cache_files = []
-    if len(final_masks) > 0:
-        # Save all filtered masks in batches
-        for batch_start in range(0, len(final_masks), batch_size):
-            batch_end = min(batch_start + batch_size, len(final_masks))
-            batch_file = cache_dir / f"nms_batch_{len(cache_files):04d}.npz"
-            np.savez_compressed(
-                batch_file,
-                masks=np.array(final_masks[batch_start:batch_end], dtype=bool),
-                bboxes=np.array(final_bboxes[batch_start:batch_end], dtype=np.float32),
-            )
-            cache_files.append(batch_file)
-
-    return cache_files, final_bboxes, final_scores
+    return new_cache_files, final_bboxes, final_scores
 
 
 def load_masks_from_cache(cache_files):
@@ -526,8 +670,8 @@ def create_visualization(image, cache_files, bboxes, output_dir, tif_stem):
     # Load masks one at a time from cache
     mask_generator = load_masks_from_cache(cache_files)
 
-    # Petrol blue
-    color = (33, 100, 119)
+    # Electric blue
+    color = (33, 240, 255)
 
     # Draw each detection
     for i, bbox in enumerate(bboxes):
@@ -606,14 +750,35 @@ def main(args):
 
     print(f"🖥️  Using device: {device}")
     sam.to(device=device)
+
+    # Compile SAM for faster inference (PyTorch 2.0+)
+    try:
+        sam = torch.compile(sam)
+        print("⚡ SAM compiled for faster inference")
+    except Exception as e:
+        print(f"⚠️  torch.compile() not available: {e}")
+
     sam_predictor = SamPredictor(sam)
 
-    # Run unified DeepForest + SAM per-tile pipeline
-    cache_files, valid_bboxes, valid_scores = detect_and_segment_per_tile(
+    # Pass 1: DeepForest detection at native 400px tiles
+    all_bboxes, all_scores = detect_trees_deepforest(
+        image,
+        model_path=args.deepforest_model,
+        tile_size=args.df_tile_size,
+        confidence_threshold=args.deepforest_confidence,
+    )
+
+    if len(all_bboxes) == 0:
+        print("\n❌ No trees detected by DeepForest. Exiting.")
+        return
+
+    # Pass 2: SAM segmentation at native 1024px tiles
+    cache_files, valid_bboxes, valid_scores = segment_trees_sam(
         image,
         sam_predictor,
-        confidence_threshold=args.deepforest_confidence,
-        model_path=args.deepforest_model,
+        all_bboxes,
+        all_scores,
+        tile_size=args.sam_tile_size,
         cache_dir=args.cache_dir,
         batch_size=args.batch_size,
     )
@@ -757,6 +922,22 @@ def parse_args():
         default=500,
         help="Number of trees to process per batch (default: 500). "
         "Lower values use less memory but may be slower",
+    )
+
+    ap.add_argument(
+        "--df_tile_size",
+        type=int,
+        default=400,
+        help="DeepForest tile size in pixels (default: 400). "
+        "DeepForest works best at 400px tiles.",
+    )
+
+    ap.add_argument(
+        "--sam_tile_size",
+        type=int,
+        default=1024,
+        help="SAM tile size in pixels (default: 1024). "
+        "SAM internally uses 1024x1024, so this matches its native resolution.",
     )
 
     ap.add_argument(
