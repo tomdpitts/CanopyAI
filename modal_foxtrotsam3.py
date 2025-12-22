@@ -260,7 +260,7 @@ def run_pipeline(
     print(f"   ✅ Image shape: {image.shape}, dtype: {image.dtype}", flush=True)
 
     # =========================================================================
-    # 2. DeepForest detection (same patch-based approach as foxtrot.py)
+    # 2. DeepForest detection
     # =========================================================================
     print("\n🌲 Running DeepForest detection...", flush=True)
     model = deepforest_main.deepforest()
@@ -272,43 +272,95 @@ def run_pipeline(
             model_path = f.name
         model.model.load_state_dict(torch.load(model_path, map_location="cpu"))
         print("   Using custom model", flush=True)
+        os.unlink(model_path)
     else:
         model.load_model("weecology/deepforest-tree")
         print("   Using pretrained model", flush=True)
 
-    # Move model to GPU for predict_tile
+    # Move model to GPU
     if torch.cuda.is_available():
         model.to("cuda")
         print("   Model moved to CUDA", flush=True)
 
-    # Use predict_tile with GPU batch strategy instead of manual patch loop
-    # dataloader_strategy='batch' loads entire image into GPU for parallel patch processing
-    print("   Running predict_tile with GPU batch strategy...", flush=True)
+    # Convert image to float32 for DeepForest
+    if image.dtype == np.uint8:
+        image_float = image.astype("float32")
+    else:
+        image_float = image
+
+    h, w = image.shape[:2]
+    tile_size = 400
+    tile_overlap = 0.05
+    stride = int(tile_size * (1 - tile_overlap))
+
+    # Calculate tile count
+    num_tiles_y = max(1, (h - tile_size) // stride + 1) if h > tile_size else 1
+    num_tiles_x = max(1, (w - tile_size) // stride + 1) if w > tile_size else 1
+    total_tiles = num_tiles_y * num_tiles_x
+
+    print(f"   Image size: {w}x{h}", flush=True)
+    print(
+        f"   Tile size: {tile_size}px, overlap: {int(tile_overlap * 100)}%", flush=True
+    )
+    print(f"   Processing {total_tiles} tiles", flush=True)
 
     import warnings
 
     warnings.filterwarnings("ignore", message=".*image_path.*")
     warnings.filterwarnings("ignore", message=".*root_dir.*")
 
-    # Save image to temp file for predict_tile (it needs a path)
-    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
-        import cv2
+    bboxes = []
+    scores = []
+    tile_count = 0
 
-        cv2.imwrite(f.name, cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
-        temp_image_path = f.name
+    # Process tiles (manual loop matching foxtrot.py)
+    y_starts = range(0, h, stride) if h > tile_size else [0]
+    x_starts = range(0, w, stride) if w > tile_size else [0]
 
-    predictions = model.predict_tile(
-        path=temp_image_path,
-        patch_size=400,
-        patch_overlap=0.05,
-        dataloader_strategy="single",  # One patch at a time on GPU (lower memory)
-    )
+    from tqdm import tqdm
 
-    # Clean up temp file
-    os.unlink(temp_image_path)
+    for y_start in tqdm(list(y_starts), desc="   DF tiles"):
+        for x_start in x_starts:
+            y_end = min(y_start + tile_size, h)
+            x_end = min(x_start + tile_size, w)
+
+            # Extract tile
+            tile = image_float[y_start:y_end, x_start:x_end]
+
+            # Skip very small edge tiles
+            if tile.shape[0] < 200 or tile.shape[1] < 200:
+                continue
+
+            tile_count += 1
+
+            # Run DeepForest prediction
+            try:
+                tile_preds = model.predict_image(image=tile)
+            except Exception:
+                continue
+
+            if tile_preds is None or len(tile_preds) == 0:
+                continue
+
+            # Filter by confidence (per tile, like foxtrot.py)
+            tile_preds = tile_preds[tile_preds["score"] >= deepforest_confidence]
+            if len(tile_preds) == 0:
+                continue
+
+            # Convert local boxes to global coordinates
+            for _, row in tile_preds.iterrows():
+                global_box = [
+                    row["xmin"] + x_start,
+                    row["ymin"] + y_start,
+                    row["xmax"] + x_start,
+                    row["ymax"] + y_start,
+                ]
+                bboxes.append(global_box)
+                scores.append(float(row["score"]))
+
     warnings.filterwarnings("default")
 
-    if predictions is None or len(predictions) == 0:
+    if len(bboxes) == 0:
         print("   ⚠️ No trees detected", flush=True)
         return {
             "geojson": json.dumps({"type": "FeatureCollection", "features": []}),
@@ -316,20 +368,8 @@ def run_pipeline(
             "stats": {"detected": 0, "segmented": 0, "features": 0},
         }
 
-    print(f"   Raw predictions: {len(predictions)}", flush=True)
     print(
-        f"   Score range: [{predictions['score'].min():.3f}, {predictions['score'].max():.3f}]",
-        flush=True,
-    )
-
-    # Filter by confidence
-    predictions = predictions[predictions["score"] >= deepforest_confidence]
-    bboxes = predictions[["xmin", "ymin", "xmax", "ymax"]].values.tolist()
-    scores = predictions["score"].values.tolist()
-
-    print(
-        f"   ✅ Detected {len(bboxes)} trees (conf >= {deepforest_confidence})",
-        flush=True,
+        f"\n   ✅ DeepForest: {tile_count} tiles, {len(bboxes)} detections", flush=True
     )
 
     # =========================================================================

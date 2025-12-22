@@ -11,7 +11,6 @@ This script implements a custom 2-stage model that:
 Usage:
     python foxtrot.py --image_path data/tcd/bin_liang/tcd_tile_WON.tif
 
-Author: CanopyAI
 """
 
 import argparse
@@ -137,7 +136,7 @@ def detect_trees_deepforest(
     model_path=None,
     tile_size=400,
     tile_overlap=0.05,
-    confidence_threshold=0.3,
+    confidence_threshold=0.35,
 ):
     """
     Pass 1: Run DeepForest detection on 400px tiles.
@@ -678,7 +677,7 @@ def save_results(
     }
 
     # Save GeoJSON
-    output_geojson_path = output_dir / f"{tif_stem}_deepforest_sam.geojson"
+    output_geojson_path = output_dir / f"{tif_stem}_canopyai.geojson"
     print(f"\n💾 Saving GeoJSON to {output_geojson_path}...")
     with open(output_geojson_path, "w") as f:
         json.dump(geojson, f, indent=2)
@@ -688,7 +687,7 @@ def save_results(
     return output_geojson_path, features
 
 
-def create_visualization(image, cache_files, bboxes, output_dir, tif_stem):
+def create_visualization(image, cache_files, bboxes, scores, output_dir, tif_stem):
     """
     Create visualization showing both bounding boxes and segmentation masks.
     Loads masks from cache to minimize memory usage.
@@ -697,6 +696,7 @@ def create_visualization(image, cache_files, bboxes, output_dir, tif_stem):
         image: RGB image
         cache_files: List of cache file paths containing masks
         bboxes: List of bounding boxes
+        scores: List of confidence scores
         output_dir: Output directory
         tif_stem: Stem name of input TIF file
     """
@@ -710,13 +710,42 @@ def create_visualization(image, cache_files, bboxes, output_dir, tif_stem):
     # Electric blue
     color = (33, 240, 255)
 
+    # Font settings for confidence labels
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.4
+    font_thickness = 1
+
     # Draw each detection
-    for i, bbox in enumerate(bboxes):
+    for i, (bbox, score) in enumerate(zip(bboxes, scores)):
         mask = next(mask_generator)
 
         # Draw bounding box (from DeepForest)
         xmin, ymin, xmax, ymax = [int(c) for c in bbox]
         cv2.rectangle(vis_image, (xmin, ymin), (xmax, ymax), color, 1)
+
+        # Draw confidence label above bbox
+        conf_text = f"{score * 100:.0f}%"
+        text_size = cv2.getTextSize(conf_text, font, font_scale, font_thickness)[0]
+        text_x = xmin
+        text_y = max(ymin - 4, text_size[1] + 2)
+
+        # Background rectangle for text readability
+        cv2.rectangle(
+            vis_image,
+            (text_x - 1, text_y - text_size[1] - 2),
+            (text_x + text_size[0] + 1, text_y + 2),
+            (0, 0, 0),
+            -1,
+        )
+        cv2.putText(
+            vis_image,
+            conf_text,
+            (text_x, text_y),
+            font,
+            font_scale,
+            color,
+            font_thickness,
+        )
 
         # Draw segmentation mask (from SAM)
         # Create colored mask overlay
@@ -735,7 +764,7 @@ def create_visualization(image, cache_files, bboxes, output_dir, tif_stem):
         cv2.drawContours(vis_image, contours, -1, color, 1)
 
     # Save visualization
-    vis_output_path = output_dir / f"{tif_stem}_deepforest_sam_visualization.png"
+    vis_output_path = output_dir / f"{tif_stem}_canopyai_visualization.png"
     cv2.imwrite(str(vis_output_path), cv2.cvtColor(vis_image, cv2.COLOR_RGB2BGR))
 
     print(f"✅ Saved visualization to {vis_output_path}")
@@ -885,7 +914,12 @@ def main(args):
     # Create visualization (loads masks from cache)
     vis_start = time.time()
     vis_path = create_visualization(
-        image, cache_files, valid_bboxes, Path(args.output_dir), tif_path.stem
+        image,
+        cache_files,
+        valid_bboxes,
+        valid_scores,
+        Path(args.output_dir),
+        tif_path.stem,
     )
     timings["Visualization"] = time.time() - vis_start
 
@@ -968,8 +1002,8 @@ def parse_args():
     ap.add_argument(
         "--deepforest_confidence",
         type=float,
-        default=0.3,
-        help="Minimum confidence threshold for DeepForest detections (default: 0.3)",
+        default=0.35,
+        help="Minimum confidence threshold for DeepForest detections (default: 0.35)",
     )
 
     ap.add_argument(
