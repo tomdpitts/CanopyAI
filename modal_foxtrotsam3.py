@@ -191,6 +191,95 @@ def mask_to_polygon(mask, simplify_tolerance=1.0):
     return poly
 
 
+def detect_shadows(image, threshold_ratio=0.7, blur_size=51):
+    """
+    Detect shadow regions using adaptive luminance thresholding.
+
+    Args:
+        image: RGB image as numpy array (H, W, C), uint8
+        threshold_ratio: Pixels below (local_mean * ratio) are shadows
+        blur_size: Gaussian blur kernel size for local mean
+
+    Returns:
+        Binary shadow mask (H, W), uint8 with 1=shadow, 0=non-shadow
+    """
+    import cv2
+
+    # Convert to LAB and extract luminance
+    lab = cv2.cvtColor(image, cv2.COLOR_RGB2LAB)
+    L = lab[:, :, 0].astype(np.float32)
+
+    # Compute local mean luminance
+    local_mean = cv2.GaussianBlur(L, (blur_size, blur_size), 0)
+
+    # Threshold: pixels darker than local mean are shadows
+    shadow_mask = (L < local_mean * threshold_ratio).astype(np.uint8)
+
+    # Morphological cleanup
+    kernel = np.ones((5, 5), np.uint8)
+    shadow_mask = cv2.morphologyEx(shadow_mask, cv2.MORPH_OPEN, kernel)
+    shadow_mask = cv2.morphologyEx(shadow_mask, cv2.MORPH_CLOSE, kernel)
+
+    return shadow_mask
+
+
+def get_shadow_negative_points(
+    shadow_mask,
+    bbox,
+    crop_coords,
+    max_points=3,
+):
+    """
+    Extract shadow centroid(s) within/near a bounding box as negative prompts.
+
+    Args:
+        shadow_mask: Full image shadow mask (H, W)
+        bbox: Original bounding box [xmin, ymin, xmax, ymax]
+        crop_coords: Crop coordinates (x1, y1, x2, y2) in original image
+        max_points: Maximum number of negative points to return
+
+    Returns:
+        List of (x, y) points in LOCAL crop coordinates for SAM,
+        normalized to [0, 1] range. Empty list if no shadows found.
+    """
+    crop_x1, crop_y1, crop_x2, crop_y2 = crop_coords
+    crop_h = crop_y2 - crop_y1
+    crop_w = crop_x2 - crop_x1
+
+    # Extract shadow mask for this crop region
+    crop_shadow = shadow_mask[crop_y1:crop_y2, crop_x1:crop_x2]
+
+    # Find shadow pixels
+    shadow_coords = np.argwhere(crop_shadow > 0)  # Returns (row, col) = (y, x)
+
+    if len(shadow_coords) == 0:
+        return []
+
+    # Sample points from shadow regions
+    # Strategy: use centroid + random samples
+    negative_points = []
+
+    # 1. Add centroid of all shadow pixels
+    centroid_y, centroid_x = shadow_coords.mean(axis=0)
+    negative_points.append(
+        (
+            centroid_x / crop_w,  # Normalize to [0, 1]
+            centroid_y / crop_h,
+        )
+    )
+
+    # 2. Add additional random samples if requested
+    if max_points > 1 and len(shadow_coords) > 1:
+        # Sample additional points
+        n_extra = min(max_points - 1, len(shadow_coords))
+        indices = np.random.choice(len(shadow_coords), n_extra, replace=False)
+        for idx in indices:
+            y, x = shadow_coords[idx]
+            negative_points.append((x / crop_w, y / crop_h))
+
+    return negative_points[:max_points]
+
+
 @app.function(
     image=sam3_image,
     gpu="A100-40GB",  # Need 40GB for DeepForest + SAM3 together
@@ -205,6 +294,7 @@ def run_pipeline(
     deepforest_confidence: float = 0.3,
     enhance_contrast_enabled: bool = False,
     saturation_boost: int = 0,
+    shadow_negative_prompts: bool = False,
 ) -> dict:
     """
     Run full DeepForest + SAM3 pipeline on Modal GPU.
@@ -216,6 +306,8 @@ def run_pipeline(
         deepforest_confidence: Confidence threshold for DeepForest
         enhance_contrast_enabled: If True, enhance contrast by 20% before SAM3
         saturation_boost: Percentage to boost saturation (0 = disabled)
+        shadow_negative_prompts: If True, detect shadows and inject as negative
+            point prompts to SAM3 (helps exclude shadows from tree masks)
 
     Returns:
         dict with keys:
@@ -394,6 +486,14 @@ def run_pipeline(
         print(f"   🎨 Boosting saturation by {saturation_boost}%...", flush=True)
         image = enhance_saturation(image, boost_percent=saturation_boost)
 
+    # Compute shadow mask if negative prompts enabled
+    shadow_mask = None
+    if shadow_negative_prompts:
+        print("   🌑 Computing shadow mask for negative prompting...", flush=True)
+        shadow_mask = detect_shadows(image)
+        shadow_coverage = shadow_mask.sum() / shadow_mask.size * 100
+        print(f"   Shadow coverage: {shadow_coverage:.1f}%", flush=True)
+
     # Get image dimensions for mask mapping
     img_h, img_w = image.shape[:2]
 
@@ -471,7 +571,17 @@ def run_pipeline(
                 h = (local_ymax - local_ymin) / crop_h
                 normalized_box = [cx, cy, w, h]
 
-                # 5. Run SAM3 on crop with box prompt
+                # 5. Get shadow negative points if enabled
+                negative_points = []
+                if shadow_mask is not None:
+                    negative_points = get_shadow_negative_points(
+                        shadow_mask,
+                        bbox,
+                        (crop_x1, crop_y1, crop_x2, crop_y2),
+                        max_points=3,
+                    )
+
+                # 6. Run SAM3 on crop with box prompt + negative points
                 if text_prompt is not None:
                     state = processor.set_text_prompt(
                         prompt=text_prompt, state=crop_state
@@ -482,6 +592,12 @@ def run_pipeline(
                 else:
                     state = processor.add_geometric_prompt(
                         box=normalized_box, label=True, state=crop_state
+                    )
+
+                # Add negative points to exclude shadows
+                for pt in negative_points:
+                    state = processor.add_geometric_prompt(
+                        point=list(pt), label=False, state=state
                     )
 
                 # 6. Extract mask and map back to original coords

@@ -68,6 +68,36 @@ def load_image_from_tif(tif_path):
     return image, crs, transform, bounds
 
 
+def detect_shadows(image, threshold_ratio=0.7, blur_size=51):
+    """
+    Detect shadow regions using adaptive luminance thresholding.
+
+    Args:
+        image: RGB image as numpy array (H, W, C), uint8
+        threshold_ratio: Pixels below (local_mean * ratio) are shadows
+        blur_size: Gaussian blur kernel size for local mean
+
+    Returns:
+        Binary shadow mask (H, W), uint8 with 1=shadow, 0=non-shadow
+    """
+    # Convert to LAB and extract luminance
+    lab = cv2.cvtColor(image, cv2.COLOR_RGB2LAB)
+    L = lab[:, :, 0].astype(np.float32)
+
+    # Compute local mean luminance
+    local_mean = cv2.GaussianBlur(L, (blur_size, blur_size), 0)
+
+    # Threshold: pixels darker than local mean are shadows
+    shadow_mask = (L < local_mean * threshold_ratio).astype(np.uint8)
+
+    # Morphological cleanup
+    kernel = np.ones((5, 5), np.uint8)
+    shadow_mask = cv2.morphologyEx(shadow_mask, cv2.MORPH_OPEN, kernel)
+    shadow_mask = cv2.morphologyEx(shadow_mask, cv2.MORPH_CLOSE, kernel)
+
+    return shadow_mask
+
+
 def compute_iou(box1, box2):
     """Compute Intersection over Union between two boxes [xmin, ymin, xmax, ymax]."""
     x1 = max(box1[0], box2[0])
@@ -1059,6 +1089,13 @@ def parse_args():
         action="store_true",
         help="Use VLM (Moondream 2) to filter shadow false positives. "
         "Requires: pip install moondream",
+    )
+
+    ap.add_argument(
+        "--shadow_negative_prompts",
+        action="store_true",
+        help="Detect shadows and inject as negative points to SAM, "
+        "excluding shadow regions from tree masks.",
     )
 
     return ap.parse_args()

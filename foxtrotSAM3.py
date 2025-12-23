@@ -78,6 +78,12 @@ def parse_args():
         help="Percentage to boost color saturation (e.g., 20 for 20%% increase)",
     )
 
+    ap.add_argument(
+        "--shadow_negative_prompts",
+        action="store_true",
+        help="Detect shadows and inject as negative points to exclude from masks",
+    )
+
     return ap.parse_args()
 
 
@@ -134,6 +140,7 @@ def main():
             deepforest_confidence=args.deepforest_confidence,
             enhance_contrast_enabled=args.enhance_contrast,
             saturation_boost=args.saturation_boost,
+            shadow_negative_prompts=args.shadow_negative_prompts,
         )
 
     # Save results locally
