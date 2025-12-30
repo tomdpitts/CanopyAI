@@ -98,10 +98,11 @@ def train_model(
                 param.requires_grad = False
 
             d_out, d_in = frozen_layer.weight.shape
+            device = frozen_layer.weight.device
 
-            # Low-rank matrices
-            self.lora_A = nn.Parameter(torch.zeros(r, d_in))
-            self.lora_B = nn.Parameter(torch.zeros(d_out, r))
+            # Low-rank matrices - create on same device as frozen layer
+            self.lora_A = nn.Parameter(torch.zeros(r, d_in, device=device))
+            self.lora_B = nn.Parameter(torch.zeros(d_out, r, device=device))
 
             # Initialize: A with Kaiming, B with zeros
             nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
