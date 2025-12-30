@@ -518,15 +518,80 @@ def train_model(
     print(f"✅ Baseline IoU: {baseline_iou:.4f}")
 
     # =========================================================================
-    # Training loop
+    # Helper to get LoRA state dict
     # =========================================================================
 
-    print(f"\n🚀 Training {mode} mode (patience={patience})...")
+    def get_lora_state(sam):
+        """Extract LoRA weights from encoder for saving."""
+        lora_state = {}
+        for idx, block in enumerate(sam.image_encoder.blocks):
+            if hasattr(block.attn.qkv, "lora_A"):
+                lora_state[f"block{idx}.attn.qkv.lora_A"] = (
+                    block.attn.qkv.lora_A.data.cpu()
+                )
+                lora_state[f"block{idx}.attn.qkv.lora_B"] = (
+                    block.attn.qkv.lora_B.data.cpu()
+                )
+            if hasattr(block.mlp.lin1, "lora_A"):
+                lora_state[f"block{idx}.mlp.lin1.lora_A"] = (
+                    block.mlp.lin1.lora_A.data.cpu()
+                )
+                lora_state[f"block{idx}.mlp.lin1.lora_B"] = (
+                    block.mlp.lin1.lora_B.data.cpu()
+                )
+        return lora_state
+
+    def load_lora_state(sam, lora_state, device):
+        """Load LoRA weights into encoder."""
+        for idx, block in enumerate(sam.image_encoder.blocks):
+            if f"block{idx}.attn.qkv.lora_A" in lora_state:
+                block.attn.qkv.lora_A.data = lora_state[
+                    f"block{idx}.attn.qkv.lora_A"
+                ].to(device)
+                block.attn.qkv.lora_B.data = lora_state[
+                    f"block{idx}.attn.qkv.lora_B"
+                ].to(device)
+            if f"block{idx}.mlp.lin1.lora_A" in lora_state:
+                block.mlp.lin1.lora_A.data = lora_state[
+                    f"block{idx}.mlp.lin1.lora_A"
+                ].to(device)
+                block.mlp.lin1.lora_B.data = lora_state[
+                    f"block{idx}.mlp.lin1.lora_B"
+                ].to(device)
+
+    # =========================================================================
+    # Check for existing checkpoint to resume from
+    # =========================================================================
+
+    checkpoint_path = output_dir / "checkpoint.pth"
+    start_epoch = 1
     best_iou = 0
     epochs_without_improvement = 0
     history = []
 
-    for epoch in range(1, epochs + 1):
+    if checkpoint_path.exists():
+        print("\n� Found checkpoint, resuming training...")
+        ckpt = torch.load(checkpoint_path, map_location=device)
+        sam.mask_decoder.load_state_dict(ckpt["mask_decoder"])
+        sam.prompt_encoder.load_state_dict(ckpt["prompt_encoder"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        scheduler.load_state_dict(ckpt["scheduler"])
+        start_epoch = ckpt["epoch"] + 1
+        best_iou = ckpt["best_iou"]
+        epochs_without_improvement = ckpt["epochs_without_improvement"]
+        history = ckpt.get("history", [])
+        baseline_iou = ckpt.get("baseline_iou", baseline_iou)
+        if mode == "adaptive" and "lora" in ckpt:
+            load_lora_state(sam, ckpt["lora"], device)
+        print(f"   Resuming from epoch {start_epoch}, best IoU: {best_iou:.4f}")
+    else:
+        print(f"\n🚀 Training {mode} mode (patience={patience})...")
+
+    # =========================================================================
+    # Training loop
+    # =========================================================================
+
+    for epoch in range(start_epoch, epochs + 1):
         sam.train()
         # Keep encoder in eval mode (frozen)
         sam.image_encoder.eval()
@@ -705,6 +770,25 @@ def train_model(
             if epochs_without_improvement >= patience:
                 print(f"\n⏹️  Early stopping: no improvement for {patience} epochs")
                 break
+
+        # Periodic checkpoint (every 5 epochs) for crash recovery
+        if epoch % 5 == 0:
+            periodic_ckpt = {
+                "epoch": epoch,
+                "best_iou": best_iou,
+                "baseline_iou": baseline_iou,
+                "epochs_without_improvement": epochs_without_improvement,
+                "mask_decoder": sam.mask_decoder.state_dict(),
+                "prompt_encoder": sam.prompt_encoder.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "history": history,
+            }
+            if mode == "adaptive":
+                periodic_ckpt["lora"] = get_lora_state(sam)
+            torch.save(periodic_ckpt, checkpoint_path)
+            data_volume.commit()  # Persist to volume
+            print(f"  💾 Checkpoint saved (epoch {epoch})")
 
     # Save final model
     final_checkpoint = {
