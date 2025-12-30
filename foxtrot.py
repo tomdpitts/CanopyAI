@@ -395,31 +395,79 @@ def segment_trees_sam(
                 tile_rgb.shape[:2],
             )
 
-            # Run SAM batch prediction
+            # Run SAM batch prediction with multiple mask options
             try:
-                masks, _, _ = sam_predictor.predict_torch(
+                masks, iou_preds, _ = sam_predictor.predict_torch(
                     point_coords=None,
                     point_labels=None,
                     boxes=transformed_boxes,
-                    multimask_output=False,
+                    multimask_output=True,  # Get 3 mask candidates per box
                 )
-                # masks: (N, 1, tile_H, tile_W) -> (N, tile_H, tile_W)
-                tile_masks = masks.cpu().numpy().squeeze(1)
+                # masks: (N, 3, tile_H, tile_W)
+                all_masks_np = masks.cpu().numpy()
             except Exception as e:
                 print(f"⚠️  SAM failed on tile ({x_start}, {y_start}): {e}")
                 continue
 
-            # Store results as SPARSE masks
-            for local_mask, box_idx in zip(tile_masks, tile_box_indices):
-                all_masks.append(local_mask)
+            # For each box, select the mask with best overlap with bbox
+            tile_h, tile_w = tile_rgb.shape[:2]
+            mask_h, mask_w = all_masks_np.shape[2], all_masks_np.shape[3]
+            scale_x = mask_w / tile_w
+            scale_y = mask_h / tile_h
+
+            for mask_idx, (box_idx, local_box) in enumerate(
+                zip(tile_box_indices, local_boxes)
+            ):
+                x1 = int(local_box[0] * scale_x)
+                y1 = int(local_box[1] * scale_y)
+                x2 = int(local_box[2] * scale_x)
+                y2 = int(local_box[3] * scale_y)
+
+                # Clamp to mask bounds
+                y1_c, x1_c = max(0, y1), max(0, x1)
+                y2_c, x2_c = min(mask_h, y2), min(mask_w, x2)
+
+                # Select mask with highest overlap with bbox
+                best_mask = None
+                best_overlap = -1
+                for m_idx in range(all_masks_np.shape[1]):
+                    candidate = all_masks_np[mask_idx, m_idx]
+                    overlap = candidate[y1_c:y2_c, x1_c:x2_c].sum()
+                    if overlap > best_overlap:
+                        best_overlap = overlap
+                        best_mask = candidate
+
+                if best_mask is None or best_overlap == 0:
+                    continue
+
+                # Isolate only the connected component that overlaps with bbox
+                # (finetuned model predicts multiple trees, we want just the one)
+                mask_uint8 = best_mask.astype(np.uint8)
+                num_labels, labels = cv2.connectedComponents(mask_uint8)
+
+                # Find which component overlaps with bbox
+                bbox_labels = labels[y1_c:y2_c, x1_c:x2_c]
+                overlapping_labels = set(bbox_labels.flatten()) - {0}
+
+                if not overlapping_labels:
+                    continue
+
+                # Keep only the largest overlapping component
+                best_label = None
+                best_size = 0
+                for lbl in overlapping_labels:
+                    size = (labels == lbl).sum()
+                    if size > best_size:
+                        best_size = size
+                        best_label = lbl
+
+                # Create filtered mask with only the selected component
+                filtered_mask = labels == best_label
+
+                all_masks.append(filtered_mask)
                 all_processed_bboxes.append(bboxes[box_idx])
                 all_processed_scores.append(scores[box_idx])
-
-            # Store tile bounds for sparse mask reconstruction
-            # bounds = (y_start, y_end, x_start, x_end, h, w)
-            tile_bounds = (y_start, y_end, x_start, x_end, h, w)
-            for _ in range(len(tile_masks)):
-                all_tile_bounds.append(tile_bounds)
+                all_tile_bounds.append((y_start, y_end, x_start, x_end, h, w))
 
             # Flush to disk periodically
             if len(all_masks) >= batch_size:
@@ -457,6 +505,7 @@ def segment_trees_sam(
         mb = batch_file.stat().st_size / (1024**2)
         print(f"   💾 Cached final {len(all_masks)} masks ({mb:.1f}MB)")
 
+    # Results summary
     # Check for unprocessed boxes (edge cases)
     unprocessed = len(bboxes) - len(processed_boxes)
     if unprocessed > 0:
@@ -489,18 +538,18 @@ def segment_trees_sam(
     final_bboxes = [all_bboxes_loaded[i] for i in keep_indices]
     final_scores = [all_processed_scores[i] for i in keep_indices]
 
-    # Stream sparse masks to new cache files
+    # Stream sparse masks to new cache files (memory-efficient)
     # Build mapping from global index to position in final output
     keep_order = {idx: pos for pos, idx in enumerate(keep_indices)}
 
-    # Prepare output batches
+    print("   Filtering and re-caching sparse masks...")
+
+    # Streaming approach: read and write in batches
     new_cache_files = []
     current_batch_masks = []
     current_batch_bboxes = []
     current_batch_bounds = []
     masks_written = 0
-
-    print("   Filtering and re-caching sparse masks...")
 
     global_idx = 0
     for cf in cache_files:
@@ -509,7 +558,6 @@ def segment_trees_sam(
             bounds = data["bounds"]
             for local_idx in range(len(masks)):
                 if global_idx in keep_set:
-                    # Get the position this mask should be in final output
                     pos = keep_order[global_idx]
                     current_batch_masks.append((pos, masks[local_idx]))
                     current_batch_bboxes.append((pos, final_bboxes[pos]))
@@ -517,16 +565,14 @@ def segment_trees_sam(
 
                     # Flush batch when full
                     if len(current_batch_masks) >= batch_size:
-                        # Sort by position to maintain order
+                        # Sort by position within batch
                         current_batch_masks.sort(key=lambda x: x[0])
                         current_batch_bboxes.sort(key=lambda x: x[0])
                         current_batch_bounds.sort(key=lambda x: x[0])
 
                         batch_file = cache_dir / f"nms_{len(new_cache_files):04d}.npz"
-                        # Create object array for variable-shaped masks
-                        masks_list = [m for _, m in current_batch_masks]
-                        masks_arr = np.empty(len(masks_list), dtype=object)
-                        for i, m in enumerate(masks_list):
+                        masks_arr = np.empty(len(current_batch_masks), dtype=object)
+                        for i, (_, m) in enumerate(current_batch_masks):
                             masks_arr[i] = m
                         np.savez_compressed(
                             batch_file,
@@ -541,7 +587,8 @@ def segment_trees_sam(
                         new_cache_files.append(batch_file)
                         masks_written += len(current_batch_masks)
                         print(
-                            f"   💾 Saved batch {len(new_cache_files)}: {masks_written}/{len(keep_indices)}"
+                            f"   💾 Saved batch {len(new_cache_files)}: "
+                            f"{masks_written}/{len(keep_indices)}"
                         )
                         current_batch_masks = []
                         current_batch_bboxes = []
@@ -556,9 +603,8 @@ def segment_trees_sam(
         current_batch_bounds.sort(key=lambda x: x[0])
 
         batch_file = cache_dir / f"nms_{len(new_cache_files):04d}.npz"
-        masks_list = [m for _, m in current_batch_masks]
-        masks_arr = np.empty(len(masks_list), dtype=object)
-        for i, m in enumerate(masks_list):
+        masks_arr = np.empty(len(current_batch_masks), dtype=object)
+        for i, (_, m) in enumerate(current_batch_masks):
             masks_arr[i] = m
         np.savez_compressed(
             batch_file,
@@ -717,7 +763,9 @@ def save_results(
     return output_geojson_path, features
 
 
-def create_visualization(image, cache_files, bboxes, scores, output_dir, tif_stem):
+def create_visualization(
+    image, cache_files, bboxes, scores, output_dir, tif_stem, smooth_masks=False
+):
     """
     Create visualization showing both bounding boxes and segmentation masks.
     Loads masks from cache to minimize memory usage.
@@ -729,6 +777,7 @@ def create_visualization(image, cache_files, bboxes, scores, output_dir, tif_ste
         scores: List of confidence scores
         output_dir: Output directory
         tif_stem: Stem name of input TIF file
+        smooth_masks: Apply morphological smoothing to noisy masks
     """
     print("\n🎨 Creating visualization...")
 
@@ -737,8 +786,9 @@ def create_visualization(image, cache_files, bboxes, scores, output_dir, tif_ste
     # Load masks one at a time from cache
     mask_generator = load_masks_from_cache(cache_files)
 
-    # Electric blue
-    color = (33, 240, 255)
+    # Colors
+    bbox_color = (33, 240, 255)  # Electric blue for bboxes
+    polygon_color = (11, 89, 214)  # Steel blue for polygons
 
     # Font settings for confidence labels
     font = cv2.FONT_HERSHEY_SIMPLEX
@@ -751,7 +801,7 @@ def create_visualization(image, cache_files, bboxes, scores, output_dir, tif_ste
 
         # Draw bounding box (from DeepForest)
         xmin, ymin, xmax, ymax = [int(c) for c in bbox]
-        cv2.rectangle(vis_image, (xmin, ymin), (xmax, ymax), color, 1)
+        cv2.rectangle(vis_image, (xmin, ymin), (xmax, ymax), bbox_color, 1)
 
         # Draw confidence label above bbox
         conf_text = f"{score * 100:.0f}%"
@@ -773,14 +823,14 @@ def create_visualization(image, cache_files, bboxes, scores, output_dir, tif_ste
             (text_x, text_y),
             font,
             font_scale,
-            color,
+            bbox_color,
             font_thickness,
         )
 
         # Draw segmentation mask (from SAM)
         # Create colored mask overlay
         mask_colored = np.zeros_like(vis_image)
-        mask_colored[mask] = color
+        mask_colored[mask] = polygon_color
 
         # Blend mask with image (alpha=0 means no fill, only contours)
         alpha = 0
@@ -788,10 +838,17 @@ def create_visualization(image, cache_files, bboxes, scores, output_dir, tif_ste
 
         # Draw mask contour
         mask_uint8 = mask.astype(np.uint8) * 255
+
+        # Optional: Smooth noisy masks from finetuned models
+        if smooth_masks:
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+            mask_uint8 = cv2.morphologyEx(mask_uint8, cv2.MORPH_CLOSE, kernel)
+            mask_uint8 = cv2.morphologyEx(mask_uint8, cv2.MORPH_OPEN, kernel)
+
         contours, _ = cv2.findContours(
             mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
         )
-        cv2.drawContours(vis_image, contours, -1, color, 1)
+        cv2.drawContours(vis_image, contours, -1, polygon_color, 1)
 
     # Save visualization
     vis_output_path = output_dir / f"{tif_stem}_canopyai_visualization.png"
@@ -832,6 +889,21 @@ def main(args):
         )
 
     sam = sam_model_registry[args.sam_model](checkpoint=args.sam_checkpoint)
+
+    # Optional: Load finetuned decoder weights
+    if args.sam_finetuned_decoder:
+        print(f"🎯 Loading finetuned decoder from {args.sam_finetuned_decoder}...")
+        if not Path(args.sam_finetuned_decoder).exists():
+            raise FileNotFoundError(
+                f"❌ Finetuned decoder not found: {args.sam_finetuned_decoder}"
+            )
+        state = torch.load(args.sam_finetuned_decoder, map_location="cpu")
+        sam.mask_decoder.load_state_dict(state["mask_decoder"])
+        if "prompt_encoder" in state:
+            sam.prompt_encoder.load_state_dict(state["prompt_encoder"])
+        mode = state.get("mode", "unknown")
+        iou = state.get("best_iou", state.get("final_iou", "?"))
+        print(f"   Mode: {mode}, IoU: {iou}")
 
     # Auto-detect device
     if args.device == "auto":
@@ -874,19 +946,37 @@ def main(args):
         print("\n❌ No trees detected by DeepForest. Exiting.")
         return
 
-    # Pass 2: SAM segmentation at native 1024px tiles (includes NMS)
+    # Apply NMS immediately to remove duplicates
+    print(f"\n🔄 Applying NMS to {len(all_bboxes)} detections...")
+    keep_indices = apply_nms(
+        all_bboxes, all_scores, iou_threshold=0.5, coverage_threshold=0.5
+    )
+    valid_bboxes = [all_bboxes[i] for i in keep_indices]
+    valid_scores = [all_scores[i] for i in keep_indices]
+
+    removed = len(all_bboxes) - len(valid_bboxes)
+    print(f"   Removed {removed} overlapping detections")
+    print(f"   Keeping {len(valid_bboxes)} unique trees")
+
+    # Debug: limit to single box
+    if args.debug_single_box and len(valid_bboxes) > 0:
+        print("\n⚠️  DEBUG: Limiting to single bbox")
+        valid_bboxes = valid_bboxes[:1]
+        valid_scores = valid_scores[:1]
+
+    # Pass 2: SAM segmentation
     sam_start = time.time()
     cache_files, valid_bboxes, valid_scores = segment_trees_sam(
         image,
         sam_predictor,
-        all_bboxes,
-        all_scores,
+        valid_bboxes,
+        valid_scores,
         tile_size=args.sam_tile_size,
         tile_overlap=args.sam_tile_overlap,
         cache_dir=args.cache_dir,
         batch_size=args.batch_size,
     )
-    timings["SAM + NMS"] = time.time() - sam_start
+    timings["SAM"] = time.time() - sam_start
 
     if len(valid_bboxes) == 0:
         print("\n❌ No trees detected or segmented. Exiting.")
@@ -950,6 +1040,7 @@ def main(args):
         valid_scores,
         Path(args.output_dir),
         tif_path.stem,
+        smooth_masks=args.smooth_masks,
     )
     timings["Visualization"] = time.time() - vis_start
 
@@ -1019,6 +1110,14 @@ def parse_args():
         default="vit_b",
         choices=["vit_b", "vit_l", "vit_h"],
         help="SAM model type (default: vit_b)",
+    )
+
+    ap.add_argument(
+        "--sam_finetuned_decoder",
+        type=str,
+        default=None,
+        help="Path to finetuned SAM decoder weights (.pth). "
+        "If provided, loads finetuned mask decoder and prompt encoder.",
     )
 
     ap.add_argument(
@@ -1096,6 +1195,19 @@ def parse_args():
         action="store_true",
         help="Detect shadows and inject as negative points to SAM, "
         "excluding shadow regions from tree masks.",
+    )
+
+    ap.add_argument(
+        "--smooth_masks",
+        action="store_true",
+        help="Apply morphological smoothing to mask contours. "
+        "Reduces jagged edges from finetuned models.",
+    )
+
+    ap.add_argument(
+        "--debug_single_box",
+        action="store_true",
+        help="Debug: limit to single bbox to inspect SAM output.",
     )
 
     return ap.parse_args()

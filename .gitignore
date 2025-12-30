@@ -16,7 +16,7 @@ archive*
 *.sif
 canopyai.tar.gz
 .DS_Store
-won003
+won003*
 won003_sam
 BUILD_ON_HPC.md
 
