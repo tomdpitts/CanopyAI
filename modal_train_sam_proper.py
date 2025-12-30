@@ -1,15 +1,20 @@
 """
 Modal Deployment: Proper SAM Finetuning with Box Prompts.
 
-Freezes SAM's ViT encoder and trains only the mask decoder + prompt encoder.
+Key features:
+- Per-box GT extraction: Uses connected components to get the single tree
+  crown that intersects each bounding box (fixes prompt-ignoring issue)
+- Shadow-canopy dual supervision for heuristic/adaptive modes
+
 Supports three training modes:
-- unguided: DiceBCE on canopy only
-- heuristic: DiceBCE on canopy + shadow penalty
-- adaptive: Multi-task with encoder fine-tuning (Phase 2)
+- unguided: DiceBCE on canopy only (frozen encoder)
+- heuristic: DiceBCE on canopy + shadow penalty (frozen encoder)
+- adaptive: DiceBCE + shadow penalty with LoRA-adapted encoder
 
 Usage:
     modal run modal_train_sam_proper.py --mode unguided --seed 42
     modal run modal_train_sam_proper.py --mode heuristic --seed 42
+    modal run modal_train_sam_proper.py --mode adaptive --seed 42
 """
 
 import modal
@@ -48,9 +53,12 @@ def train_model(
     lr: float = 1e-4,
     lambda_shadow: float = 0.3,
     seed: int = 42,
+    patience: int = 10,
 ):
     """Train SAM decoder on Modal GPU."""
+    import math
     import torch
+    import torch.nn as nn
     import torch.nn.functional as F
     import torch.optim as optim
     from torch.utils.data import Dataset, DataLoader
@@ -67,6 +75,66 @@ def train_model(
     torch.manual_seed(seed)
     print(f"Mode: {mode}, Epochs: {epochs}, Seed: {seed}")
     print(f"Device: cuda ({torch.cuda.get_device_name(0)})")
+
+    # =========================================================================
+    # LoRA (Low-Rank Adaptation) for encoder fine-tuning
+    # =========================================================================
+
+    class LoRALayer(nn.Module):
+        """Low-Rank Adaptation layer.
+
+        Adds trainable rank decomposition: W' = W + BA
+        where W is frozen, and B, A are trainable with rank r.
+        """
+
+        def __init__(self, frozen_layer, r=8, alpha=16):
+            super().__init__()
+            self.frozen_layer = frozen_layer
+            self.r = r
+            self.alpha = alpha
+
+            # Freeze original weights
+            for param in frozen_layer.parameters():
+                param.requires_grad = False
+
+            d_out, d_in = frozen_layer.weight.shape
+
+            # Low-rank matrices
+            self.lora_A = nn.Parameter(torch.zeros(r, d_in))
+            self.lora_B = nn.Parameter(torch.zeros(d_out, r))
+
+            # Initialize: A with Kaiming, B with zeros
+            nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+            nn.init.zeros_(self.lora_B)
+
+            self.scaling = alpha / r
+
+        def forward(self, x):
+            original = self.frozen_layer(x)
+            lora_out = (x @ self.lora_A.T) @ self.lora_B.T
+            return original + lora_out * self.scaling
+
+    def add_lora_to_encoder(sam, r=8, alpha=16):
+        """Add LoRA adapters to SAM's ViT encoder attention and MLP.
+
+        Returns list of LoRA parameters for the optimizer.
+        """
+        lora_params = []
+
+        for block in sam.image_encoder.blocks:
+            # Adapt QKV projection in attention
+            if hasattr(block.attn, "qkv"):
+                lora_qkv = LoRALayer(block.attn.qkv, r=r, alpha=alpha)
+                block.attn.qkv = lora_qkv
+                lora_params.extend([lora_qkv.lora_A, lora_qkv.lora_B])
+
+            # Adapt MLP first layer
+            if hasattr(block.mlp, "lin1"):
+                lora_lin1 = LoRALayer(block.mlp.lin1, r=r, alpha=alpha)
+                block.mlp.lin1 = lora_lin1
+                lora_params.extend([lora_lin1.lora_A, lora_lin1.lora_B])
+
+        return lora_params
 
     # =========================================================================
     # Download SAM checkpoint if needed
@@ -95,19 +163,118 @@ def train_model(
     sam = sam_model_registry["vit_b"](checkpoint=str(sam_checkpoint))
     sam.to(device)
 
-    # Freeze image encoder
-    print("❄️  Freezing image encoder (86M params)...")
-    for param in sam.image_encoder.parameters():
-        param.requires_grad = False
+    # Mode-specific encoder configuration
+    lora_params = []
+    if mode == "adaptive":
+        # Add LoRA adapters to encoder (keeps pretrained weights frozen)
+        print("🔧 Adding LoRA adapters to encoder...")
+        lora_params = add_lora_to_encoder(sam, r=8, alpha=16)
+        print(f"   Added {len(lora_params)} LoRA parameter tensors")
+    else:
+        # Freeze image encoder entirely for unguided/heuristic modes
+        print("❄️  Freezing image encoder (86M params)...")
+        for param in sam.image_encoder.parameters():
+            param.requires_grad = False
 
     # Count trainable params
     trainable = sum(p.numel() for p in sam.parameters() if p.requires_grad)
+    trainable += sum(p.numel() for p in lora_params)  # LoRA params
     total = sum(p.numel() for p in sam.parameters())
     print(f"   Trainable: {trainable:,} / {total:,} params")
 
     # =========================================================================
     # Dataset
     # =========================================================================
+
+    # =========================================================================
+    # Helper functions for per-tree mask extraction
+    # =========================================================================
+
+    def extract_tree_mask_for_box(canopy_mask, box):
+        """Extract the single tree crown with maximum IoU with the bounding box.
+
+        Uses connected component labeling to isolate individual tree crowns,
+        then selects the ONE component with highest IoU with the box region.
+        This ensures only one tree per box, even with partial overlaps.
+
+        Args:
+            canopy_mask: Binary mask (H, W) with all canopy pixels
+            box: Dict with xmin, ymin, xmax, ymax
+
+        Returns:
+            Binary mask (H, W) containing only the single best-matching tree
+        """
+        x1, y1, x2, y2 = box["xmin"], box["ymin"], box["xmax"], box["ymax"]
+        box_area = (x2 - x1) * (y2 - y1)
+
+        # Label connected components in the canopy mask
+        num_labels, labels = cv2.connectedComponents(
+            (canopy_mask > 0.5).astype(np.uint8)
+        )
+
+        # Create box region mask
+        box_region = np.zeros_like(canopy_mask, dtype=np.uint8)
+        box_region[y1:y2, x1:x2] = 1
+
+        # Find which labels intersect with the box
+        labels_in_box = np.unique(labels * box_region)
+        labels_in_box = labels_in_box[labels_in_box > 0]  # Exclude background
+
+        if len(labels_in_box) == 0:
+            # No tree intersects - return empty mask
+            return np.zeros_like(canopy_mask, dtype=np.float32)
+
+        # Calculate IoU for each candidate tree
+        best_label = None
+        best_iou = -1
+
+        for label in labels_in_box:
+            component_mask = (labels == label).astype(np.float32)
+            component_area = component_mask.sum()
+
+            # Intersection with box
+            intersection = (component_mask * box_region).sum()
+
+            # Union = component + box - intersection
+            union = component_area + box_area - intersection
+
+            iou = intersection / (union + 1e-6)
+
+            if iou > best_iou:
+                best_iou = iou
+                best_label = label
+
+        # Create output mask with only the best tree
+        tree_mask = np.zeros_like(canopy_mask, dtype=np.float32)
+        if best_label is not None:
+            tree_mask[labels == best_label] = 1.0
+
+        return tree_mask
+
+    def extract_shadow_for_tree(shadow_mask, tree_mask, dilation_px=10):
+        """Extract shadow region associated with this tree.
+
+        Strategy: Dilate the tree mask and find shadow pixels nearby.
+        This captures the cast shadow even if it's not directly connected.
+
+        Args:
+            shadow_mask: Binary mask (H, W) with all shadow pixels
+            tree_mask: Binary mask (H, W) with this tree's canopy
+            dilation_px: Pixels to dilate tree mask for shadow searching
+
+        Returns:
+            Binary mask (H, W) containing shadow near this tree
+        """
+        # Dilate tree mask to create search region
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (dilation_px * 2 + 1, dilation_px * 2 + 1)
+        )
+        search_region = cv2.dilate(tree_mask.astype(np.uint8), kernel)
+
+        # Find shadow within search region (but not overlapping canopy)
+        tree_shadow = shadow_mask * search_region * (1 - tree_mask)
+
+        return tree_shadow.astype(np.float32)
 
     def parse_voc(xml_path):
         tree = ET.parse(xml_path)
@@ -150,22 +317,26 @@ def train_model(
         def __getitem__(self, idx):
             name, box = self.samples[idx]
 
-            # Load image and masks
+            # Load image and full masks
             img = cv2.imread(str(self.image_dir / f"{name}.png"))
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            canopy_path = self.mask_dir / f"canopy_mask_{name}.png"
-            shadow_path = self.mask_dir / f"shadow_mask_{name}.png"
-            canopy = cv2.imread(str(canopy_path), 0)
-            shadow = cv2.imread(str(shadow_path), 0)
+            canopy_full = cv2.imread(str(self.mask_dir / f"canopy_mask_{name}.png"), 0)
+            shadow_full = cv2.imread(str(self.mask_dir / f"shadow_mask_{name}.png"), 0)
 
             # Binarize masks
-            canopy = (canopy > 127).astype(np.float32)
-            shadow = (shadow > 127).astype(np.float32)
+            canopy_full = (canopy_full > 127).astype(np.float32)
+            shadow_full = (shadow_full > 127).astype(np.float32)
+
+            # === Extract tree-specific masks ===
+            # Get only the tree crown(s) that intersect with this box
+            tree_mask = extract_tree_mask_for_box(canopy_full, box)
+            # Get shadow associated with this tree
+            tree_shadow = extract_shadow_for_tree(shadow_full, tree_mask)
 
             x1, y1, x2, y2 = box["xmin"], box["ymin"], box["xmax"], box["ymax"]
             h, w = img.shape[:2]
 
-            # Augmentation
+            # Augmentation (apply to tree-specific masks)
             if self.augment:
                 rng = random.Random(self.seed + idx)
                 np_rng = np.random.RandomState(self.seed + idx)
@@ -173,14 +344,14 @@ def train_model(
                 # Random flip
                 if rng.random() < 0.5:
                     img = np.fliplr(img).copy()
-                    canopy = np.fliplr(canopy).copy()
-                    shadow = np.fliplr(shadow).copy()
+                    tree_mask = np.fliplr(tree_mask).copy()
+                    tree_shadow = np.fliplr(tree_shadow).copy()
                     x1, x2 = w - x2, w - x1
 
                 if rng.random() < 0.5:
                     img = np.flipud(img).copy()
-                    canopy = np.flipud(canopy).copy()
-                    shadow = np.flipud(shadow).copy()
+                    tree_mask = np.flipud(tree_mask).copy()
+                    tree_shadow = np.flipud(tree_shadow).copy()
                     y1, y2 = h - y2, h - y1
 
                 # Small noise
@@ -191,8 +362,8 @@ def train_model(
             # Resize to SAM's expected 1024x1024
             img_resized = cv2.resize(img, (1024, 1024))
             # SAM output is 256x256
-            canopy_resized = cv2.resize(canopy, (256, 256))
-            shadow_resized = cv2.resize(shadow, (256, 256))
+            tree_mask_resized = cv2.resize(tree_mask, (256, 256))
+            tree_shadow_resized = cv2.resize(tree_shadow, (256, 256))
 
             # Scale box coordinates
             scale_x = 1024 / w
@@ -204,8 +375,8 @@ def train_model(
                     torch.from_numpy(img_resized).permute(2, 0, 1).float() / 255.0
                 ),
                 "box": torch.tensor(box_scaled, dtype=torch.float32),
-                "canopy_mask": torch.from_numpy(canopy_resized).float(),
-                "shadow_mask": torch.from_numpy(shadow_resized).float(),
+                "canopy_mask": torch.from_numpy(tree_mask_resized).float(),
+                "shadow_mask": torch.from_numpy(tree_shadow_resized).float(),
                 "original_size": torch.tensor([h, w]),
             }
 
@@ -286,8 +457,10 @@ def train_model(
     )
     val_loader = DataLoader(val_ds, batch_size=batch_size, num_workers=4)
 
-    # Optimizer (only trainable params)
+    # Optimizer (decoder + prompt encoder, plus LoRA params for adaptive)
     trainable_params = [p for p in sam.parameters() if p.requires_grad]
+    if mode == "adaptive":
+        trainable_params = trainable_params + lora_params
     optimizer = optim.AdamW(trainable_params, lr=lr, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, epochs)
 
@@ -347,8 +520,9 @@ def train_model(
     # Training loop
     # =========================================================================
 
-    print(f"\n🚀 Training {mode} mode...")
+    print(f"\n🚀 Training {mode} mode (patience={patience})...")
     best_iou = 0
+    epochs_without_improvement = 0
     history = []
 
     for epoch in range(1, epochs + 1):
@@ -404,7 +578,7 @@ def train_model(
                 # Compute loss
                 loss = dice_bce_loss(pred[0], canopy_gt[i])
 
-                if mode == "heuristic":
+                if mode in ("heuristic", "adaptive"):
                     # Shadow penalty: penalize predicting shadow as canopy
                     shadow_penalty = (pred[0] * shadow_gt[i]).mean()
                     loss = loss + lambda_shadow * shadow_penalty
@@ -462,7 +636,7 @@ def train_model(
                     pred = torch.sigmoid(pred.squeeze(1))
 
                     loss = dice_bce_loss(pred[0], canopy_gt[i])
-                    if mode == "heuristic":
+                    if mode in ("heuristic", "adaptive"):
                         shadow_penalty = (pred[0] * shadow_gt[i]).mean()
                         loss = loss + lambda_shadow * shadow_penalty
 
@@ -494,7 +668,7 @@ def train_model(
         # Save best model
         if val_iou > best_iou:
             best_iou = val_iou
-            # Save only decoder + prompt encoder weights
+            # Save decoder + prompt encoder + LoRA weights
             checkpoint = {
                 "mask_decoder": sam.mask_decoder.state_dict(),
                 "prompt_encoder": sam.prompt_encoder.state_dict(),
@@ -503,8 +677,33 @@ def train_model(
                 "baseline_iou": baseline_iou,
                 "epoch": epoch,
             }
+            # For adaptive mode, also save LoRA weights
+            if mode == "adaptive":
+                lora_state = {}
+                for idx, block in enumerate(sam.image_encoder.blocks):
+                    if hasattr(block.attn.qkv, "lora_A"):
+                        lora_state[f"block{idx}.attn.qkv.lora_A"] = (
+                            block.attn.qkv.lora_A.data
+                        )
+                        lora_state[f"block{idx}.attn.qkv.lora_B"] = (
+                            block.attn.qkv.lora_B.data
+                        )
+                    if hasattr(block.mlp.lin1, "lora_A"):
+                        lora_state[f"block{idx}.mlp.lin1.lora_A"] = (
+                            block.mlp.lin1.lora_A.data
+                        )
+                        lora_state[f"block{idx}.mlp.lin1.lora_B"] = (
+                            block.mlp.lin1.lora_B.data
+                        )
+                checkpoint["lora"] = lora_state
             torch.save(checkpoint, output_dir / "best_decoder.pth")
             print(f"  → Saved best (IoU: {best_iou:.4f}, baseline: {baseline_iou:.4f})")
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
+            if epochs_without_improvement >= patience:
+                print(f"\n⏹️  Early stopping: no improvement for {patience} epochs")
+                break
 
     # Save final model
     final_checkpoint = {
@@ -554,14 +753,11 @@ def main(
     lr: float = 1e-4,
     lambda_shadow: float = 0.3,
     seed: int = 42,
+    patience: int = 10,
 ):
     """Run SAM finetuning on Modal."""
     if mode not in ["unguided", "heuristic", "adaptive"]:
         raise ValueError(f"Invalid mode: {mode}. Use unguided, heuristic, or adaptive")
-
-    if mode == "adaptive":
-        print("⚠️  Adaptive mode not yet implemented. Use unguided or heuristic.")
-        return
 
     result = train_model.remote(
         mode=mode,
@@ -570,6 +766,7 @@ def main(
         lr=lr,
         lambda_shadow=lambda_shadow,
         seed=seed,
+        patience=patience,
     )
 
     print(f"\n🎯 {result['mode']} (seed={seed})")
