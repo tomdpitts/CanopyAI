@@ -42,7 +42,7 @@ VOLUME_PATH = "/data"
 
 @app.function(
     image=training_image,
-    gpu="A10G",
+    gpu="A100",
     timeout=3600 * 6,  # 6 hours
     volumes={VOLUME_PATH: data_volume},
 )
@@ -54,6 +54,7 @@ def train_model(
     lambda_shadow: float = 0.3,
     seed: int = 42,
     patience: int = 10,
+    run_name: str = "",
 ):
     """Train SAM decoder on Modal GPU."""
     import math
@@ -412,9 +413,11 @@ def train_model(
     # =========================================================================
 
     data_dir = Path(VOLUME_PATH) / "won003"
-    output_subdir = f"{mode}_seed{seed}"
+    # Use custom run_name if provided, otherwise default to mode_seed format
+    output_subdir = run_name if run_name else f"{mode}_seed{seed}"
     output_dir = Path(VOLUME_PATH) / "sam_proper_outputs" / output_subdir
     output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Output directory: {output_dir}")
 
     # Create datasets
     full_ds = SAMBoxDataset(
@@ -839,6 +842,7 @@ def main(
     lambda_shadow: float = 0.3,
     seed: int = 42,
     patience: int = 10,
+    run_name: str = "",
 ):
     """Run SAM finetuning on Modal."""
     if mode not in ["unguided", "heuristic", "adaptive"]:
@@ -852,6 +856,7 @@ def main(
         lambda_shadow=lambda_shadow,
         seed=seed,
         patience=patience,
+        run_name=run_name,
     )
 
     print(f"\n🎯 {result['mode']} (seed={seed})")
