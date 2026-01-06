@@ -1,0 +1,541 @@
+#!/usr/bin/env python3
+"""
+train.py — Fine-tune Detectree2 using tiny/fast/full YAML presets.
+
+Usage quickstart:
+    python train.py --preset tiny   --weights baseline --already_downloaded
+    python train.py --preset fast   --weights baseline
+    python train.py --preset full   --weights baseline
+
+for finetuning from previous run instead:
+    python train.py --weights finetuned
+
+updated:
+    python train.py --preset tiny --weights baseline --already_downloaded --dataset won --run-name whiskey
+"""
+
+import argparse
+import os
+from pathlib import Path
+
+import torch
+import torch.multiprocessing as mp
+from detectron2.data import DatasetCatalog, MetadataCatalog
+from detectree2.models.train import register_train_data, MyTrainer, get_tree_dicts
+from detectree2.models.train import setup_cfg
+from detectron2.structures import BoxMode
+from prepare_data import run_preparation
+import wget
+import json
+
+
+def is_running_on_modal():
+    """Detect if running on Modal by checking environment variables."""
+    return os.environ.get("MODAL_ENVIRONMENT") is not None
+
+
+# ============================================================
+#   Load preset YAML + override weights + device
+# ============================================================
+
+
+def load_preset_cfg(preset: str, weights: str, output_dir: Path):
+    cfg = setup_cfg(update_model="230103_randresize_full.pth")
+
+    # Preset selection
+    preset_map = {
+        "tiny": "configs/tiny_debug.yaml",
+        "fast": "configs/fast_train.yaml",
+        "full": "configs/full_train.yaml",
+    }
+    cfg.merge_from_file(preset_map[preset])
+    cfg.IMGMODE = "rgb"
+
+    # ---- Set model weights ----
+    if weights == "baseline":
+        # Determine weights path (use persistent storage on Modal)
+        if is_running_on_modal():
+            weights_path = Path("/checkpoints/230103_randresize_full.pth")
+        else:
+            weights_path = Path("230103_randresize_full.pth")
+
+        # Download if missing
+        if not weights_path.exists():
+            url = "https://zenodo.org/records/10522461/files/230103_randresize_full.pth"
+            print(f"📦 Downloading baseline weights to {weights_path}")
+            wget.download(url, out=str(weights_path))
+            print("\n✅ Model download complete.")
+        else:
+            print(f"✅ Using cached weights: {weights_path}")
+
+        cfg.MODEL.WEIGHTS = str(weights_path)
+    elif weights == "finetuned":
+        cfg.MODEL.WEIGHTS = str(output_dir / "model_final.pth")
+    else:
+        cfg.MODEL.WEIGHTS = weights  # custom path
+
+    # ---- Device selection ----
+    # if torch.backends.mps.is_available():
+    #     cfg.MODEL.DEVICE = "mps"
+    #     print("💻 Using Apple MPS backend")
+    if torch.cuda.is_available():
+        cfg.MODEL.DEVICE = "cuda"
+        print("🚀 Using CUDA GPU")
+    else:
+        cfg.MODEL.DEVICE = "cpu"
+        print("🧠 Using CPU")
+
+    # ---- Multi-scale training (set programmatically to bypass YACS type check) ----
+    if preset == "full":
+        # Override with tuple for multi-scale training
+        # This works because we're setting it directly, not via YAML merge
+        cfg.INPUT.MIN_SIZE_TRAIN = (800, 1024, 1280)
+        cfg.INPUT.MIN_SIZE_TRAIN_SAMPLING = "choice"
+        print("🔍 Multi-scale training enabled: [800, 1024, 1280]px")
+
+    cfg.OUTPUT_DIR = str(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    return cfg
+
+
+def build_train_augmentation(cfg):
+    """
+    Custom augmentation pipeline with color jitter for aerial imagery robustness.
+    Adds brightness/contrast/saturation variations to handle different lighting
+    conditions and seasons.
+    """
+    from detectron2.data import transforms as T
+
+    augs = []
+
+    # Resize (respects MIN_SIZE_TRAIN for multi-scale)
+    if isinstance(cfg.INPUT.MIN_SIZE_TRAIN, (list, tuple)):
+        min_size = cfg.INPUT.MIN_SIZE_TRAIN
+    else:
+        min_size = (cfg.INPUT.MIN_SIZE_TRAIN,)
+
+    augs.append(
+        T.ResizeShortestEdge(
+            min_size,
+            cfg.INPUT.MAX_SIZE_TRAIN,
+            sample_style=cfg.INPUT.MIN_SIZE_TRAIN_SAMPLING,
+        )
+    )
+
+    # Random flips
+    if cfg.INPUT.RANDOM_FLIP != "none":
+        augs.append(
+            T.RandomFlip(
+                horizontal=cfg.INPUT.RANDOM_FLIP == "horizontal",
+                vertical=cfg.INPUT.RANDOM_FLIP == "vertical",
+            )
+        )
+
+    # Random crop
+    if cfg.INPUT.CROP.ENABLED:
+        augs.append(T.RandomCrop(cfg.INPUT.CROP.TYPE, cfg.INPUT.CROP.SIZE))
+
+    # Color augmentations (NEW - for aerial imagery robustness)
+    # Apply random brightness adjustment
+    augs.append(T.RandomBrightness(intensity_min=0.8, intensity_max=1.2))
+    # Apply random contrast adjustment
+    augs.append(T.RandomContrast(intensity_min=0.8, intensity_max=1.2))
+    # Apply random saturation adjustment
+    augs.append(T.RandomSaturation(intensity_min=0.8, intensity_max=1.2))
+    # Apply random lighting (PCA-based color jitter)
+    augs.append(T.RandomLighting(scale=0.1))
+
+    return augs
+
+
+# ============================================================
+#   TRAINING
+# ============================================================
+
+
+def get_next_nato_codename(output_dir: Path) -> str:
+    """Get next available NATO phonetic alphabet codename."""
+    nato_alphabet = [
+        "alpha",
+        "bravo",
+        "charlie",
+        "delta",
+        "echo",
+        "foxtrot",
+        "golf",
+        "hotel",
+        "india",
+        "juliet",
+        "kilo",
+        "lima",
+        "mike",
+        "november",
+        "oscar",
+        "papa",
+        "quebec",
+        "romeo",
+        "sierra",
+        "tango",
+        "uniform",
+        "victor",
+        "whiskey",
+        "xray",
+        "yankee",
+        "zulu",
+    ]
+
+    existing_runs = [
+        d.name for d in output_dir.iterdir() if d.is_dir() and d.name.startswith("run_")
+    ]
+
+    for codename in nato_alphabet:
+        if f"run_{codename}" not in existing_runs:
+            return codename
+
+    # Fallback if all NATO names used
+    import random
+
+    return f"run_{random.randint(1000, 9999)}"
+
+
+def find_recent_incomplete_run(output_dir: Path, time_window_minutes: int = 5) -> Path:
+    """Find most recent incomplete run within time window (for preemption recovery)."""
+    from datetime import datetime, timedelta
+
+    if not output_dir.exists():
+        return None
+
+    cutoff_time = datetime.now() - timedelta(minutes=time_window_minutes)
+    incomplete_runs = []
+
+    for run_dir in output_dir.iterdir():
+        if not run_dir.is_dir() or not run_dir.name.startswith("run_"):
+            continue
+
+        # Check if run is incomplete (no model_final.pth)
+        if (run_dir / "model_final.pth").exists():
+            continue
+
+        # Check if created within time window
+        created_time = datetime.fromtimestamp(run_dir.stat().st_ctime)
+        if created_time > cutoff_time:
+            incomplete_runs.append((created_time, run_dir))
+
+    if incomplete_runs:
+        # Return most recent
+        incomplete_runs.sort(reverse=True)
+        return incomplete_runs[0][1]
+
+    return None
+
+
+def get_won_dicts(directory: str):
+    """Load WON dataset from _meta.json files."""
+    directory = Path(directory)
+    dataset_dicts = []
+
+    # Find all meta.json files
+    meta_files = sorted(list(directory.glob("*_meta.json")))
+
+    for meta_path in meta_files:
+        with open(meta_path, "r") as f:
+            meta = json.load(f)
+
+        record = {}
+        record["file_name"] = str(directory / meta["file_name"])
+        record["image_id"] = meta["image_id"]
+        record["height"] = meta["height"]
+        record["width"] = meta["width"]
+
+        objs = []
+        for ann in meta.get("coco_annotations", []):
+            obj = {
+                "bbox": ann["bbox"],
+                "bbox_mode": BoxMode.XYWH_ABS,
+                "segmentation": ann["segmentation"],
+                "category_id": ann["category_id"],
+            }
+            objs.append(obj)
+
+        record["annotations"] = objs
+        dataset_dicts.append(record)
+
+    return dataset_dicts
+
+
+def train_detectree2(
+    train_path: Path,
+    output_dir: Path,
+    preset: str,
+    weights: str,
+    run_name: str = None,
+    dataset: str = "tcd",
+    val_path: Path = None,
+):
+    print("📚 Registering training dataset…")
+
+    site_name = "tcd" if dataset == "tcd" else "won"
+
+    if dataset == "won":
+        # WON data is flat (no folds), so we register manually
+        DatasetCatalog.clear()  # Clear existing registrations if any
+        DatasetCatalog.register(
+            f"{site_name}_train", lambda: get_won_dicts(str(train_path))
+        )
+
+        if val_path:
+            DatasetCatalog.register(
+                f"{site_name}_val", lambda: get_won_dicts(str(val_path))
+            )
+        else:
+            # Fallback if no val path provided (shouldn't happen with new logic)
+            print("⚠️ No validation path provided, using training data for validation")
+            DatasetCatalog.register(
+                f"{site_name}_val", lambda: get_won_dicts(str(train_path))
+            )
+
+        # Set metadata (required for COCOEvaluator)
+        MetadataCatalog.get(f"{site_name}_train").set(thing_classes=["tree"])
+        MetadataCatalog.get(f"{site_name}_val").set(thing_classes=["tree"])
+
+        print(f"   Registered {site_name}_train from {train_path}")
+        print(f"   Registered {site_name}_val from {val_path}")
+    else:
+        val_fold = 1
+        register_train_data(str(train_path), site_name, val_fold)
+
+    train_name = f"{site_name}_train"
+    val_name = f"{site_name}_val"
+
+    # Detect Modal and override output directory if needed
+    if is_running_on_modal():
+        output_dir = Path("/checkpoints")
+        print(f"☁️  Running on Modal: Saving checkpoints to {output_dir}")
+    else:
+        print(f"💾 Running locally: Saving checkpoints to {output_dir}")
+
+    cfg = load_preset_cfg(preset, weights, output_dir)
+
+    # Explicitly set correct datasets
+    cfg.DATASETS.TRAIN = (train_name,)
+    cfg.DATASETS.TEST = (val_name,)
+
+    # Enable COCO evaluation for early stopping
+    # Set eval period to match checkpoint period to avoid too frequent evaluation
+    cfg.TEST.EVAL_PERIOD = cfg.SOLVER.CHECKPOINT_PERIOD
+
+    # Determine run directory
+    if run_name:
+        # Explicit run name provided
+        run_dir = output_dir / f"run_{run_name}"
+        print(f"📁 Using run name: {run_name}")
+    else:
+        # Auto-detect recent incomplete run (preemption recovery)
+        recent_incomplete = find_recent_incomplete_run(
+            output_dir, time_window_minutes=5
+        )
+        if recent_incomplete:
+            run_dir = recent_incomplete
+            print(f"🔄 Detected recent incomplete run: {run_dir.name}")
+            print(f"   (created within last 5 minutes, likely preemption)")
+        else:
+            # Create new auto-codename
+            codename = get_next_nato_codename(output_dir)
+            run_dir = output_dir / f"run_{codename}"
+            print(f"🆕 Creating new run: {codename}")
+
+    cfg.OUTPUT_DIR = str(
+        run_dir
+    )  # override output directory with run codename, if provided
+
+    # Freeze config
+    cfg.freeze()
+
+    # Clean up eval cache to avoid stale COCO annotations
+    import shutil
+
+    eval_dir = Path("eval")
+    if eval_dir.exists():
+        print(f"🧹 Cleaning eval cache: {eval_dir}")
+        shutil.rmtree(eval_dir)
+
+    print("🚀 Training starting…")
+    print(f"✅ COCO evaluation enabled (every {cfg.TEST.EVAL_PERIOD} iters)")
+    print(f"⏱️  Early stopping patience: 5 evaluations")
+
+    # Check for existing checkpoints to resume from
+    checkpoint_dir = Path(cfg.OUTPUT_DIR)
+    last_checkpoint_file = checkpoint_dir / "last_checkpoint"
+    resume_from_checkpoint = False
+
+    if last_checkpoint_file.exists():
+        with open(last_checkpoint_file, "r") as f:
+            last_checkpoint = f.read().strip()
+        checkpoint_path = checkpoint_dir / last_checkpoint
+        if checkpoint_path.exists():
+            print(f"🔄 Found existing checkpoint: {last_checkpoint}")
+            print(
+                f"   Resuming training from iteration {last_checkpoint.split('_')[-1].replace('.pth', '')}"
+            )
+            resume_from_checkpoint = True
+        else:
+            print(f"⚠️  Checkpoint file listed but not found: {checkpoint_path}")
+            print(f"   Starting fresh training")
+    else:
+        print(f"📝 No existing checkpoints found, starting fresh training")
+
+    # Create custom trainer with enhanced augmentations
+    class CustomAugTrainer(MyTrainer):
+        """Extended MyTrainer with custom color augmentations for aerial imagery."""
+
+        @classmethod
+        def build_train_loader(cls, cfg):
+            """Override to use custom augmentation pipeline."""
+            from detectron2.data import (
+                DatasetMapper,
+                build_detection_train_loader,
+            )
+
+            # Create custom mapper with our augmentation pipeline
+            mapper = DatasetMapper(
+                is_train=True,
+                augmentations=build_train_augmentation(cfg),
+                image_format=cfg.INPUT.FORMAT,
+                use_instance_mask=cfg.MODEL.MASK_ON,
+            )
+
+            return build_detection_train_loader(cfg, mapper=mapper)
+
+    # Use custom trainer if full preset (has color augs), else standard
+    if preset == "full":
+        trainer = CustomAugTrainer(cfg, patience=5)
+        print("🎨 Using enhanced color augmentations for aerial imagery")
+    else:
+        trainer = MyTrainer(cfg, patience=5)
+
+    trainer.resume_or_load(resume=resume_from_checkpoint)
+    trainer.train()
+
+
+# ============================================================
+#   Worker run by launch()
+# ============================================================
+
+
+def main_worker(rank, args):
+    # Detect Modal and use persistent volume paths
+    if is_running_on_modal():
+        if args.dataset == "won":
+            # Assuming WON data is mounted or available at /data/won
+            data_root = Path("/data/won")
+        else:
+            data_root = Path("/data/tcd")
+        output_dir = Path("/checkpoints")
+        print(f"☁️  Running on Modal:")
+        print(f"   Data: {data_root} (persistent volume)")
+        print(f"   Checkpoints: {output_dir} (persistent volume)")
+    else:
+        if args.dataset == "won":
+            data_root = Path("data/won")
+        else:
+            data_root = Path("data/tcd")
+        output_dir = data_root / "train_outputs"
+        print(f"💾 Running locally:")
+        print(f"   Data: {data_root}")
+        print(f"   Checkpoints: {output_dir}")
+
+    if args.dataset == "won":
+        train_path = data_root / "raw"
+        val_path = data_root / "raw_test"
+    else:
+        train_path = data_root / "chips"
+        val_path = None
+
+    # Create directories
+    data_root.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. Download
+    # 1. Prepare Data (Download + Tile + Split)
+    if args.dataset == "tcd":
+        if not args.already_downloaded:
+            print("🏗️  Running data preparation pipeline...")
+            run_preparation(args)
+        else:
+            # Nothing to download, nothing to tile
+            print("⏭️ Skipping download and tiling (using existing chips)")
+    else:
+        print(f"⏭️ Skipping TCD preparation (using {args.dataset} dataset)")
+
+    # 2. Train
+    train_detectree2(
+        train_path,
+        output_dir,
+        preset=args.preset,
+        weights=args.weights,
+        run_name=args.run_name,
+        dataset=args.dataset,
+        val_path=val_path,
+    )
+
+
+# ============================================================
+#   CLI
+# ============================================================
+
+
+def parse_args():
+    p = argparse.ArgumentParser()
+
+    p.add_argument("--already_downloaded", action="store_true")
+    p.add_argument("--max_images", type=int, default=3)
+    p.add_argument(
+        "--train_split",
+        type=float,
+        default=0.8,
+        help="Fraction of data to use for training (rest for test)",
+    )
+    p.add_argument(
+        "--run-name",
+        type=str,
+        default=None,
+        help="Name for this training run (e.g., 'experiment-v1'). If not provided, auto-generates NATO codename.",
+    )
+
+    p.add_argument("--preset", default="tiny", choices=["tiny", "fast", "full"])
+
+    p.add_argument(
+        "--weights",
+        default="baseline",
+        help="'baseline' | 'finetuned' | /path/to/model.pth",
+    )
+
+    p.add_argument(
+        "--dataset",
+        default="tcd",
+        choices=["tcd", "won"],
+        help="Dataset to use. 'tcd' (default) downloads/tiles TCD data. 'won' uses local data in data/won/raw.",
+    )
+
+    return p.parse_args()
+
+
+# ============================================================
+
+if __name__ == "__main__":
+    mp.set_start_method("spawn", force=True)
+    args = parse_args()
+
+    # Determine number of available GPUs
+    if torch.cuda.is_available():
+        num_gpus = torch.cuda.device_count()
+    else:
+        num_gpus = 1
+
+    # Multi-GPU → spawn workers
+    if num_gpus > 1:
+        mp.spawn(main_worker, nprocs=num_gpus, args=(args,))
+    else:
+        # Single GPU or CPU/MPS
+        main_worker(0, args)
