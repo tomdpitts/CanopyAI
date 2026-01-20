@@ -763,12 +763,42 @@ def save_results(
     return output_geojson_path, features
 
 
+def _process_mask_batch(args):
+    """Worker function to extract contours from a batch of masks."""
+    masks, bounds, smooth_masks = args
+    results = []
+    for local_mask, bound in zip(masks, bounds):
+        y_start, y_end, x_start, x_end, h, w = bound
+        mask_uint8 = local_mask.astype(np.uint8) * 255
+
+        # Optional smoothing
+        if smooth_masks:
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+            mask_uint8 = cv2.morphologyEx(mask_uint8, cv2.MORPH_CLOSE, kernel)
+            mask_uint8 = cv2.morphologyEx(mask_uint8, cv2.MORPH_OPEN, kernel)
+
+        contours, _ = cv2.findContours(
+            mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+
+        # Offset contours to global coordinates
+        offset_contours = []
+        for cnt in contours:
+            offset_cnt = cnt.copy()
+            offset_cnt[:, :, 0] += x_start
+            offset_cnt[:, :, 1] += y_start
+            offset_contours.append(offset_cnt)
+
+        results.append(offset_contours)
+    return results
+
+
 def create_visualization(
     image, cache_files, bboxes, scores, output_dir, tif_stem, smooth_masks=False
 ):
     """
     Create visualization showing both bounding boxes and segmentation masks.
-    Loads masks from cache to minimize memory usage.
+    Uses parallel processing for contour extraction.
 
     Args:
         image: RGB image
@@ -779,12 +809,11 @@ def create_visualization(
         tif_stem: Stem name of input TIF file
         smooth_masks: Apply morphological smoothing to noisy masks
     """
+    from multiprocessing import Pool, cpu_count
+
     print("\n🎨 Creating visualization...")
 
     vis_image = image.copy()
-
-    # Load masks one at a time from cache
-    mask_generator = load_masks_from_cache(cache_files)
 
     # Colors
     bbox_color = (33, 240, 255)  # Electric blue for bboxes
@@ -795,11 +824,9 @@ def create_visualization(
     font_scale = 0.4
     font_thickness = 1
 
-    # Draw each detection
-    for i, (bbox, score) in enumerate(zip(bboxes, scores)):
-        mask = next(mask_generator)
-
-        # Draw bounding box (from DeepForest)
+    # First pass: Draw all bboxes and labels (fast)
+    print("   Drawing bounding boxes...")
+    for bbox, score in zip(bboxes, scores):
         xmin, ymin, xmax, ymax = [int(c) for c in bbox]
         cv2.rectangle(vis_image, (xmin, ymin), (xmax, ymax), bbox_color, 1)
 
@@ -827,27 +854,27 @@ def create_visualization(
             font_thickness,
         )
 
-        # Draw segmentation mask (from SAM)
-        # Create colored mask overlay
-        mask_colored = np.zeros_like(vis_image)
-        mask_colored[mask] = polygon_color
+    # Second pass: Extract contours in parallel from cache files
+    # Each cache file becomes a work unit (avoids full-image mask reconstruction)
+    print(f"   Extracting contours in parallel ({cpu_count()} workers)...")
 
-        # Blend mask with image (alpha=0 means no fill, only contours)
-        alpha = 0
-        vis_image = cv2.addWeighted(vis_image, 1, mask_colored, alpha, 0)
+    work_units = []
+    for cache_file in cache_files:
+        with np.load(cache_file, allow_pickle=True) as data:
+            masks = list(data["masks"])
+            bounds = data["bounds"].tolist()
+            work_units.append((masks, bounds, smooth_masks))
 
-        # Draw mask contour
-        mask_uint8 = mask.astype(np.uint8) * 255
+    # Process in parallel
+    all_contours = []
+    with Pool(processes=cpu_count()) as pool:
+        batch_results = pool.map(_process_mask_batch, work_units)
+        for batch in batch_results:
+            all_contours.extend(batch)
 
-        # Optional: Smooth noisy masks from finetuned models
-        if smooth_masks:
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-            mask_uint8 = cv2.morphologyEx(mask_uint8, cv2.MORPH_CLOSE, kernel)
-            mask_uint8 = cv2.morphologyEx(mask_uint8, cv2.MORPH_OPEN, kernel)
-
-        contours, _ = cv2.findContours(
-            mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-        )
+    # Third pass: Draw all contours (fast, single-threaded)
+    print(f"   Drawing {len(all_contours)} mask contours...")
+    for contours in all_contours:
         cv2.drawContours(vis_image, contours, -1, polygon_color, 1)
 
     # Save visualization

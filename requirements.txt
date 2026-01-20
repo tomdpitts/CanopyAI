@@ -33,6 +33,23 @@ scikit-image==0.20.0
 tqdm
 datasets
 Pillow==9.5.0
+PyYAML>=6.0.1  # Explicit pin to avoid Cython build issues on ARM Macs
+
+segment_anything
+deepforest==2.0.0
+
+albumentations
+
+# For training, install modal and set up modal client on your machine
+# pip install modal
+# python3 -m modal setup
 
 # NEXT STEP FOR LOCAL DEV: pip install --no-build-isolation -r detectron_requirements.txt
 # (ignore archive_requirements.txt, deprecated)
+
+
+# other files needed
+# model_oscar50.pth
+# models/
+# solar_pipeline_architecture.md
+# sam_vit_b_01ec64.pth

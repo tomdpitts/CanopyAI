@@ -8,7 +8,7 @@ class GlobalContextEncoder(nn.Module):
     """
     Stage 0: Unsupervised 'Sun Vector' Estimator.
 
-    Takes a downsampled orthomosaic (e.g. 512x512) and outputs a normalized
+    Takes a 500x500 image tile and outputs a normalized
     2D vector representing the global scene directionality (Sun Azimuth).
 
     Training Objective: Self-Supervised Rotational Equivariance.
@@ -30,7 +30,7 @@ class GlobalContextEncoder(nn.Module):
         )
 
     def forward(self, x):
-        # x: (B, 3, 512, 512)
+        # x: (B, 3, H, W) - typically 500x500 tiles
         features = self.backbone(x)  # (B, 512, 1, 1)
         features = torch.flatten(features, 1)  # (B, 512)
 
@@ -43,7 +43,7 @@ class GlobalContextEncoder(nn.Module):
 
 class SolarAttentionBlock(nn.Module):
     """
-    The Core Innovation: Solar-Gated Spatial Attention.
+    Solar-Gated Spatial Attention.
 
     Injects the global 'Sun Vector' into local feature maps (from FPN).
     Learns to upweight features that are consistent with the solar direction.

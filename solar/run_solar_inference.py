@@ -6,8 +6,8 @@ import sys
 
 # Add parent directory
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from prototypes.solar_adapter import GlobalContextEncoder
-from prototypes.solar_deepforest import SolarDeepForest
+from solar_adapter import GlobalContextEncoder
+from solar_deepforest import SolarDeepForest
 from segment_anything import sam_model_registry
 
 
@@ -17,7 +17,7 @@ def run_pipeline(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # =========================================================================
-    # STAGE 0: GLOBAL CONTEXT
+    # STAGE 0: GLOBAL CONTEXT (via random crop consensus)
     # =========================================================================
     print("--- Stage 0: Inferring Global Sun Vector ---")
 
@@ -26,20 +26,54 @@ def run_pipeline(
     context_model.load_state_dict(torch.load(context_weights, map_location=device))
     context_model.eval()
 
-    # Process Orthomosaic (Simulated as random crops logic)
-    # Ideally: Load big ortho -> random crops -> consensus
-    # Here: Just resize image for prototype
+    # Load full orthomosaic
     ortho = cv2.imread(ortho_path)
-    ortho_resized = cv2.resize(ortho, (512, 512))
-    ortho_tensor = (
-        torch.from_numpy(ortho_resized).permute(2, 0, 1).float().unsqueeze(0).to(device)
-        / 255.0
+    if ortho is None:
+        raise ValueError(f"Could not load orthomosaic: {ortho_path}")
+
+    h, w = ortho.shape[:2]
+    crop_size = 500
+    n_samples = 30  # Number of random crops to sample
+
+    print(
+        f"Orthomosaic size: {w}x{h}, sampling {n_samples} random {crop_size}x{crop_size} crops"
     )
 
-    with torch.no_grad():
-        sun_vector = context_model(ortho_tensor)
+    # Sample random non-overlapping crops and predict sun vector for each
+    predictions = []
 
-    print(f"Global Sun Vector: {sun_vector.cpu().numpy()}")
+    for i in range(n_samples):
+        # Random top-left corner (ensure crop fits within image)
+        x = np.random.randint(0, max(1, w - crop_size))
+        y = np.random.randint(0, max(1, h - crop_size))
+
+        crop = ortho[y : y + crop_size, x : x + crop_size]
+
+        # Convert to tensor
+        crop_tensor = (
+            torch.from_numpy(crop).permute(2, 0, 1).float().unsqueeze(0).to(device)
+            / 255.0
+        )
+
+        with torch.no_grad():
+            pred = context_model(crop_tensor)
+            predictions.append(pred)
+
+    # Stack predictions: (N, 2)
+    predictions = torch.cat(predictions, dim=0)
+
+    # Compute consensus using circular mean (better for directional data)
+    # Convert to angles, compute mean angle, convert back to unit vector
+    angles = torch.atan2(predictions[:, 1], predictions[:, 0])
+    mean_angle = torch.atan2(torch.sin(angles).mean(), torch.cos(angles).mean())
+    sun_vector = torch.tensor([[torch.cos(mean_angle), torch.sin(mean_angle)]]).to(
+        device
+    )
+
+    print(
+        f"Global Sun Vector (consensus of {n_samples} crops): {sun_vector.cpu().numpy()}"
+    )
+    print(f"Sun angle: {np.degrees(mean_angle.cpu().numpy()):.1f}°")
 
     # =========================================================================
     # STAGE 1: SOLAR-GATED DETECTION
