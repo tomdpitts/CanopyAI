@@ -28,6 +28,7 @@ deepforest/visualization_output
 foxtrot_output
 test_november
 oscar
+input_data*
 
 mask_extraction_test
 noise_test_output

@@ -28,6 +28,7 @@ import cv2
 import torch
 from tqdm import tqdm
 from deepforest import main as deepforest_main
+from deepforest import utilities
 from shapely.geometry import Polygon
 
 # Fix MPS float64 compatibility
@@ -196,6 +197,22 @@ def detect_trees_deepforest(
         print("   Loading default model from Hugging Face...")
         df_model.load_model("weecology/deepforest-tree")
 
+    # Set device for GPU acceleration
+    # NOTE: DeepForest v2.0.0 uses self.device to move input tensors during predict_image.
+    # Simply calling model.to(device) is NOT sufficient - must set df_model.device.
+    device = torch.device("cpu")
+    if torch.backends.mps.is_available():
+        # Move model to MPS if available to speed up detection
+        device = torch.device("mps")
+        df_model.model.to(device)
+        print(f"   🖥️  DeepForest on: {device}")
+    else:
+        print("   🖥️  DeepForest on: cpu")
+
+    # Important: Set to evaluation mode for inference
+    # This prevents "targets should not be none" error when running manual inference
+    df_model.model.eval()
+
     # Convert image to float32 for DeepForest
     if image.dtype == np.uint8:
         image_float = image.astype("float32")
@@ -240,10 +257,27 @@ def detect_trees_deepforest(
 
             tile_count += 1
 
-            # Run DeepForest prediction
+            # Run prediction with manual device handling to support MPS
             try:
-                tile_preds = df_model.predict_image(image=tile)
-            except Exception:
+                # Custom prediction logic to bypass DeepForest bug
+                # Prepare input tensor on correct device
+                image_tensor = torch.tensor(tile).permute(2, 0, 1).float() / 255.0
+                image_tensor = image_tensor.to(device).unsqueeze(0)
+
+                # Inference
+                with torch.no_grad():
+                    prediction = df_model.model(image_tensor)
+
+                # Post-process
+                if len(prediction[0]["boxes"]) > 0:
+                    tile_preds = utilities.format_boxes(prediction[0])
+                    # Filter by confidence strictly
+                    tile_preds = tile_preds[tile_preds["score"] >= confidence_threshold]
+                else:
+                    tile_preds = None
+            except Exception as e:
+                # Log error but continue (likely edge case or corrupt tile)
+                print(f"❌ Error on tile ({x_start},{y_start}): {e}")
                 continue
 
             if tile_preds is None or len(tile_preds) == 0:
@@ -809,7 +843,14 @@ def create_visualization(
         tif_stem: Stem name of input TIF file
         smooth_masks: Apply morphological smoothing to noisy masks
     """
-    from multiprocessing import Pool, cpu_count
+    import multiprocessing as mp
+    import platform
+
+    # Use 'spawn' on macOS to avoid fork issues (audio glitches, resource copying)
+    if platform.system() == "Darwin":
+        ctx = mp.get_context("spawn")
+    else:
+        ctx = mp.get_context("fork")
 
     print("\n🎨 Creating visualization...")
 
@@ -854,9 +895,10 @@ def create_visualization(
             font_thickness,
         )
 
-    # Second pass: Extract contours in parallel from cache files
-    # Each cache file becomes a work unit (avoids full-image mask reconstruction)
-    print(f"   Extracting contours in parallel ({cpu_count()} workers)...")
+    # Second pass: Extract contours in parallel from cache files.
+    # Each cache file becomes a work unit (avoids full-image reconstruction)
+    n_workers = mp.cpu_count()
+    print(f"   Extracting contours in parallel ({n_workers} workers)...")
 
     work_units = []
     for cache_file in cache_files:
@@ -867,7 +909,7 @@ def create_visualization(
 
     # Process in parallel
     all_contours = []
-    with Pool(processes=cpu_count()) as pool:
+    with ctx.Pool(processes=mp.cpu_count()) as pool:
         batch_results = pool.map(_process_mask_batch, work_units)
         for batch in batch_results:
             all_contours.extend(batch)
