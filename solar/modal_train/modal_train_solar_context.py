@@ -158,5 +158,7 @@ def train_context_modal(
 
 
 @app.local_entrypoint()
-def main(epochs: int = 50, run_name: str = "you_forgot_to_add_run_name"):
-    train_context_modal.remote(epochs=epochs, run_name=run_name)
+def main(
+    epochs: int = 50, run_name: str = "you_forgot_to_add_run_name", patience: int = 10
+):
+    train_context_modal.remote(epochs=epochs, run_name=run_name, patience=patience)
