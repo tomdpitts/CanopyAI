@@ -4,11 +4,72 @@ import torch.nn.functional as F
 import torchvision.models as models
 
 
+def compute_shadow_channel(rgb_images):
+    """
+    Compute a 'shadow likeness' channel from RGB images.
+    Shadows are characterized by low luminance and high blue/red ratio (Rayleigh scattering).
+
+    Args:
+        rgb_images: (B, 3, H, W) tensor, normalized or not (assumes roughly [0,1] or standard standardization)
+
+    Returns:
+        shadow_channel: (B, 1, H, W) tensor
+    """
+    # If images are standardized (e.g. ImageNet mean/std), we might need to un-standardize to get color ratios?
+    # For now, let's work on the assumption that relative differences persist.
+    # Typically resnet inputs are normalized.
+    # Let's assume input is standard tensor.
+
+    r, g, b = rgb_images[:, 0], rgb_images[:, 1], rgb_images[:, 2]
+
+    # 1. Luminance (darkness)
+    # Standard coeffs: 0.299R + 0.587G + 0.114B
+    luminance = 0.299 * r + 0.587 * g + 0.114 * b
+    # Inverted: higher value = darker = more likely shadow
+    darkness = 1.0 - luminance
+
+    # 2. Blue Ratio / Blue Shift
+    # Shadows are illuminated by the blue sky, so they are bluer than direct sunlit areas.
+    # Simple proxy: (B - R). Normalized to roughly [0, 1] range if possible, or just used as is.
+    blue_shift = b - r
+
+    # Combine: Shadow = Dark AND Blue-ish
+    # Using sigmoid to squash range or just raw multiplication
+    # Let's keep it simple and differentiable
+    shadow_score = darkness + blue_shift
+
+    # Add Gaussian Blur to suppress high-frequency noise (leaf texture)
+    # and focus on structural shadows (tree casting shadow)
+    # Kernel size 7, sigma 3 seems reasonable for 10cm/px resolution
+    blur = torch.nn.Sequential(
+        torch.nn.ReflectionPad2d(3),
+        torch.nn.Conv2d(1, 1, kernel_size=7, stride=1, padding=0, bias=False, groups=1),
+    )
+    # Initialize with Gaussian kernel
+    with torch.no_grad():
+        sigma = 3.0
+        k = 7
+        x = torch.arange(k).float() - (k - 1) / 2
+        y = torch.arange(k).float() - (k - 1) / 2
+        xx, yy = torch.meshgrid(x, y, indexing="xy")
+        kernel = torch.exp(-(xx**2 + yy**2) / (2 * sigma**2))
+        kernel = kernel / kernel.sum()
+        blur[1].weight.data = kernel.view(1, 1, k, k)
+        # Move to correct device
+        if rgb_images.device.type != "cpu":
+            blur.to(rgb_images.device)
+
+    shadow_score = shadow_score.unsqueeze(1)  # (B, 1, H, W)
+    shadow_score = blur(shadow_score)
+
+    return shadow_score
+
+
 class GlobalContextEncoder(nn.Module):
     """
     Stage 0: Unsupervised 'Sun Vector' Estimator.
 
-    Takes a 500x500 image tile and outputs a normalized
+    Takes a 500x500 image tile (RGB or RGB+Shadow) and outputs a normalized
     2D vector representing the global scene directionality (Sun Azimuth).
 
     Training Objective: Self-Supervised Rotational Equivariance.
@@ -19,7 +80,30 @@ class GlobalContextEncoder(nn.Module):
         # Use a lightweight backbone
         resnet = models.resnet18(
             weights=models.ResNet18_Weights.IMAGENET1K_V1
-        )  # this model is trained on ImageNet-1K e.g. dogs, planes, cars
+        )  # this model is trained on ImageNet-1K.
+
+        # Modify first layer to accept 4 channels (RGB + Shadow)
+        # Original: Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        original_conv1 = resnet.conv1
+        new_conv1 = nn.Conv2d(
+            4,
+            original_conv1.out_channels,
+            kernel_size=original_conv1.kernel_size,
+            stride=original_conv1.stride,
+            padding=original_conv1.padding,
+            bias=original_conv1.bias,
+        )
+
+        # Initialize new conv1:
+        # Copy weights for first 3 channels
+        with torch.no_grad():
+            new_conv1.weight[:, :3, :, :] = original_conv1.weight
+            # Initialize 4th channel (shadow) with average of RGB weights -> allows it to contribute immediately
+            new_conv1.weight[:, 3:4, :, :] = torch.mean(
+                original_conv1.weight, dim=1, keepdim=True
+            )
+
+        resnet.conv1 = new_conv1
 
         # Remove the classification head (fc)
         self.backbone = nn.Sequential(*list(resnet.children())[:-1])
@@ -32,7 +116,13 @@ class GlobalContextEncoder(nn.Module):
         )
 
     def forward(self, x):
-        # x: (B, 3, H, W) - typically 500x500 tiles
+        # x: (B, 3, H, W) or (B, 4, H, W)
+
+        if x.shape[1] == 3:
+            # Auto-compute shadow channel if missing
+            shadow = compute_shadow_channel(x)
+            x = torch.cat([x, shadow], dim=1)  # (B, 4, H, W)
+
         features = self.backbone(x)  # (B, 512, 1, 1)
         features = torch.flatten(features, 1)  # (B, 512)
 
