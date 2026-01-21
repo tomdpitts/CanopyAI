@@ -28,7 +28,7 @@ class SolarContextTrainer:
 
     def train_step(self, images):
         """
-        images: Batch of orthomosaic crops (B, 3, 1024, 1024)
+        images: Batch of orthomosaic crops (B, 3, 500, 500)
         """
         batch_size = images.shape[0]
         device = images.device
@@ -38,10 +38,8 @@ class SolarContextTrainer:
         v1 = self.model(images)  # (B, 2)
 
         # 2. Rotation Augmentation
-        # Pick a random angle for each image in batch (simplification: same angle for batch)
-        # Let's rotate by 90 degrees for simplicity (easy tensor swap)
-        # Or proper rotation:
-        angle_deg = 90.0
+        # Random angle for each training step (full 360° range)
+        angle_deg = torch.rand(1).item() * 360.0  # Random angle in [0, 360)
         angle_rad = math.radians(angle_deg)
 
         # Rotate images
