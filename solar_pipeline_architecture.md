@@ -4,24 +4,24 @@
 graph TD
     subgraph "Stage 0: Global Context Inference"
         Ortho[Full Orthomosaic] -->|"Sample N random 500x500 crops"| Crops[Random Crops]
-        Crops -->|ResNet18| ContextEncoder[Context Encoder]
-        ContextEncoder -->|Regress| Predictions["Per-Crop Sun Vectors (N,2)"]
-        Predictions -->|Circular Mean| SunVec["Global Sun Vector (1,2)"]
+        Crops -->|ResNet18 backbone| GCE["GlobalContextEncoder"]
+        GCE -->|"projection_head → normalize"| Predictions["Per-Crop Sun Vectors (N,2)"]
+        Predictions -->|Circular Mean| SunVec["sun_vector (B,2)"]
     end
 
-    subgraph "Stage 1: Solar-Gated Detection"
-        Tile[High-Res 500x500 Tile] -->|Fine-tuned ResNet| Backbone[ResNet Backbone]
-        Backbone -->|C3, C4, C5| FPN["Feature Pyramid Network (B,256,H,W)"]
+    subgraph "Stage 1: SolarRetinaNet"
+        Tile[High-Res 500x500 Tile] -->|"ResNet50 (oscar50 weights)"| Backbone[backbone]
+        Backbone -->|C3, C4, C5| FPN["FPN features (B,256,H,W)"]
         
-        subgraph SolarGate["Solar Gate Layer (per FPN level)"]
-            SunVec -.->|"FiLM: (B,2)"| MLP["MLP: 2→256"]
-            MLP -->|"Channel Bias (B,256,1,1)"| Add(("+"))
-            FPNIn["FPN Features (B,256,H,W)"] -->|"broadcast add"| Add
-            Add -->|"Conditioned (B,256,H,W)"| Conv3x3["3×3 Conv → 1ch"]
-            Conv3x3 --> Sigmoid["σ: Sigmoid"]
-            Sigmoid -->|"Attention (B,1,H,W)"| Gate(("×"))
-            FPNIn -.->|"Original features"| Gate
-            Gate --> GatedOut["Gated Features (B,256,H,W)"]
+        subgraph SolarGate["SolarAttentionBlock (per FPN level)"]
+            SunVec -.->|"FiLM: (B,2)"| MLP["sun_mlp: 2→64→256"]
+            MLP -->|"sun_embedding (B,256,1,1)"| Add(("+"))
+            FPNIn["x: FPN features (B,256,H,W)"] -->|"broadcast add"| Add
+            Add -->|"conditioned_features"| Conv3x3["gate_conv: 3×3 → 1ch"]
+            Conv3x3 --> Sigmoid["sigmoid"]
+            Sigmoid -->|"attn_map (B,1,H,W)"| Gate(("×"))
+            FPNIn -.->|"x (original)"| Gate
+            Gate --> GatedOut["out (B,256,H,W)"]
         end
         
         FPN --> FPNIn
