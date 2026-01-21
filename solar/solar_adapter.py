@@ -17,7 +17,9 @@ class GlobalContextEncoder(nn.Module):
     def __init__(self, pretrained=True):
         super().__init__()
         # Use a lightweight backbone
-        resnet = models.resnet18(pretrained=pretrained)
+        resnet = models.resnet18(
+            pretrained=pretrained
+        )  # this model is trained on ImageNet-1K e.g. dogs, planes, cars
 
         # Remove the classification head (fc)
         self.backbone = nn.Sequential(*list(resnet.children())[:-1])
