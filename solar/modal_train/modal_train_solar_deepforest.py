@@ -9,6 +9,10 @@ from pathlib import Path
 # Note: These imports are deferred to inside the Modal function
 # where sys.path is set up correctly
 
+# Get the project root (solar/modal_train -> solar -> canopyAI)
+SCRIPT_DIR = Path(__file__).parent
+PROJECT_ROOT = SCRIPT_DIR.parent.parent
+
 app = modal.App("solar-deepforest-training")
 
 image = (
@@ -24,7 +28,7 @@ image = (
         "opencv-python-headless",
     )
     .add_local_dir(
-        "..",
+        str(PROJECT_ROOT),  # Absolute path to canopyAI
         remote_path="/root/canopyAI",
         ignore=[
             # Large files

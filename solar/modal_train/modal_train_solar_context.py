@@ -2,6 +2,12 @@ import modal
 import sys
 import os
 
+from pathlib import Path
+
+# Get the project root (solar/modal_train -> solar -> canopyAI)
+SCRIPT_DIR = Path(__file__).parent
+PROJECT_ROOT = SCRIPT_DIR.parent.parent
+
 app = modal.App("solar-context-training")
 
 # reuse the same image/volumes as deepforest
@@ -9,7 +15,7 @@ image = (
     modal.Image.debian_slim()
     .pip_install("torch", "torchvision", "numpy", "pillow", "tqdm")
     .add_local_dir(
-        "..",  # Parent directory (canopyAI)
+        str(PROJECT_ROOT),  # Absolute path to canopyAI
         remote_path="/root/canopyAI",
         ignore=[
             # Large files
