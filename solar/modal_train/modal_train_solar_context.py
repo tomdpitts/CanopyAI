@@ -11,7 +11,32 @@ image = (
     .add_local_dir(
         "..",  # Parent directory (canopyAI)
         remote_path="/root/canopyAI",
-        ignore=["*.tif", ".git", "__pycache__", "venv*", "data/"],
+        ignore=[
+            # Large files
+            "*.tif",
+            "*.tiff",
+            "*.pth",
+            "*.png",
+            "*.jpg",
+            "*.jpeg",
+            # Directories
+            ".git",
+            "__pycache__",
+            "venv*",
+            ".mypy_cache",
+            "data/",
+            "input_data/",
+            "input_data_small/",
+            "models/",
+            "samples/",
+            "quebec/",
+            "won_samples/",
+            "test_rawortho_output/",
+            "test_rawortho_output.png",
+            # Other
+            "*.pyc",
+            ".DS_Store",
+        ],
     )
 )
 
