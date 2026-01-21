@@ -26,57 +26,110 @@ class SolarContextTrainer:
         # Cosine Similarity is better for vectors than MSE
         self.criterion = nn.CosineEmbeddingLoss()
 
-    def train_step(self, images):
+    def train_step(self, images, num_rotations=4):
         """
+        Multi-rotation training step.
+
+        For each image, apply N random rotations and predict vectors.
+        Enforce that all pairs of predictions are correctly rotated.
+        This prevents the "constant output" degenerate solution.
+
         images: Batch of orthomosaic crops (B, 3, 500, 500)
+        num_rotations: Number of random rotations per image (default 4)
         """
         batch_size = images.shape[0]
         device = images.device
 
-        # 1. Forward Pass on Original Images
-        # V1 = Predicted Sun Vector for original image
-        v1 = self.model(images)  # (B, 2)
+        # Generate N random angles for this step
+        angles_deg = torch.rand(num_rotations) * 360.0  # (N,) random angles
+        angles_rad = angles_deg * (math.pi / 180.0)
 
-        # 2. Rotation Augmentation
-        # Random angle for each training step (full 360° range)
-        angle_deg = torch.rand(1).item() * 360.0  # Random angle in [0, 360)
-        angle_rad = math.radians(angle_deg)
+        # Collect predictions for each rotation
+        predictions = []  # List of (B, 2) tensors
 
-        # Rotate images
-        images_rotated = TF.rotate(images, angle_deg)
+        for i, angle_deg in enumerate(angles_deg):
+            if i == 0:
+                # First "rotation" is identity (original image)
+                rotated_images = images
+            else:
+                rotated_images = TF.rotate(images, angle_deg.item())
 
-        # 3. Forward Pass on Rotated Images
-        # V2 = Predicted Sun Vector for rotated image
-        v2 = self.model(images_rotated)  # (B, 2)
+            v = self.model(rotated_images)  # (B, 2)
+            predictions.append(v)
 
-        # 4. Rotate V1 to match V2
-        # If the model features are consistent, V1 rotated by 90 should equal V2.
-        # Rotation Matrix R for +90 degrees (counter-clockwise)
-        # | cos -sin |  | 0 -1 |
-        # | sin  cos |  | 1  0 |
+        # Compute pairwise consistency loss
+        # For each pair (i, j), v_j should equal R(theta_j - theta_i) @ v_i
+        total_loss = 0.0
+        num_pairs = 0
 
-        # Generic rotation matrix for batch
-        # v_rot = v_original @ R.T
-        c, s = math.cos(angle_rad), math.sin(angle_rad)
-        # Rotation matrix for (x, y)
-        R = torch.tensor([[c, -s], [s, c]], device=device)
+        for i in range(num_rotations):
+            for j in range(i + 1, num_rotations):
+                # Rotation from i to j
+                delta_angle = angles_rad[j] - angles_rad[i]
+                c, s = torch.cos(delta_angle), torch.sin(delta_angle)
+                R = torch.tensor([[c, -s], [s, c]], device=device)
 
-        # Apply rotation to V1
-        # v1 is (B, 2), R is (2, 2)
-        # (B, 2) x (2, 2) -> (B, 2)
-        v1_rotated = torch.matmul(v1, R.t())
+                # Rotate prediction i to match prediction j
+                v_i = predictions[i]  # (B, 2)
+                v_j = predictions[j]  # (B, 2)
+                v_i_rotated = torch.matmul(v_i, R.t())  # (B, 2)
 
-        # 5. Loss Function
-        # We want v1_rotated to be 'close' to v2
-        # Target is 1.0 (perfect alignment)
-        loss = self.criterion(v1_rotated, v2, target=torch.ones(batch_size).to(device))
+                # Loss: v_i_rotated should match v_j
+                pair_loss = self.criterion(
+                    v_i_rotated, v_j, target=torch.ones(batch_size, device=device)
+                )
+                total_loss += pair_loss
+                num_pairs += 1
 
-        # 6. Optimization
+        # Average over all pairs
+        loss = total_loss / num_pairs
+
+        # Optimization
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
 
         return loss.item()
+
+    def compute_val_loss(self, images, num_rotations=4):
+        """
+        Compute validation loss without gradient updates.
+        Same multi-rotation approach as train_step.
+        """
+        batch_size = images.shape[0]
+        device = images.device
+
+        angles_deg = torch.rand(num_rotations) * 360.0
+        angles_rad = angles_deg * (math.pi / 180.0)
+
+        predictions = []
+        for i, angle_deg in enumerate(angles_deg):
+            if i == 0:
+                rotated_images = images
+            else:
+                rotated_images = TF.rotate(images, angle_deg.item())
+            v = self.model(rotated_images)
+            predictions.append(v)
+
+        total_loss = 0.0
+        num_pairs = 0
+
+        for i in range(num_rotations):
+            for j in range(i + 1, num_rotations):
+                delta_angle = angles_rad[j] - angles_rad[i]
+                c, s = torch.cos(delta_angle), torch.sin(delta_angle)
+                R = torch.tensor([[c, -s], [s, c]], device=device)
+
+                v_i_rotated = torch.matmul(predictions[i], R.t())
+                pair_loss = self.criterion(
+                    v_i_rotated,
+                    predictions[j],
+                    target=torch.ones(batch_size, device=device),
+                )
+                total_loss += pair_loss.item()
+                num_pairs += 1
+
+        return total_loss / num_pairs
 
 
 # Dataset for pre-tiled training images (already 500x500)

@@ -104,32 +104,54 @@ def train_context_modal(
         best_loss = ckpt.get("best_loss", float("inf"))
         epochs_without_improvement = ckpt.get("epochs_without_improvement", 0)
 
-    # 3. Data Loading
-    # images need to be accessible on the volume at image_dir
-    dataset = RawOrthoDataset(image_dir)
-    print(f"📊 Training on {len(dataset)} images")
+    # 3. Data Loading - Train from raw/, Validate from raw_test/
+    train_dir = image_dir  # /data/images/data/won/raw
+    val_dir = image_dir.replace("/raw", "/raw_test")  # /data/images/data/won/raw_test
 
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4)
+    train_dataset = RawOrthoDataset(train_dir)
+    val_dataset = RawOrthoDataset(val_dir)
 
-    # 4. Training Loop with Periodic Checkpointing and Early Stopping
+    print(f"📊 Training on {len(train_dataset)} images from {train_dir}")
+    print(f"📊 Validating on {len(val_dataset)} images from {val_dir}")
+
+    train_loader = DataLoader(
+        train_dataset, batch_size=batch_size, shuffle=True, num_workers=4
+    )
+    val_loader = DataLoader(
+        val_dataset, batch_size=batch_size, shuffle=False, num_workers=4
+    )
+
+    # 4. Training Loop with Validation-Based Early Stopping
     for epoch in range(start_epoch, epochs):
+        # Training
         model.train()
-        total_loss = 0
-        for batch in dataloader:
+        train_loss = 0
+        for batch in train_loader:
             batch = batch.to(device)
             loss = trainer.train_step(batch)
-            total_loss += loss
+            train_loss += loss
+        avg_train_loss = train_loss / len(train_loader)
 
-        avg_loss = total_loss / len(dataloader)
-        print(f"Epoch {epoch}: Loss {avg_loss:.4f}")
+        # Validation
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for batch in val_loader:
+                batch = batch.to(device)
+                # Compute validation loss (same multi-rotation approach)
+                val_batch_loss = trainer.compute_val_loss(batch)
+                val_loss += val_batch_loss
+        avg_val_loss = val_loss / len(val_loader)
 
-        # Early stopping check
-        if avg_loss < best_loss:
-            best_loss = avg_loss
+        print(f"Epoch {epoch}: Train {avg_train_loss:.4f} | Val {avg_val_loss:.4f}")
+
+        # Early stopping based on validation loss
+        if avg_val_loss < best_loss:
+            best_loss = avg_val_loss
             epochs_without_improvement = 0
             # Save best model
             torch.save({"model": model.state_dict(), "loss": best_loss}, best_ckpt)
-            print(f"📈 New best loss: {best_loss:.4f}")
+            print(f"📈 New best val loss: {best_loss:.4f}")
         else:
             epochs_without_improvement += 1
             print(
@@ -141,7 +163,8 @@ def train_context_modal(
             "epoch": epoch,
             "model": model.state_dict(),
             "optimizer": trainer.optimizer.state_dict(),
-            "loss": avg_loss,
+            "train_loss": avg_train_loss,
+            "val_loss": avg_val_loss,
             "best_loss": best_loss,
             "epochs_without_improvement": epochs_without_improvement,
         }
@@ -154,7 +177,7 @@ def train_context_modal(
             print(f"🛑 Early stopping triggered after {epoch + 1} epochs")
             break
 
-    print(f"✅ Training Complete. Best loss: {best_loss:.4f}")
+    print(f"✅ Training Complete. Best val loss: {best_loss:.4f}")
 
 
 @app.local_entrypoint()
