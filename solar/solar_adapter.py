@@ -14,11 +14,11 @@ class GlobalContextEncoder(nn.Module):
     Training Objective: Self-Supervised Rotational Equivariance.
     """
 
-    def __init__(self, pretrained=True):
+    def __init__(self):
         super().__init__()
         # Use a lightweight backbone
         resnet = models.resnet18(
-            pretrained=pretrained
+            weights=models.ResNet18_Weights.IMAGENET1K_V1
         )  # this model is trained on ImageNet-1K e.g. dogs, planes, cars
 
         # Remove the classification head (fc)
