@@ -7,14 +7,14 @@ Key features:
 - Shadow-canopy dual supervision for heuristic/adaptive modes
 
 Supports three training modes:
-- unguided: DiceBCE on canopy only (frozen encoder)
-- heuristic: DiceBCE on canopy + shadow penalty (frozen encoder)
-- adaptive: DiceBCE + shadow penalty with LoRA-adapted encoder
+- standard_sam: DiceBCE on canopy only (frozen encoder)
+- shadow_penalty: DiceBCE on canopy + shadow penalty (frozen encoder)
+- lora_adapted_encoder_plus_shadow_penalty: DiceBCE + shadow penalty with LoRA-adapted encoder
 
 Usage:
-    modal run modal_train_sam_proper.py --mode unguided --seed 42
-    modal run modal_train_sam_proper.py --mode heuristic --seed 42
-    modal run modal_train_sam_proper.py --mode adaptive --seed 42
+    modal run modal_train_sam_proper.py --mode standard_sam --seed 42
+    modal run modal_train_sam_proper.py --mode shadow_penalty --seed 42
+    modal run modal_train_sam_proper.py --mode lora_adapted_encoder_plus_shadow_penalty --seed 42
 """
 
 import modal
@@ -47,7 +47,7 @@ VOLUME_PATH = "/data"
     volumes={VOLUME_PATH: data_volume},
 )
 def train_model(
-    mode: str = "unguided",
+    mode: str = "standard_sam",
     epochs: int = 50,
     batch_size: int = 4,
     lr: float = 1e-4,
@@ -167,7 +167,7 @@ def train_model(
 
     # Mode-specific encoder configuration
     lora_params = []
-    if mode == "adaptive":
+    if mode == "lora_adapted_encoder_plus_shadow_penalty":
         # Add LoRA adapters to encoder (keeps pretrained weights frozen)
         print("🔧 Adding LoRA adapters to encoder...")
         lora_params = add_lora_to_encoder(sam, r=8, alpha=16)
@@ -463,7 +463,7 @@ def train_model(
 
     # Optimizer (decoder + prompt encoder, plus LoRA params for adaptive)
     trainable_params = [p for p in sam.parameters() if p.requires_grad]
-    if mode == "adaptive":
+    if mode == "lora_adapted_encoder_plus_shadow_penalty":
         trainable_params = trainable_params + lora_params
     optimizer = optim.AdamW(trainable_params, lr=lr, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, epochs)
@@ -584,7 +584,7 @@ def train_model(
         epochs_without_improvement = ckpt["epochs_without_improvement"]
         history = ckpt.get("history", [])
         baseline_iou = ckpt.get("baseline_iou", baseline_iou)
-        if mode == "adaptive" and "lora" in ckpt:
+        if mode == "lora_adapted_encoder_plus_shadow_penalty" and "lora" in ckpt:
             load_lora_state(sam, ckpt["lora"], device)
         print(f"   Resuming from epoch {start_epoch}, best IoU: {best_iou:.4f}")
     else:
@@ -647,7 +647,10 @@ def train_model(
                 # Compute loss
                 loss = dice_bce_loss(pred[0], canopy_gt[i])
 
-                if mode in ("heuristic", "adaptive"):
+                if mode in (
+                    "shadow_penalty",
+                    "lora_adapted_encoder_plus_shadow_penalty",
+                ):
                     # Shadow penalty: penalize predicting shadow as canopy
                     shadow_penalty = (pred[0] * shadow_gt[i]).mean()
                     loss = loss + lambda_shadow * shadow_penalty
@@ -705,7 +708,10 @@ def train_model(
                     pred = torch.sigmoid(pred.squeeze(1))
 
                     loss = dice_bce_loss(pred[0], canopy_gt[i])
-                    if mode in ("heuristic", "adaptive"):
+                    if mode in (
+                        "shadow_penalty",
+                        "lora_adapted_encoder_plus_shadow_penalty",
+                    ):
                         shadow_penalty = (pred[0] * shadow_gt[i]).mean()
                         loss = loss + lambda_shadow * shadow_penalty
 
@@ -747,7 +753,7 @@ def train_model(
                 "epoch": epoch,
             }
             # For adaptive mode, also save LoRA weights
-            if mode == "adaptive":
+            if mode == "lora_adapted_encoder_plus_shadow_penalty":
                 lora_state = {}
                 for idx, block in enumerate(sam.image_encoder.blocks):
                     if hasattr(block.attn.qkv, "lora_A"):
@@ -787,7 +793,7 @@ def train_model(
                 "scheduler": scheduler.state_dict(),
                 "history": history,
             }
-            if mode == "adaptive":
+            if mode == "lora_adapted_encoder_plus_shadow_penalty":
                 periodic_ckpt["lora"] = get_lora_state(sam)
             torch.save(periodic_ckpt, checkpoint_path)
             data_volume.commit()  # Persist to volume
@@ -835,7 +841,7 @@ def train_model(
 
 @app.local_entrypoint()
 def main(
-    mode: str = "unguided",
+    mode: str = "standard_sam",
     epochs: int = 50,
     batch_size: int = 4,
     lr: float = 1e-4,
@@ -845,8 +851,14 @@ def main(
     run_name: str = "",
 ):
     """Run SAM finetuning on Modal."""
-    if mode not in ["unguided", "heuristic", "adaptive"]:
-        raise ValueError(f"Invalid mode: {mode}. Use unguided, heuristic, or adaptive")
+    if mode not in [
+        "standard_sam",
+        "shadow_penalty",
+        "lora_adapted_encoder_plus_shadow_penalty",
+    ]:
+        raise ValueError(
+            f"Invalid mode: {mode}. Use standard_sam, shadow_penalty, or lora_adapted_encoder_plus_shadow_penalty"
+        )
 
     result = train_model.remote(
         mode=mode,
