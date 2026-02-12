@@ -1,0 +1,385 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Shadow Direction Annotator</title>
+    <style>
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background: #1a1a1a;
+            color: #e0e0e0;
+        }
+
+        h1 {
+            color: #4CAF50;
+            margin-bottom: 10px;
+        }
+
+        .controls {
+            background: #2a2a2a;
+            padding: 20px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+        }
+
+        .image-container {
+            position: relative;
+            display: inline-block;
+            background: #000;
+            border-radius: 8px;
+            overflow: hidden;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+        }
+
+        canvas {
+            display: block;
+            cursor: crosshair;
+        }
+
+        .info {
+            background: #2a2a2a;
+            padding: 15px;
+            border-radius: 8px;
+            margin-top: 20px;
+        }
+
+        button {
+            background: #4CAF50;
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 16px;
+            margin-right: 10px;
+            transition: background 0.2s;
+        }
+
+        button:hover {
+            background: #45a049;
+        }
+
+        button:disabled {
+            background: #555;
+            cursor: not-allowed;
+        }
+
+        .secondary {
+            background: #666;
+        }
+
+        .secondary:hover {
+            background: #777;
+        }
+
+        input[type="file"] {
+            margin-bottom: 15px;
+        }
+
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 15px;
+            margin-top: 15px;
+        }
+
+        .stat-box {
+            background: #333;
+            padding: 15px;
+            border-radius: 6px;
+            text-align: center;
+        }
+
+        .stat-value {
+            font-size: 32px;
+            font-weight: bold;
+            color: #4CAF50;
+        }
+
+        .stat-label {
+            color: #999;
+            font-size: 14px;
+            margin-top: 5px;
+        }
+
+        .arrow-preview {
+            color: #4CAF50;
+            font-weight: bold;
+        }
+    </style>
+</head>
+
+<body>
+    <h1>🌞 Shadow Direction Annotator</h1>
+    <p>Click on the image to mark shadow direction. The arrow will point from center to your click.</p>
+
+    <div class="controls">
+        <input type="file" id="imageInput" webkitdirectory directory multiple accept="image/*">
+        <div>
+            <button id="prevBtn" disabled>← Previous</button>
+            <button id="nextBtn" disabled>Next →</button>
+            <button id="skipBtn" class="secondary" disabled>Skip (No Shadow)</button>
+            <button id="exportBtn" class="secondary">Export Annotations</button>
+        </div>
+    </div>
+
+    <div class="image-container">
+        <canvas id="canvas"></canvas>
+    </div>
+
+    <div class="info">
+        <div id="imageInfo">Load images to begin</div>
+        <div class="stats">
+            <div class="stat-box">
+                <div class="stat-value" id="currentIndex">0</div>
+                <div class="stat-label">Current Image</div>
+            </div>
+            <div class="stat-box">
+                <div class="stat-value" id="totalImages">0</div>
+                <div class="stat-label">Total Images</div>
+            </div>
+            <div class="stat-box">
+                <div class="stat-value" id="annotatedCount">0</div>
+                <div class="stat-label">Annotated</div>
+            </div>
+        </div>
+        <div id="currentAngle" style="margin-top: 15px;"></div>
+    </div>
+
+    <div id="csvOutput" style="display: none; margin-top: 20px;">
+        <h3 style="color: #4CAF50;">📋 CSV Output (Copy/Paste This)</h3>
+        <p style="color: #999;">The download didn't work? No problem - copy the text below and save it as
+            <code>shadow_annotations.csv</code>
+        </p>
+        <textarea id="csvText" readonly
+            style="width: 100%; height: 200px; font-family: monospace; background: #1a1a1a; color: #0f0; border: 1px solid #4CAF50; padding: 10px; border-radius: 6px; font-size: 12px;"></textarea>
+    </div>
+
+    <script>
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+        const imageInput = document.getElementById('imageInput');
+        const prevBtn = document.getElementById('prevBtn');
+        const nextBtn = document.getElementById('nextBtn');
+        const skipBtn = document.getElementById('skipBtn');
+        const exportBtn = document.getElementById('exportBtn');
+
+        let images = [];
+        let currentIndex = 0;
+        let annotations = {};
+        let currentImage = null;
+
+        imageInput.addEventListener('change', (e) => {
+            const files = Array.from(e.target.files).filter(f => f.type.startsWith('image/'));
+            images = files.sort((a, b) => a.name.localeCompare(b.name));
+            currentIndex = 0;
+            annotations = {};
+
+            document.getElementById('totalImages').textContent = images.length;
+
+            if (images.length > 0) {
+                loadImage(0);
+                updateButtons();
+            }
+        });
+
+        function loadImage(index) {
+            if (index < 0 || index >= images.length) return;
+
+            currentIndex = index;
+            const file = images[index];
+
+            const reader = new FileReader();
+            reader.onload = (e) => {
+                const img = new Image();
+                img.onload = () => {
+                    currentImage = img;
+
+                    // Scale to fit screen
+                    const maxWidth = 800;
+                    const maxHeight = 600;
+                    let width = img.width;
+                    let height = img.height;
+
+                    if (width > maxWidth) {
+                        height = (maxWidth / width) * height;
+                        width = maxWidth;
+                    }
+                    if (height > maxHeight) {
+                        width = (maxHeight / height) * width;
+                        height = maxHeight;
+                    }
+
+                    canvas.width = width;
+                    canvas.height = height;
+
+                    drawImage();
+                    updateInfo();
+                    updateButtons();
+                };
+                img.src = e.target.result;
+            };
+            reader.readAsDataURL(file);
+        }
+
+        function drawImage() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            ctx.drawImage(currentImage, 0, 0, canvas.width, canvas.height);
+
+            // Draw existing annotation if present
+            const fileName = images[currentIndex].name;
+            if (annotations[fileName]) {
+                drawArrow(annotations[fileName].x, annotations[fileName].y);
+            }
+        }
+
+        function drawArrow(clickX, clickY) {
+            const centerX = canvas.width / 2;
+            const centerY = canvas.height / 2;
+
+            // Draw line
+            ctx.strokeStyle = 'red';
+            ctx.lineWidth = 4;
+            ctx.beginPath();
+            ctx.moveTo(centerX, centerY);
+            ctx.lineTo(clickX, clickY);
+            ctx.stroke();
+
+            // Draw arrowhead
+            const angle = Math.atan2(clickY - centerY, clickX - centerX);
+            const headLength = 20;
+
+            ctx.fillStyle = 'red';
+            ctx.beginPath();
+            ctx.moveTo(clickX, clickY);
+            ctx.lineTo(
+                clickX - headLength * Math.cos(angle - Math.PI / 6),
+                clickY - headLength * Math.sin(angle - Math.PI / 6)
+            );
+            ctx.lineTo(
+                clickX - headLength * Math.cos(angle + Math.PI / 6),
+                clickY - headLength * Math.sin(angle + Math.PI / 6)
+            );
+            ctx.closePath();
+            ctx.fill();
+
+            // Draw center point
+            ctx.fillStyle = 'yellow';
+            ctx.beginPath();
+            ctx.arc(centerX, centerY, 8, 0, 2 * Math.PI);
+            ctx.fill();
+        }
+
+        canvas.addEventListener('click', (e) => {
+            if (!currentImage) return;
+
+            const rect = canvas.getBoundingClientRect();
+            const x = e.clientX - rect.left;
+            const y = e.clientY - rect.top;
+
+            const centerX = canvas.width / 2;
+            const centerY = canvas.height / 2;
+
+            // Calculate angle (0° = North, clockwise)
+            const dx = x - centerX;
+            const dy = y - centerY;
+            let angle = Math.atan2(dx, -dy) * 180 / Math.PI;
+            if (angle < 0) angle += 360;
+
+            const fileName = images[currentIndex].name;
+            annotations[fileName] = { x, y, angle: angle.toFixed(1) };
+
+            drawImage();
+            updateInfo();
+        });
+
+        prevBtn.addEventListener('click', () => {
+            if (currentIndex > 0) {
+                loadImage(currentIndex - 1);
+            }
+        });
+
+        nextBtn.addEventListener('click', () => {
+            if (currentIndex < images.length - 1) {
+                loadImage(currentIndex + 1);
+            }
+        });
+
+        skipBtn.addEventListener('click', () => {
+            const fileName = images[currentIndex].name;
+            annotations[fileName] = { skipped: true, angle: null };
+
+            if (currentIndex < images.length - 1) {
+                loadImage(currentIndex + 1);
+            }
+        });
+
+        exportBtn.addEventListener('click', () => {
+            const csv = ['filename,shadow_azimuth,skipped'];
+
+            for (const [filename, data] of Object.entries(annotations)) {
+                const angle = data.skipped ? '' : data.angle;
+                const skipped = data.skipped ? 'true' : 'false';
+                csv.push(`${filename},${angle},${skipped}`);
+            }
+
+            const csvContent = csv.join('\n');
+
+            // Try to trigger download
+            const blob = new Blob([csvContent], { type: 'text/csv' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'shadow_annotations.csv';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+
+            // Also show CSV in text area for manual copy/paste
+            document.getElementById('csvText').value = csvContent;
+            document.getElementById('csvOutput').style.display = 'block';
+
+            // Scroll to CSV output
+            document.getElementById('csvOutput').scrollIntoView({ behavior: 'smooth' });
+        });
+
+        function updateInfo() {
+            const fileName = images[currentIndex]?.name || '';
+            const annotation = annotations[fileName];
+
+            document.getElementById('imageInfo').innerHTML = `
+                <strong>Image:</strong> ${fileName}<br>
+            `;
+
+            if (annotation) {
+                if (annotation.skipped) {
+                    document.getElementById('currentAngle').innerHTML =
+                        '<span style="color: #ff9800;">⚠️ Skipped (no shadow)</span>';
+                } else {
+                    document.getElementById('currentAngle').innerHTML =
+                        `<span class="arrow-preview">→ Shadow Azimuth: ${annotation.angle}°</span>`;
+                }
+            } else {
+                document.getElementById('currentAngle').innerHTML =
+                    '<span style="color: #999;">No annotation yet</span>';
+            }
+
+            document.getElementById('currentIndex').textContent = currentIndex + 1;
+            document.getElementById('annotatedCount').textContent = Object.keys(annotations).length;
+        }
+
+        function updateButtons() {
+            prevBtn.disabled = currentIndex === 0;
+            nextBtn.disabled = currentIndex >= images.length - 1;
+            skipBtn.disabled = images.length === 0;
+        }
+    </script>
+</body>
+
+</html>
