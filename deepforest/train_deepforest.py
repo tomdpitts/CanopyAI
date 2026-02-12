@@ -29,6 +29,7 @@ def train_deepforest(
     patience=5,
     pretrained=True,
     wandb_project=None,
+    resume_from_checkpoint="auto",  # Default: always try to resume
 ):
     """
     Train a DeepForest model using DeepForest 2.0 config-based API.
@@ -44,6 +45,8 @@ def train_deepforest(
         patience: Early stopping patience
         pretrained: Whether to use pretrained weights
         wandb_project: Weights & Biases project name (unused in this version)
+        resume_from_checkpoint: "auto" (default) to resume from latest checkpoint,
+                               None to force fresh training, or path to specific checkpoint
     """
     # Create run-specific output directory
     run_output_dir = str(Path(output_dir) / run_name)
@@ -74,6 +77,30 @@ def train_deepforest(
             print(f"   Full traceback:")
             traceback.print_exc()
             raise RuntimeError("Cannot continue without pretrained weights") from e
+
+    # Auto-detect checkpoint if requested
+    checkpoint_path = None
+    if resume_from_checkpoint == "auto":
+        print("\n🔍 Searching for checkpoint to resume from...")
+        checkpoint_files = list(Path(run_output_dir).glob("*.ckpt"))
+        if checkpoint_files:
+            # Get most recent checkpoint by modification time
+            checkpoint_path = str(
+                max(checkpoint_files, key=lambda p: p.stat().st_mtime)
+            )
+            print(f"   ✅ Found checkpoint: {checkpoint_path}")
+            print(f"   🔄 Will resume training from this checkpoint")
+        else:
+            print(f"   ⚠️  No checkpoint found in {run_output_dir}")
+            print("   Starting fresh training")
+    elif resume_from_checkpoint:
+        checkpoint_path = resume_from_checkpoint
+        if Path(checkpoint_path).exists():
+            print(f"\n🔄 Resuming from checkpoint: {checkpoint_path}")
+        else:
+            print(f"\n⚠️  Checkpoint not found: {checkpoint_path}")
+            print("   Starting fresh training")
+            checkpoint_path = None
 
     # Configure training via model.config (DeepForest 2.0 API)
     print("\n⚙️  Configuring training...")
@@ -145,8 +172,8 @@ def train_deepforest(
         enable_checkpointing=True,
     )
 
-    # Train the model
-    model.trainer.fit(model)
+    # Train the model (with optional checkpoint resumption)
+    model.trainer.fit(model, ckpt_path=checkpoint_path)
 
     print("\n✅ Training complete!")
 

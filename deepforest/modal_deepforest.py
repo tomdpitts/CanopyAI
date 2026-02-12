@@ -96,7 +96,7 @@ def train_deepforest_modal(
     run_name=None,
     dataset="tcd",
 ):
-    """Train DeepForest on Modal with TCD data."""
+    """Train DeepForest on Modal with TCD data. Auto-resumes from checkpoint if exists."""
 
     os.chdir("/root/canopyAI")
     sys.path.insert(0, "/root/canopyAI")
@@ -193,7 +193,7 @@ def train_deepforest_modal(
         print("   Training without validation data")
         val_csv = None
 
-    # Train
+    # Train (auto-resumes from checkpoint if exists)
     model, results = train_deepforest.train_deepforest(
         train_csv=train_csv,
         val_csv=val_csv,
@@ -231,6 +231,8 @@ def main(
 ):
     """
     Launch DeepForest training on Modal.
+
+    Automatically resumes from latest checkpoint if found in run_name directory.
 
     Args:
         dataset: Which dataset to train on ('tcd', 'won', or 'both')
