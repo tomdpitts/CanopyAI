@@ -20,12 +20,16 @@ import tempfile
 import gc
 import shutil
 import time
+import math
+import random
 import numpy as np
 import rasterio
 from pathlib import Path
 from segment_anything import sam_model_registry, SamPredictor
+from PIL import Image
 import cv2
 import torch
+import torchvision.transforms as transforms
 from tqdm import tqdm
 from deepforest import main as deepforest_main
 from deepforest import utilities
@@ -160,6 +164,242 @@ def apply_nms(bboxes, scores, iou_threshold=0.5, coverage_threshold=0.5):
         indices = remaining
 
     return keep
+
+
+# =============================================================================
+# Stage 0: Shadow Vector Prediction (Global Context)
+# =============================================================================
+
+
+def extract_safe_crops(image, n_crops=30, crop_size=500, margin_fraction=0.2):
+    """
+    Extract random 500x500 crops from center region of image, avoiding edges.
+
+    Args:
+        image: RGB image as (H, W, 3) numpy array
+        n_crops: Number of crops to extract
+        crop_size: Size of each crop (default 500px)
+        margin_fraction: Fraction of image to avoid at edges (default 0.2 = 20%)
+
+    Returns:
+        List of PIL Image crops
+    """
+    h, w = image.shape[:2]
+
+    # Define safe extraction zone (center, avoiding margins)
+    margin_w = int(w * margin_fraction)
+    margin_h = int(h * margin_fraction)
+
+    safe_min_col = margin_w
+    safe_max_col = w - margin_w - crop_size
+    safe_min_row = margin_h
+    safe_max_row = h - margin_h - crop_size
+
+    # Fallback if image is too small
+    if safe_max_col <= safe_min_col or safe_max_row <= safe_min_row:
+        safe_min_col = max(0, crop_size)
+        safe_max_col = max(crop_size, w - crop_size)
+        safe_min_row = max(0, crop_size)
+        safe_max_row = max(0, h - crop_size)
+
+    crops = []
+    for _ in range(n_crops):
+        if safe_max_col <= safe_min_col or safe_max_row <= safe_min_row:
+            # Image too small for safe cropping
+            break
+
+        col_off = random.randint(safe_min_col, safe_max_col)
+        row_off = random.randint(safe_min_row, safe_max_row)
+
+        crop_np = image[row_off : row_off + crop_size, col_off : col_off + crop_size]
+        crop_pil = Image.fromarray(crop_np)
+        crops.append(crop_pil)
+
+    return crops
+
+
+def predict_shadow_vector_from_crops(crops, model, device):
+    """
+    Predict shadow vector from multiple crops using the trained model.
+
+    Args:
+        crops: List of PIL Image crops (500x500)
+        model: Trained shadow regression model
+        device: torch device
+
+    Returns:
+        List of predicted vectors (N, 2) as numpy arrays
+    """
+    preprocess = transforms.Compose(
+        [
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+        ]
+    )
+
+    vectors = []
+    model.eval()
+
+    with torch.no_grad():
+        for crop in crops:
+            img_tensor = preprocess(crop).unsqueeze(0).to(device)
+            pred = model(img_tensor).cpu().squeeze().numpy()
+            vectors.append(pred)
+
+    return np.array(vectors)  # (N, 2)
+
+
+def compute_circular_mean_with_outlier_rejection(vectors, outlier_threshold_deg=45.0):
+    """
+    Compute circular mean of shadow vectors with democratic outlier rejection.
+    Majority wins, minority is ignored.
+
+    Args:
+        vectors: Array of shadow vectors (N, 2)
+        outlier_threshold_deg: Reject vectors > this many degrees from median
+
+    Returns:
+        mean_vector: (2,) array - circular mean of inliers
+        n_inliers: Number of agreeing crops
+        n_outliers: Number of rejected outliers
+        circular_std: Circular standard deviation in degrees
+    """
+    # Convert vectors to angles
+    angles = np.arctan2(vectors[:, 0], vectors[:, 1])  # radians
+    angles_deg = np.degrees(angles) % 360
+
+    # Compute circular median as robust center estimate
+    # Use mean of sin and cos for circular median approximation
+    sin_mean = np.mean(np.sin(np.radians(angles_deg)))
+    cos_mean = np.mean(np.cos(np.radians(angles_deg)))
+    median_angle = np.degrees(np.arctan2(sin_mean, cos_mean)) % 360
+
+    # Compute circular distance from median
+    def circular_distance(a1, a2):
+        """Compute minimum angular distance between two angles."""
+        diff = np.abs(a1 - a2)
+        return np.minimum(diff, 360 - diff)
+
+    distances = circular_distance(angles_deg, median_angle)
+
+    # Democratic outlier rejection: keep predictions within threshold
+    inlier_mask = distances <= outlier_threshold_deg
+    n_inliers = inlier_mask.sum()
+    n_outliers = (~inlier_mask).sum()
+
+    if n_inliers == 0:
+        # All rejected (shouldn't happen with 45° threshold, but handle it)
+        # Fall back to using all
+        inlier_mask = np.ones(len(vectors), dtype=bool)
+        n_inliers = len(vectors)
+        n_outliers = 0
+
+    # Compute circular mean of inliers
+    inlier_angles_rad = angles[inlier_mask]
+    mean_sin = np.mean(np.sin(inlier_angles_rad))
+    mean_cos = np.mean(np.cos(inlier_angles_rad))
+    mean_angle_rad = np.arctan2(mean_sin, mean_cos)
+
+    # Convert to unit vector
+    mean_vector = np.array([np.sin(mean_angle_rad), np.cos(mean_angle_rad)])
+
+    # Compute circular standard deviation (measure of spread)
+    # R = length of mean vector (1 = perfect agreement, 0 = uniform spread)
+    R = np.sqrt(mean_sin**2 + mean_cos**2)
+    circular_std = np.degrees(np.sqrt(-2 * np.log(R))) if R > 0 else 180.0
+
+    return mean_vector, n_inliers, n_outliers, circular_std
+
+
+def predict_shadow_vector(
+    image, shadow_model_path, device, n_crops=30, outlier_threshold_deg=45.0
+):
+    """
+    Stage 0: Predict global shadow direction from orthomosaic.
+
+    Uses ResNet-34 shadow regression model to predict shadow vectors from
+    multiple random crops, then computes circular mean with outlier rejection.
+
+    Args:
+        image: RGB image as (H, W, 3) numpy array
+        shadow_model_path: Path to trained shadow model (.pth)
+        device: torch device
+        n_crops: Number of crops to sample (default 30)
+        outlier_threshold_deg: Outlier rejection threshold in degrees (default 45)
+
+    Returns:
+        shadow_vector: (2,) unit vector or None if prediction failed
+        stats: Dict with prediction statistics
+    """
+    print(f"\n🌞 Stage 0: Shadow Vector Prediction...")
+    print(f"   Sampling {n_crops} random 500×500 crops...")
+
+    # Import model class (inline to avoid external dependency)
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).parent / "solar" / "shadow_regression"))
+    from train_combined import ShadowResNet34
+
+    # Load model
+    model = ShadowResNet34()
+    model.load_state_dict(torch.load(shadow_model_path, map_location=device))
+    model.to(device)
+    model.eval()
+
+    # Extract crops
+    crops = extract_safe_crops(image, n_crops=n_crops)
+
+    if len(crops) == 0:
+        print("   ⚠️  Image too small for crop extraction")
+        return None, {"error": "image_too_small"}
+
+    if len(crops) < n_crops:
+        print(f"   ⚠️  Only extracted {len(crops)}/{n_crops} crops (image small)")
+
+    # Predict on each crop
+    print(f"   Running inference on {len(crops)} crops...")
+    vectors = predict_shadow_vector_from_crops(crops, model, device)
+
+    # Compute circular mean with outlier rejection
+    mean_vector, n_inliers, n_outliers, circular_std = (
+        compute_circular_mean_with_outlier_rejection(
+            vectors, outlier_threshold_deg=outlier_threshold_deg
+        )
+    )
+
+    # Convert to angle for logging
+    shadow_angle = math.degrees(math.atan2(mean_vector[0], mean_vector[1])) % 360
+
+    # Log consensus statistics
+    consensus_pct = (n_inliers / len(crops)) * 100
+    print(f"   ✅ Shadow direction: {shadow_angle:.1f}°")
+    print(
+        f"   📊 Consensus: {n_inliers}/{len(crops)} crops ({consensus_pct:.0f}%) | "
+        f"Rejected: {n_outliers} outliers"
+    )
+    print(f"   📏 Circular std: {circular_std:.1f}°")
+
+    # Prepare stats
+    stats = {
+        "shadow_angle_deg": shadow_angle,
+        "n_crops": len(crops),
+        "n_inliers": n_inliers,
+        "n_outliers": n_outliers,
+        "consensus_pct": consensus_pct,
+        "circular_std_deg": circular_std,
+        "shadow_vector": mean_vector.tolist(),
+    }
+
+    # Quality check: warn if low consensus
+    if consensus_pct < 70:
+        print(
+            f"   ⚠️  Low consensus ({consensus_pct:.0f}%) - predictions may be unreliable"
+        )
+        stats["reliable"] = False
+    else:
+        stats["reliable"] = True
+
+    return mean_vector, stats
 
 
 def detect_trees_deepforest(
@@ -997,6 +1237,23 @@ def main(args):
 
     sam_predictor = SamPredictor(sam)
 
+    # Stage 0: Shadow Vector Prediction (Optional)
+    shadow_vector = None
+    shadow_stats = None
+    if args.shadow_model:
+        try:
+            shadow_vector, shadow_stats = predict_shadow_vector(
+                image,
+                args.shadow_model,
+                device,
+                n_crops=args.shadow_n_crops,
+                outlier_threshold_deg=args.shadow_outlier_threshold,
+            )
+        except Exception as e:
+            print(f"   ⚠️  Shadow prediction failed: {e}")
+            print("   Continuing without shadow context...")
+            shadow_vector = None
+
     # Track timing for each stage
     timings = {}
     pipeline_start = time.time()
@@ -1250,6 +1507,32 @@ def parse_args():
         default=None,
         help="Directory for caching masks. "
         "If not provided, uses a temporary directory that is cleaned up after",
+    )
+
+    # Stage 0: Shadow Vector Prediction
+    ap.add_argument(
+        "--shadow_model",
+        type=str,
+        default=None,
+        help="Path to fine-tuned ResNet-34 shadow prediction model (.pth). "
+        "If provided, predicts global shadow direction before detection. "
+        "This enables future FiLM-conditioned training of oscar50.",
+    )
+
+    ap.add_argument(
+        "--shadow_n_crops",
+        type=int,
+        default=30,
+        help="Number of random crops for shadow prediction (default: 30). "
+        "More crops = more robust but slower.",
+    )
+
+    ap.add_argument(
+        "--shadow_outlier_threshold",
+        type=float,
+        default=45.0,
+        help="Outlier rejection threshold in degrees (default: 45). "
+        "Crops with predictions > this far from median are ignored.",
     )
 
     ap.add_argument(
