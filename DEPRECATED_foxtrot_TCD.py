@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 """
+DEPRECATED
 Two-Stage Tree Detection Pipeline: DeepForest + SAM
 ---------------------------------------------------
 This script implements a custom 2-stage model that:
