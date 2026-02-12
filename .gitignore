@@ -16,7 +16,7 @@ archive*
 *.sif
 canopyai.tar.gz
 .DS_Store
-won003*
+won003_train
 won003_sam
 BUILD_ON_HPC.md
 
@@ -42,3 +42,8 @@ crop3.tif
 
 test_rawortho*
 won_samples
+
+solar/shadow_regression/annotation_data/sjer_images/*.png
+solar/shadow_regression/annotation_images/*.png
+solar/shadow_regression/output/predictions_clean_unseen/*.png
+zebra
