@@ -47,3 +47,5 @@ solar/shadow_regression/annotation_data/sjer_images/*.png
 solar/shadow_regression/annotation_images/*.png
 solar/shadow_regression/output/predictions_clean_unseen/*.png
 zebra
+
+lightning_logs*

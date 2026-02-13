@@ -405,6 +405,8 @@ def predict_shadow_vector(
 def detect_trees_deepforest(
     image,
     model_path=None,
+    weights_path=None,
+    shadow_vector=None,
     tile_size=400,
     tile_overlap=0.05,
     confidence_threshold=0.35,
@@ -414,7 +416,9 @@ def detect_trees_deepforest(
 
     Args:
         image: RGB image as (H, W, 3) numpy array
-        model_path: Optional path to custom DeepForest model (.pth file)
+        model_path: Optional path to custom standard DeepForest model (.pth file)
+        weights_path: Optional path to FiLM-conditioned DeepForest weights (.pth file)
+        shadow_vector: (1, 2) tensor representing shadow direction for FiLM-DeepForest
         tile_size: Size of each tile (default 400px - DeepForest's native)
         tile_overlap: Overlap between tiles (default 0.05 = 5%)
         confidence_threshold: Minimum confidence score for detections
@@ -424,36 +428,86 @@ def detect_trees_deepforest(
         all_scores: List of confidence scores
     """
     import warnings
+    from deepforest import main as deepforest_main
+    from deepforest import utilities
 
     print("\n🌲 Pass 1: DeepForest Detection...")
 
-    # Initialize DeepForest model
-    df_model = deepforest_main.deepforest()
-
-    if model_path:
-        print(f"   Loading custom model: {model_path}")
-        df_model.model.load_state_dict(torch.load(model_path, map_location="cpu"))
-    else:
-        print("   Loading default model from Hugging Face...")
-        df_model.load_model("weecology/deepforest-tree")
-
-    # Set device for GPU acceleration
-    # NOTE: DeepForest v2.0.0 uses self.device to move input tensors during predict_image.
-    # Simply calling model.to(device) is NOT sufficient - must set df_model.device.
+    # Determine device
     device = torch.device("cpu")
     if torch.backends.mps.is_available():
-        # Move model to MPS if available to speed up detection
         device = torch.device("mps")
-        df_model.model.to(device)
-        print(f"   🖥️  DeepForest on: {device}")
+    elif torch.cuda.is_available():
+        device = torch.device("cuda")
+    
+    # Load model based on whether we have FiLM weights
+    use_film = (weights_path is not None and shadow_vector is not None)
+    
+    
+    if use_film:
+        print("   🌞 Using FiLM-conditioned DeepForest")
+        try:
+            from deepforest_custom.models import ShadowConditionedDeepForest
+        except ImportError as e:
+            print(f"❌ Error importing FiLM model: {e}")
+            raise
+        
+        # Initialize FiLM model
+        df_model = ShadowConditionedDeepForest(shadow_angle_deg=0.0)
+        
+        # Load weights
+        checkpoint = torch.load(weights_path, map_location="cpu")
+        if "state_dict" in checkpoint:
+            state_dict = checkpoint["state_dict"]
+        else:
+            state_dict = checkpoint
+
+        # Try loading into full model first (expects "deepforest.model..." keys)
+        try:
+            df_model.load_state_dict(state_dict)
+            print(f"   ✅ Loaded full ShadowConditionedDeepForest weights")
+        except RuntimeError as e:
+            # Fallback: Try loading into inner RetinaNet (expects "backbone..." keys)
+            # This happens if checkpoint is standard DeepForest
+            print(f"   ⚠️  Full model load failed. Trying inner RetinaNet model...")
+            missing_keys, unexpected_keys = df_model.deepforest.model.load_state_dict(state_dict, strict=False)
+            
+            if len(unexpected_keys) == 0:
+                 print(f"   ✅ Loaded inner RetinaNet weights (standard DeepForest)")
+                 if len(missing_keys) > 0:
+                     print(f"   ℹ️  Missing keys (expected): {len(missing_keys)} (likely FiLM weights)")
+                     # print(f"   Keys: {missing_keys[:5]}...")
+                 print(f"   ℹ️  FiLM weights not in checkpoint. Initializing shadow conditioning layers from scratch.")
+                 print(f"   ℹ️  This is expected if using standard DeepForest weights as a base.")
+            else:
+                # If still failing or weird keys, raise the original error
+                print(f"   ❌ Inner model load failed.")
+                print(f"   ⚠️  Unexpected keys: {len(unexpected_keys)}")
+                print(f"   Example unexpected: {unexpected_keys[:5]}")
+                print(f"   ⚠️  Missing keys: {len(missing_keys)}")
+                raise e
+        
+        df_model.to(device)
+        df_model.eval()
+        print(f"   ✅ Loaded FiLM weights from {Path(weights_path).name}")
+        
     else:
-        print("   🖥️  DeepForest on: cpu")
+        print("   🌲 Using Standard DeepForest")
+        df_model = deepforest_main.deepforest()
+        
+        if model_path and Path(model_path).exists():
+            print(f"   Loading custom weights: {model_path}")
+            df_model.model.load_state_dict(torch.load(model_path, map_location="cpu"))
+        else:
+            print("   Loading default model from Hugging Face...")
+            df_model.load_model("weecology/deepforest-tree")
+        
+        df_model.model.to(device)
+        df_model.model.eval()
 
-    # Important: Set to evaluation mode for inference
-    # This prevents "targets should not be none" error when running manual inference
-    df_model.model.eval()
+    print(f"   🖥️  Device: {device}")
 
-    # Convert image to float32 for DeepForest
+    # Convert image to float32
     if image.dtype == np.uint8:
         image_float = image.astype("float32")
     else:
@@ -471,7 +525,7 @@ def detect_trees_deepforest(
     print(f"   Tile size: {tile_size}px, overlap: {int(tile_overlap * 100)}%")
     print(f"   Processing {total_tiles} tiles\n")
 
-    # Suppress DeepForest warnings
+    # Suppress warnings
     warnings.filterwarnings("ignore", message=".*image_path.*")
     warnings.filterwarnings("ignore", message=".*root_dir.*")
 
@@ -497,35 +551,33 @@ def detect_trees_deepforest(
 
             tile_count += 1
 
-            # Run prediction with manual device handling to support MPS
+            # Run prediction
             try:
-                # Custom prediction logic to bypass DeepForest bug
-                # Prepare input tensor on correct device
+                # Prepare input tensor
                 image_tensor = torch.tensor(tile).permute(2, 0, 1).float() / 255.0
-                image_tensor = image_tensor.to(device).unsqueeze(0)
+                image_tensor = image_tensor.to(device).unsqueeze(0)  # (1, C, H, W)
 
                 # Inference
                 with torch.no_grad():
-                    prediction = df_model.model(image_tensor)
+                    if use_film:
+                        # Pass shadow vector to FiLM model
+                        prediction = df_model(image_tensor, shadow_vectors=shadow_vector)
+                    else:
+                        # Standard DeepForest
+                        prediction = df_model.model(image_tensor)
 
                 # Post-process
                 if len(prediction[0]["boxes"]) > 0:
                     tile_preds = utilities.format_boxes(prediction[0])
-                    # Filter by confidence strictly
                     tile_preds = tile_preds[tile_preds["score"] >= confidence_threshold]
                 else:
                     tile_preds = None
+                    
             except Exception as e:
-                # Log error but continue (likely edge case or corrupt tile)
                 print(f"❌ Error on tile ({x_start},{y_start}): {e}")
                 continue
 
             if tile_preds is None or len(tile_preds) == 0:
-                continue
-
-            # Filter by confidence
-            tile_preds = tile_preds[tile_preds["score"] >= confidence_threshold]
-            if len(tile_preds) == 0:
                 continue
 
             # Convert local boxes to global coordinates
@@ -1239,6 +1291,7 @@ def main(args):
 
     # Stage 0: Shadow Vector Prediction (Optional)
     shadow_vector = None
+    shadow_vector_tensor = None
     shadow_stats = None
     if args.shadow_model:
         try:
@@ -1249,10 +1302,13 @@ def main(args):
                 n_crops=args.shadow_n_crops,
                 outlier_threshold_deg=args.shadow_outlier_threshold,
             )
+            # Convert to tensor for FiLM model
+            shadow_vector_tensor = torch.from_numpy(shadow_vector).float().to(device).unsqueeze(0)  # (1, 2)
         except Exception as e:
             print(f"   ⚠️  Shadow prediction failed: {e}")
             print("   Continuing without shadow context...")
             shadow_vector = None
+            shadow_vector_tensor = None
 
     # Track timing for each stage
     timings = {}
@@ -1263,6 +1319,8 @@ def main(args):
     all_bboxes, all_scores = detect_trees_deepforest(
         image,
         model_path=args.deepforest_model,
+        weights_path=args.deepforest_weights,
+        shadow_vector=shadow_vector_tensor,
         tile_size=args.df_tile_size,
         confidence_threshold=args.deepforest_confidence,
     )
@@ -1467,6 +1525,15 @@ def parse_args():
         default=None,
         help="Path to custom DeepForest model (.pth file). "
         "If not provided, uses default pretrained model",
+    )
+
+    ap.add_argument(
+        "--deepforest_weights",
+        type=str,
+        default=None,
+        help="Path to DeepForest weights (.pth file). "
+        "Use this for FiLM-conditioned models trained with shadow conditioning. "
+        "If provided along with --shadow_model, uses FiLM-conditioned inference.",
     )
 
     ap.add_argument(

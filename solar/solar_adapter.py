@@ -82,30 +82,8 @@ class GlobalContextEncoder(nn.Module):
             weights=models.ResNet18_Weights.IMAGENET1K_V1
         )  # this model is trained on ImageNet-1K.
 
-        # Modify first layer to accept 4 channels (RGB + Shadow)
-        # Original: Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False)
-        original_conv1 = resnet.conv1
-        new_conv1 = nn.Conv2d(
-            4,
-            original_conv1.out_channels,
-            kernel_size=original_conv1.kernel_size,
-            stride=original_conv1.stride,
-            padding=original_conv1.padding,
-            bias=original_conv1.bias,
-        )
-
-        # Initialize new conv1:
-        # Copy weights for first 3 channels
-        with torch.no_grad():
-            new_conv1.weight[:, :3, :, :] = original_conv1.weight
-            # Initialize 4th channel (shadow) with average of RGB weights -> allows it to contribute immediately
-            new_conv1.weight[:, 3:4, :, :] = torch.mean(
-                original_conv1.weight, dim=1, keepdim=True
-            )
-
-        resnet.conv1 = new_conv1
-
-        # Remove the classification head (fc)
+        # Standard ResNet18 accepts 3 channels (RGB)
+        # We use the backbone as-is, removing the classification head (fc)
         self.backbone = nn.Sequential(*list(resnet.children())[:-1])
 
         # New head: Regress to 2D vector (x, y)
@@ -116,12 +94,7 @@ class GlobalContextEncoder(nn.Module):
         )
 
     def forward(self, x):
-        # x: (B, 3, H, W) or (B, 4, H, W)
-
-        if x.shape[1] == 3:
-            # Auto-compute shadow channel if missing
-            shadow = compute_shadow_channel(x)
-            x = torch.cat([x, shadow], dim=1)  # (B, 4, H, W)
+        # x: (B, 3, H, W) - Standard RGB
 
         features = self.backbone(x)  # (B, 512, 1, 1)
         features = torch.flatten(features, 1)  # (B, 512)
