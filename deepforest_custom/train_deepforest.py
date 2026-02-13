@@ -14,8 +14,30 @@ On Modal:
 import argparse
 from pathlib import Path
 import pandas as pd
+import numpy as np
+import torch
+from torch import nn
+import torch.nn.functional as F
+
 from deepforest import main as deepforest_main
+import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
+
+
+
+# Import model classes from separate file
+try:
+    from .models import (
+        SolarAttentionBlock,
+        ShadowConditionedDeepForest,
+    )
+except ImportError:
+    # Fallback if run as script
+    from models import (
+        SolarAttentionBlock,
+        ShadowConditionedDeepForest,
+    )
+
 
 
 def train_deepforest(
@@ -29,10 +51,13 @@ def train_deepforest(
     patience=5,
     pretrained=True,
     wandb_project=None,
-    resume_from_checkpoint="auto",  # Default: always try to resume
+    shadow_conditioning=False,  # Enable FiLM conditioning
+    checkpoint=None,  # Optional checkpoint path for DeepForest weights
 ):
     """
     Train a DeepForest model using DeepForest 2.0 config-based API.
+
+    Automatically resumes from existing checkpoints if found (for Modal auto-restarts).
 
     Args:
         train_csv: Path to training CSV
@@ -45,8 +70,8 @@ def train_deepforest(
         patience: Early stopping patience
         pretrained: Whether to use pretrained weights
         wandb_project: Weights & Biases project name (unused in this version)
-        resume_from_checkpoint: "auto" (default) to resume from latest checkpoint,
-                               None to force fresh training, or path to specific checkpoint
+        shadow_conditioning: If True, use FiLM conditioning with constant 215° shadow
+        checkpoint: Optional path to DeepForest checkpoint file to load initial weights from
     """
     # Create run-specific output directory
     run_output_dir = str(Path(output_dir) / run_name)
@@ -60,47 +85,64 @@ def train_deepforest(
     print("=" * 60)
 
     # Initialize model
-    print("\n📦 Initializing DeepForest model...")
-    model = deepforest_main.deepforest()
+    print("\n⚙️  Initializing model...")
 
-    # Load pretrained weights if requested
-    if pretrained:
-        print("   Loading pretrained weights from Hugging Face...")
+    if shadow_conditioning:
+        print("   🌞 Shadow conditioning: ENABLED (FiLM)")
+        model = ShadowConditionedDeepForest(shadow_angle_deg=215.0)
+    else:
+        print("   🌞 Shadow conditioning: DISABLED (baseline)")
+        model = deepforest_main.deepforest()
+
+    # Load weights
+    import traceback
+
+    if checkpoint:
+        print(f"\n📦 Loading checkpoint: {checkpoint}")
         try:
-            model.load_model("weecology/deepforest-tree")
-            print("   ✅ Loaded pretrained weights from Hugging Face")
+            state_dict = torch.load(checkpoint, map_location="cpu")
+            # strict=False allows FiLM layers to stay random if shadow_conditioning=True
+            if shadow_conditioning:
+                model.deepforest.model.load_state_dict(state_dict, strict=False)
+            else:
+                model.model.load_state_dict(state_dict, strict=False)
+            print("   ✅ Checkpoint loaded successfully")
+            if shadow_conditioning:
+                print("   ℹ️  FiLM layers initialized randomly (not in checkpoint)")
         except Exception as e:
-            import traceback
-
-            print(f"   ❌ FAILED to load pretrained weights!")
-            print(f"   Error: {e}")
+            print(f"   ❌ Failed to load checkpoint: {e}")
+            print(f"   Full traceback:")
+            traceback.print_exc()
+            raise RuntimeError("Cannot continue without loading checkpoint") from e
+    elif pretrained:
+        print("\n📦 Loading pretrained weights...")
+        try:
+            if shadow_conditioning:
+                model.deepforest.create_model()
+                model.deepforest.load_model("weecology/deepforest-tree")
+            else:
+                model.create_model()
+                model.load_model("weecology/deepforest-tree")
+            print("   ✅ Loaded HuggingFace pretrained weights")
+        except Exception as e:
+            print(f"   ❌ Failed to load pretrained weights: {e}")
             print(f"   Full traceback:")
             traceback.print_exc()
             raise RuntimeError("Cannot continue without pretrained weights") from e
 
-    # Auto-detect checkpoint if requested
+    # Auto-detect and resume from checkpoint if it exists
+    # This handles Modal auto-restarts gracefully
     checkpoint_path = None
-    if resume_from_checkpoint == "auto":
-        print("\n🔍 Searching for checkpoint to resume from...")
-        checkpoint_files = list(Path(run_output_dir).glob("*.ckpt"))
-        if checkpoint_files:
-            # Get most recent checkpoint by modification time
-            checkpoint_path = str(
-                max(checkpoint_files, key=lambda p: p.stat().st_mtime)
-            )
-            print(f"   ✅ Found checkpoint: {checkpoint_path}")
-            print(f"   🔄 Will resume training from this checkpoint")
-        else:
-            print(f"   ⚠️  No checkpoint found in {run_output_dir}")
-            print("   Starting fresh training")
-    elif resume_from_checkpoint:
-        checkpoint_path = resume_from_checkpoint
-        if Path(checkpoint_path).exists():
-            print(f"\n🔄 Resuming from checkpoint: {checkpoint_path}")
-        else:
-            print(f"\n⚠️  Checkpoint not found: {checkpoint_path}")
-            print("   Starting fresh training")
-            checkpoint_path = None
+    print("\n🔍 Searching for checkpoint to resume from...")
+    checkpoint_files = list(Path(run_output_dir).glob("*.ckpt"))
+    if checkpoint_files:
+        # Get most recent checkpoint by modification time
+        checkpoint_path = str(max(checkpoint_files, key=lambda p: p.stat().st_mtime))
+        print(f"   ✅ Found checkpoint: {checkpoint_path}")
+        print(f"   🔄 Will resume training from this checkpoint")
+    else:
+        print(f"   ⚠️  No checkpoint found in {run_output_dir}")
+        print("   Starting fresh training")
 
     # Configure training via model.config (DeepForest 2.0 API)
     print("\n⚙️  Configuring training...")
@@ -109,6 +151,14 @@ def train_deepforest(
     model.config.train.epochs = epochs
     model.config.train.lr = lr
     model.config.batch_size = batch_size
+
+    # Configure rotation augmentation for FiLM training
+    if shadow_conditioning:
+        print("   🔄 Rotation augmentation: ENABLED")
+        print("   ℹ️  Images, bboxes, and shadow vectors will be rotated together")
+        # Custom collate will be set in the dataloader creation below
+    else:
+        print("   🔄 Rotation augmentation: DISABLED (baseline mode)")
 
     if val_csv:
         model.config.validation.csv_file = val_csv
@@ -165,15 +215,20 @@ def train_deepforest(
     print(f"\n🚀 Starting training...")
     print("-" * 60)
 
+    # When using shadow conditioning, model is a wrapper around DeepForest
+    # We need to train the inner DeepForest model (which has been patched for rotation)
+    # since PyTorch Lightning expects a LightningModule, not our nn.Module wrapper
+    training_model = model.deepforest if shadow_conditioning else model
+
     # Create trainer using DeepForest's API
-    model.create_trainer(
+    training_model.create_trainer(
         callbacks=callbacks,
         max_epochs=epochs,
         enable_checkpointing=True,
     )
 
-    # Train the model (with optional checkpoint resumption)
-    model.trainer.fit(model, ckpt_path=checkpoint_path)
+    # Train the inner model (patched for rotation + FiLM hooks)
+    training_model.trainer.fit(training_model, ckpt_path=checkpoint_path)
 
     print("\n✅ Training complete!")
 
@@ -182,7 +237,12 @@ def train_deepforest(
     print(f"💾 Saved final model to {final_model_path}")
     import torch
 
-    torch.save(model.model.state_dict(), str(final_model_path))
+    if shadow_conditioning:
+        # Save the full wrapper model (including FiLM weights)
+        torch.save(model.state_dict(), str(final_model_path))
+    else:
+        # Save only the inner DeepForest model (backward compatibility)
+        torch.save(model.model.state_dict(), str(final_model_path))
 
     # Evaluate on validation set if provided
     # NOTE: Skipping final evaluation due to DeepForest 2.0 pandas bug
@@ -215,6 +275,14 @@ def main():
     parser.add_argument("--lr", type=float, default=0.001)
     parser.add_argument("--patience", type=int, default=5)
     parser.add_argument("--no-pretrained", action="store_true")
+    parser.add_argument(
+        "--shadow_conditioning",
+        action="store_true",
+        help="Enable FiLM shadow conditioning",
+    )
+    parser.add_argument(
+        "--checkpoint", type=str, default=None, help="Path to checkpoint to resume from"
+    )
 
     args = parser.parse_args()
 
@@ -228,6 +296,8 @@ def main():
         lr=args.lr,
         patience=args.patience,
         pretrained=not args.no_pretrained,
+        shadow_conditioning=args.shadow_conditioning,
+        checkpoint=args.checkpoint,
     )
 
 

@@ -9,8 +9,8 @@ Usage:
     modal volume put canopyai-deepforest-data annotations_train.csv /annotations_train.csv
     modal volume put canopyai-deepforest-data annotations_val.csv /annotations_val.csv
     
-    # Run training on Modal (from deepforest/ directory)
-    cd deepforest && modal run modal_deepforest.py \
+    # Run training on Modal (from deepforest_custom/ directory)
+    cd deepforest_custom && modal run modal_deepforest.py \
         --epochs 20 \
         --batch-size 16 \
         --lr 0.001 \
@@ -18,7 +18,7 @@ Usage:
         --run-name "my_experiment_v1"
     
     # With Weights & Biases
-    cd deepforest && modal run modal_deepforest.py \
+    cd deepforest_custom && modal run modal_deepforest.py \
         --epochs 20 \
         --wandb-project canopyai-deepforest \
         --run-name "tcd_finetune_v1"
@@ -53,22 +53,16 @@ image = (
         "wandb",
         "deepforest==2.0.0",  # Upgraded to match local env and get load_model() API
     )
+    # Mount specific files and directories instead of the whole root
+    # This prevents accidental upload of large data folders
+    .add_local_file("../pyproject.toml", remote_path="/root/canopyAI/pyproject.toml")
     .add_local_dir(
-        "..",  # Parent directory (canopyAI)
-        remote_path="/root/canopyAI",
-        ignore=[
-            "data/",
-            "won003*/",
-            "venv*/",
-            "*.tif",
-            "__pycache__",
-            ".git",
-            "*.pth",
-            "foxtrot_output/",
-            "sam_output/",
-            "train_outputs/",
-        ],
+        ".",
+        remote_path="/root/canopyAI/deepforest_custom",
+        ignore=["__pycache__", "lightning_logs/", "wandb/", "data/", "checkpoints/"],
     )
+    .add_local_dir("../configs", remote_path="/root/canopyAI/configs")
+    .add_local_file("../utils.py", remote_path="/root/canopyAI/utils.py")
 )
 
 # Create volumes
@@ -95,12 +89,20 @@ def train_deepforest_modal(
     wandb_project=None,
     run_name=None,
     dataset="tcd",
+    shadow_conditioning=False,  # Enable FiLM conditioning with constant 215° shadow
+    checkpoint=None,  # Optional checkpoint path
 ):
-    """Train DeepForest on Modal with TCD data. Auto-resumes from checkpoint if exists."""
+    """
+    Train DeepForest on Modal. Auto-resumes from checkpoint if exists.
+
+    Args:
+        shadow_conditioning: If True, use FiLM conditioning with constant 215° shadow + rotation augmentation
+        checkpoint: Optional path to checkpoint file in Modal volume
+    """
 
     os.chdir("/root/canopyAI")
     sys.path.insert(0, "/root/canopyAI")
-    sys.path.insert(0, "/root/canopyAI/deepforest")
+    sys.path.insert(0, "/root/canopyAI/deepforest_custom")
 
     # Import our custom training script (not the deepforest package)
     import train_deepforest
@@ -205,6 +207,8 @@ def train_deepforest_modal(
         pretrained=True,
         wandb_project=wandb_project,
         run_name=run_name,
+        shadow_conditioning=shadow_conditioning,  # NEW
+        checkpoint=checkpoint,  # NEW
     )
 
     # Commit checkpoint volume
@@ -228,6 +232,8 @@ def main(
     wandb_project: str = None,
     run_name: str = None,
     dataset: str = "tcd",
+    shadow_conditioning: bool = False,
+    checkpoint: str = None,
 ):
     """
     Launch DeepForest training on Modal.
@@ -236,6 +242,8 @@ def main(
 
     Args:
         dataset: Which dataset to train on ('tcd', 'won', or 'both')
+        shadow_conditioning: Enable FiLM conditioning with constant 215° shadow + rotation augmentation
+        checkpoint: Path to checkpoint file in Modal volume (e.g., 'models/model_oscar50.pth')
     """
 
     print("☁️  Submitting DeepForest training job to Modal...")
@@ -248,6 +256,8 @@ def main(
         wandb_project=wandb_project,
         run_name=run_name,
         dataset=dataset,
+        shadow_conditioning=shadow_conditioning,  # NEW
+        checkpoint=checkpoint,  # NEW
     )
 
     if results:
