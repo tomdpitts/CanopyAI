@@ -1334,7 +1334,6 @@ def main(args):
 
     # Pass 1: DeepForest detection at native 400px tiles
     df_start = time.time()
-    df_start = time.time()
     all_bboxes, all_scores = detect_trees_deepforest(
         image,
         model_path=args.deepforest_model,
