@@ -1,8 +1,8 @@
-
 import torch
 import torch.nn as nn
 import numpy as np
 from deepforest import main as deepforest_main
+
 
 class SolarAttentionBlock(nn.Module):
     """
@@ -55,7 +55,7 @@ class SolarAttentionBlock(nn.Module):
         return out
 
 
-class ShadowConditionedDeepForest(nn.Module):
+class ShadowConditionedDeepForest(deepforest_main.deepforest):
     """
     DeepForest with FiLM conditioning on shadow vectors.
 
@@ -65,10 +65,8 @@ class ShadowConditionedDeepForest(nn.Module):
     """
 
     def __init__(self, shadow_angle_deg=215.0, config=None, **kwargs):
-        super().__init__()
-
-        # Create base DeepForest model
-        self.deepforest = deepforest_main.deepforest(config=config, **kwargs)
+        # Initialize DeepForest (LightningModule)
+        super().__init__(config=config, **kwargs)
 
         # Add FiLM blocks for each FPN level (P3-P7)
         # DeepForest uses RetinaNet with 256 channels at each FPN level
@@ -95,87 +93,104 @@ class ShadowConditionedDeepForest(nn.Module):
         self._film_injected = False
         self.current_shadow_vector = None
 
-        # Patch DeepForest's training_step for rotation augmentation
-        self._patch_training_step()
+    def training_step(self, batch, batch_idx):
+        """
+        Training step with rotation augmentation and FiLM conditioning.
+        Overrides DeepForest's training_step.
 
-    def _patch_training_step(self):
-        """Patch DeepForest's training_step to apply rotation augmentation."""
-        original_training_step = self.deepforest.training_step
-        base_shadow_vector = self.base_shadow_vector
-        film_model = self  # Reference to this ShadowConditionedDeepForest instance
+        Args:
+            batch: Tuple of (images, targets) or (images, targets, image_ids)
+            batch_idx: Batch index
 
-        def training_step_with_rotation(batch, batch_idx):
-            # Import here to avoid circular dependencies
-            try:
-                from .rotation_augmentation import (
-                    rotate_image_and_boxes,
-                    rotate_shadow_vector,
-                )
-            except ImportError:
-                # If running as script
-                from rotation_augmentation import (
-                    rotate_image_and_boxes,
-                    rotate_shadow_vector,
-                )
-
-            # DeepForest batch can be (images, targets) or (images, targets, image_ids)
-            images = batch[0]
-            targets = batch[1]
-
-            # Apply rotation to each sample
-            rotated_images = []
-            rotated_targets = []
-            rotated_shadows = []
-
-            for image, target in zip(images, targets):
-                # Random rotation angle (±180°)
-                angle = np.random.uniform(-180, 180)
-
-                # Convert tensor to numpy for rotation
-                img_np = image.permute(1, 2, 0).cpu().numpy()  # (C, H, W) -> (H, W, C)
-                boxes_np = target["boxes"].cpu().numpy()
-
-                # Rotate image and boxes
-                rotated_img, rotated_boxes = rotate_image_and_boxes(
-                    img_np, boxes_np, angle
-                )
-
-                # Rotate shadow vector
-                base_shadow_np = base_shadow_vector.cpu().numpy()
-                rotated_shadow = rotate_shadow_vector(base_shadow_np, angle)
-
-                # Convert back to tensors
-                rotated_img_tensor = (
-                    torch.from_numpy(rotated_img).permute(2, 0, 1).to(image.device)
-                )  # (H, W, C) -> (C, H, W)
-                rotated_boxes_tensor = (
-                    torch.from_numpy(rotated_boxes).float().to(target["boxes"].device)
-                )
-
-                # Update target
-                target["boxes"] = rotated_boxes_tensor
-
-                rotated_images.append(rotated_img_tensor)
-                rotated_targets.append(target)
-                rotated_shadows.append(rotated_shadow)
-
-            # Store shadow vectors for forward pass
-            shadow_vectors = (
-                torch.from_numpy(np.array(rotated_shadows)).float().to(images[0].device)
+        Returns:
+            Loss dictionary
+        """
+        # Import here to avoid circular dependencies
+        try:
+            from .rotation_augmentation import (
+                rotate_image_and_boxes,
+                rotate_shadow_vector,
             )
-            film_model.current_shadow_vector = shadow_vectors  # Set for hooks
+        except ImportError:
+            # If running as script
+            from rotation_augmentation import (
+                rotate_image_and_boxes,
+                rotate_shadow_vector,
+            )
 
-            # Call original training step with rotated data
-            # The original training step expects (images, targets, image_ids)
-            # We reconstruct the batch with rotated images/targets and original image_ids
-            if len(batch) > 2:
-                new_batch = (rotated_images, rotated_targets) + batch[2:]
-            else:
-                new_batch = (rotated_images, rotated_targets)
+        base_shadow_vector = self.base_shadow_vector
 
-            return original_training_step(new_batch, batch_idx)
+        # DeepForest batch can be (images, targets) or (images, targets, image_ids)
+        images = batch[0]
+        targets = batch[1]
 
-        self.deepforest.training_step = training_step_with_rotation
+        # Apply rotation to each sample
+        rotated_images = []
+        rotated_targets = []
+        rotated_shadows = []
+
+        for image, target in zip(images, targets):
+            # Random rotation angle (±180°)
+            angle = np.random.uniform(-180, 180)
+
+            # Convert tensor to numpy for rotation
+            img_np = image.permute(1, 2, 0).cpu().numpy()  # (C, H, W) -> (H, W, C)
+            boxes_np = target["boxes"].cpu().numpy()
+
+            # Rotate image and boxes
+            rotated_img, rotated_boxes = rotate_image_and_boxes(img_np, boxes_np, angle)
+
+            # Rotate shadow vector
+            base_shadow_np = base_shadow_vector.cpu().numpy()
+            rotated_shadow = rotate_shadow_vector(base_shadow_np, angle)
+
+            # Convert back to tensors
+            rotated_img_tensor = (
+                torch.from_numpy(rotated_img).permute(2, 0, 1).to(image.device)
+            )  # (H, W, C) -> (C, H, W)
+            rotated_boxes_tensor = (
+                torch.from_numpy(rotated_boxes).float().to(target["boxes"].device)
+            )
+
+            # Update target
+            target["boxes"] = rotated_boxes_tensor
+
+            rotated_images.append(rotated_img_tensor)
+            rotated_targets.append(target)
+            rotated_shadows.append(rotated_shadow)
+
+        # Store shadow vectors for forward pass
+        shadow_vectors = (
+            torch.from_numpy(np.array(rotated_shadows)).float().to(images[0].device)
+        )
+        self.current_shadow_vector = shadow_vectors  # Set for hooks
+
+        # Reconstruct the batch with rotated images/targets and original image_ids
+        if len(batch) > 2:
+            new_batch = (rotated_images, rotated_targets) + batch[2:]
+        else:
+            new_batch = (rotated_images, rotated_targets)
+
+        # Call original training_step from super class (DeepForest)
+        # DeepForest's training_step eventually calls self.model(images, targets)
+        # We need to ensure we call the method on the super class, not recursively
+        return super().training_step(new_batch, batch_idx)
+
+    def configure_optimizers(self):
+        """
+        Configure optimizers for both RetinaNet and FiLM layers.
+        """
+        # Collect all parameters
+        params = [
+            {"params": self.model.parameters()},
+            {"params": self.film_blocks.parameters()},
+        ]
+
+        # Use simple SGD as default for DeepForest
+        lr = self.config.train.lr if self.config else 0.001
+
+        optimizer = torch.optim.SGD(params, lr=lr, momentum=0.9, weight_decay=0.0001)
+        return optimizer
 
     def set_shadow_vector(self, shadow_vector):
         """Set the current shadow vector (called by dataloader during augmentation)."""
@@ -184,8 +199,6 @@ class ShadowConditionedDeepForest(nn.Module):
     def _inject_film_hooks(self):
         """
         Inject forward hooks into DeepForest's FPN to apply FiLM conditioning.
-
-        This modifies the model's forward pass to condition features on shadow vectors.
         """
         if self._film_injected:
             return
@@ -202,13 +215,26 @@ class ShadowConditionedDeepForest(nn.Module):
             return hook
 
         # Register hooks on FPN outputs
-        # Note: This assumes DeepForest's internal structure
         try:
-            fpn = self.deepforest.model.model.backbone.fpn
-            for level in [3, 4, 5, 6, 7]:
-                layer = getattr(fpn, f"fpn_layer{level}", None)
-                if layer is not None:
-                    layer.register_forward_hook(make_hook(f"P{level}"))
+            # Try to access FPN. Path might vary depending on DeepForest/Torchvision version.
+            # Usually: self.model (RetinaNet) -> backbone -> fpn
+            # Or: self.model (RetinaNet) -> model (if wrapped) -> backbone -> fpn
+            fpn = None
+            if hasattr(self.model, "backbone") and hasattr(self.model.backbone, "fpn"):
+                fpn = self.model.backbone.fpn
+            elif hasattr(self.model, "model") and hasattr(self.model.model, "backbone"):
+                # Handle case where RetinaNet is wrapped or double-nested
+                fpn = self.model.model.backbone.fpn
+
+            if fpn:
+                for level in [3, 4, 5, 6, 7]:
+                    layer = getattr(fpn, f"fpn_layer{level}", None)
+                    if layer is not None:
+                        layer.register_forward_hook(make_hook(f"P{level}"))
+                print("   ✅ FiLM hooks injected into FPN")
+            else:
+                print("   ⚠️  Could not find FPN to inject hooks.")
+
         except AttributeError:
             print(
                 "⚠️  Warning: Could not inject FiLM hooks. FPN structure may have changed."
@@ -216,6 +242,28 @@ class ShadowConditionedDeepForest(nn.Module):
             print("   FiLM conditioning will be skipped.")
 
         self._film_injected = True
+
+    def on_train_start(self):
+        """DeepForest hook: called when training starts."""
+        if not self._film_injected:
+            self._inject_film_hooks()
+        # Call super just in case
+        if hasattr(super(), "on_train_start"):
+            super().on_train_start()
+
+    def on_validation_start(self):
+        """DeepForest hook: called when validation starts."""
+        if not self._film_injected:
+            self._inject_film_hooks()
+        if hasattr(super(), "on_validation_start"):
+            super().on_validation_start()
+
+    def on_predict_start(self):
+        """DeepForest hook: called when prediction starts."""
+        if not self._film_injected:
+            self._inject_film_hooks()
+        if hasattr(super(), "on_predict_start"):
+            super().on_predict_start()
 
     def forward(self, x, targets=None, shadow_vectors=None):
         """
@@ -246,21 +294,15 @@ class ShadowConditionedDeepForest(nn.Module):
                 self.base_shadow_vector.to(device).unsqueeze(0).repeat(batch_size, 1)
             )
 
-        # Inject hooks on first forward pass
+        # Inject hooks on first forward pass if not already done
         if not self._film_injected:
             self._inject_film_hooks()
 
         # Forward through DeepForest (FiLM hooks will activate)
+        # self.model is the backbone+head in DeepForest class
         if targets is not None:
             # Training mode
-            return self.deepforest.model(x, targets)
+            return self.model(x, targets)
         else:
             # Inference mode
-            return self.deepforest.model(x)
-
-    def __getattr__(self, name):
-        """Delegates attributes to the wrapped DeepForest model."""
-        try:
-            return super().__getattr__(name)
-        except AttributeError:
-            return getattr(self.deepforest, name)
+            return self.model(x)
