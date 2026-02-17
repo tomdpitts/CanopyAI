@@ -405,7 +405,6 @@ def predict_shadow_vector(
 def detect_trees_deepforest(
     image,
     model_path=None,
-    weights_path=None,
     shadow_vector=None,
     tile_size=400,
     tile_overlap=0.05,
@@ -416,8 +415,8 @@ def detect_trees_deepforest(
 
     Args:
         image: RGB image as (H, W, 3) numpy array
-        model_path: Optional path to custom standard DeepForest model (.pth file)
-        weights_path: Optional path to FiLM-conditioned DeepForest weights (.pth file)
+        model_path: Optional path to custom DeepForest model (.pth file)
+                   Auto-detects whether it's standard or FiLM-conditioned
         shadow_vector: (1, 2) tensor representing shadow direction for FiLM-DeepForest
         tile_size: Size of each tile (default 400px - DeepForest's native)
         tile_overlap: Overlap between tiles (default 0.05 = 5%)
@@ -439,11 +438,44 @@ def detect_trees_deepforest(
         device = torch.device("mps")
     elif torch.cuda.is_available():
         device = torch.device("cuda")
-    
-    # Load model based on whether we have FiLM weights
-    use_film = (weights_path is not None and shadow_vector is not None)
-    
-    
+
+    # Auto-detect model type if path provided
+    use_film = False
+
+    if model_path is not None and Path(model_path).exists():
+        print(f"   🔍 Inspecting model: {Path(model_path).name}")
+        try:
+            # Load checkpoint to CPU to inspect keys
+            checkpoint = torch.load(model_path, map_location="cpu")
+            if "state_dict" in checkpoint:
+                keys = checkpoint["state_dict"].keys()
+            else:
+                keys = checkpoint.keys()
+
+            # Check for FiLM specific keys
+            has_film_blocks = any("film_blocks" in k for k in keys)
+
+            if has_film_blocks:
+                print("   ✨ Detected FiLM-conditioned model")
+                use_film = True
+            else:
+                print("   🌲 Detected Standard DeepForest model")
+                use_film = False
+
+        except Exception as e:
+            print(f"   ⚠️  Could not inspect model keys: {e}")
+            print("   Assuming Standard DeepForest model")
+            use_film = False
+
+    # Check if we have shadow vector for FiLM
+    if use_film and shadow_vector is None:
+        print("   ⚠️  FiLM model detected but no shadow vector provided/predicted.")
+        print("   ⚠️  Falling back to base shadow vector (0, 0) or similar.")
+        # We'll see if the model handles None shadow_vector or if we need to provide a dummy one
+        # ShadowConditionedDeepForest typically requires it, or has default in forward
+        # Let's verify in models.py logic -> it has a base_shadow_vector
+        pass
+
     if use_film:
         print("   🌞 Using FiLM-conditioned DeepForest")
         try:
@@ -451,57 +483,39 @@ def detect_trees_deepforest(
         except ImportError as e:
             print(f"❌ Error importing FiLM model: {e}")
             raise
-        
+
         # Initialize FiLM model
         df_model = ShadowConditionedDeepForest(shadow_angle_deg=0.0)
-        
+
         # Load weights
-        checkpoint = torch.load(weights_path, map_location="cpu")
+        checkpoint = torch.load(model_path, map_location="cpu")
         if "state_dict" in checkpoint:
             state_dict = checkpoint["state_dict"]
         else:
             state_dict = checkpoint
 
-        # Try loading into full model first (expects "deepforest.model..." keys)
+        # Try loading into full model first
         try:
             df_model.load_state_dict(state_dict)
             print(f"   ✅ Loaded full ShadowConditionedDeepForest weights")
         except RuntimeError as e:
-            # Fallback: Try loading into inner RetinaNet (expects "backbone..." keys)
-            # This happens if checkpoint is standard DeepForest
-            print(f"   ⚠️  Full model load failed. Trying inner RetinaNet model...")
-            missing_keys, unexpected_keys = df_model.deepforest.model.load_state_dict(state_dict, strict=False)
-            
-            if len(unexpected_keys) == 0:
-                 print(f"   ✅ Loaded inner RetinaNet weights (standard DeepForest)")
-                 if len(missing_keys) > 0:
-                     print(f"   ℹ️  Missing keys (expected): {len(missing_keys)} (likely FiLM weights)")
-                     # print(f"   Keys: {missing_keys[:5]}...")
-                 print(f"   ℹ️  FiLM weights not in checkpoint. Initializing shadow conditioning layers from scratch.")
-                 print(f"   ℹ️  This is expected if using standard DeepForest weights as a base.")
-            else:
-                # If still failing or weird keys, raise the original error
-                print(f"   ❌ Inner model load failed.")
-                print(f"   ⚠️  Unexpected keys: {len(unexpected_keys)}")
-                print(f"   Example unexpected: {unexpected_keys[:5]}")
-                print(f"   ⚠️  Missing keys: {len(missing_keys)}")
-                raise e
-        
+            print(f"   ❌ Model load failed: {e}")
+            raise e
+
         df_model.to(device)
         df_model.eval()
-        print(f"   ✅ Loaded FiLM weights from {Path(weights_path).name}")
-        
+
     else:
         print("   🌲 Using Standard DeepForest")
         df_model = deepforest_main.deepforest()
-        
+
         if model_path and Path(model_path).exists():
             print(f"   Loading custom weights: {model_path}")
             df_model.model.load_state_dict(torch.load(model_path, map_location="cpu"))
         else:
             print("   Loading default model from Hugging Face...")
             df_model.load_model("weecology/deepforest-tree")
-        
+
         df_model.model.to(device)
         df_model.model.eval()
 
@@ -561,7 +575,9 @@ def detect_trees_deepforest(
                 with torch.no_grad():
                     if use_film:
                         # Pass shadow vector to FiLM model
-                        prediction = df_model(image_tensor, shadow_vectors=shadow_vector)
+                        prediction = df_model(
+                            image_tensor, shadow_vectors=shadow_vector
+                        )
                     else:
                         # Standard DeepForest
                         prediction = df_model.model(image_tensor)
@@ -572,7 +588,7 @@ def detect_trees_deepforest(
                     tile_preds = tile_preds[tile_preds["score"] >= confidence_threshold]
                 else:
                     tile_preds = None
-                    
+
             except Exception as e:
                 print(f"❌ Error on tile ({x_start},{y_start}): {e}")
                 continue
@@ -1303,7 +1319,9 @@ def main(args):
                 outlier_threshold_deg=args.shadow_outlier_threshold,
             )
             # Convert to tensor for FiLM model
-            shadow_vector_tensor = torch.from_numpy(shadow_vector).float().to(device).unsqueeze(0)  # (1, 2)
+            shadow_vector_tensor = (
+                torch.from_numpy(shadow_vector).float().to(device).unsqueeze(0)
+            )  # (1, 2)
         except Exception as e:
             print(f"   ⚠️  Shadow prediction failed: {e}")
             print("   Continuing without shadow context...")
@@ -1316,10 +1334,10 @@ def main(args):
 
     # Pass 1: DeepForest detection at native 400px tiles
     df_start = time.time()
+    df_start = time.time()
     all_bboxes, all_scores = detect_trees_deepforest(
         image,
         model_path=args.deepforest_model,
-        weights_path=args.deepforest_weights,
         shadow_vector=shadow_vector_tensor,
         tile_size=args.df_tile_size,
         confidence_threshold=args.deepforest_confidence,
@@ -1524,16 +1542,8 @@ def parse_args():
         type=str,
         default=None,
         help="Path to custom DeepForest model (.pth file). "
-        "If not provided, uses default pretrained model",
-    )
-
-    ap.add_argument(
-        "--deepforest_weights",
-        type=str,
-        default=None,
-        help="Path to DeepForest weights (.pth file). "
-        "Use this for FiLM-conditioned models trained with shadow conditioning. "
-        "If provided along with --shadow_model, uses FiLM-conditioned inference.",
+        "Can be either a standard DeepForest model or a FiLM-conditioned model "
+        "(auto-detected). If not provided, uses default pretrained model.",
     )
 
     ap.add_argument(

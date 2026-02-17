@@ -49,3 +49,4 @@ solar/shadow_regression/output/predictions_clean_unseen/*.png
 zebra
 
 lightning_logs*
+models/*
