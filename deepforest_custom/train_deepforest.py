@@ -24,7 +24,6 @@ import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 
 
-
 # Import model classes from separate file
 try:
     from .models import (
@@ -37,7 +36,6 @@ except ImportError:
         SolarAttentionBlock,
         ShadowConditionedDeepForest,
     )
-
 
 
 def train_deepforest(
@@ -102,10 +100,9 @@ def train_deepforest(
         try:
             state_dict = torch.load(checkpoint, map_location="cpu")
             # strict=False allows FiLM layers to stay random if shadow_conditioning=True
-            if shadow_conditioning:
-                model.deepforest.model.load_state_dict(state_dict, strict=False)
-            else:
-                model.model.load_state_dict(state_dict, strict=False)
+            # Since ShadowConditionedDeepForest inherits from deepforest,
+            # we can load weights directly into model.model (the backbone)
+            model.model.load_state_dict(state_dict, strict=False)
             print("   ✅ Checkpoint loaded successfully")
             if shadow_conditioning:
                 print("   ℹ️  FiLM layers initialized randomly (not in checkpoint)")
@@ -118,8 +115,8 @@ def train_deepforest(
         print("\n📦 Loading pretrained weights...")
         try:
             if shadow_conditioning:
-                model.deepforest.create_model()
-                model.deepforest.load_model("weecology/deepforest-tree")
+                model.create_model()
+                model.load_model("weecology/deepforest-tree")
             else:
                 model.create_model()
                 model.load_model("weecology/deepforest-tree")
@@ -215,10 +212,8 @@ def train_deepforest(
     print(f"\n🚀 Starting training...")
     print("-" * 60)
 
-    # When using shadow conditioning, model is a wrapper around DeepForest
-    # We need to train the inner DeepForest model (which has been patched for rotation)
-    # since PyTorch Lightning expects a LightningModule, not our nn.Module wrapper
-    training_model = model.deepforest if shadow_conditioning else model
+    # ShadowConditionedDeepForest is now a LightningModule (inherited)
+    training_model = model
 
     # Create trainer using DeepForest's API
     training_model.create_trainer(
@@ -235,7 +230,7 @@ def train_deepforest(
     # Save final model
     final_model_path = Path(run_output_dir) / "deepforest_final.pth"
     print(f"💾 Saved final model to {final_model_path}")
-    import torch
+    # Saved final model
 
     if shadow_conditioning:
         # Save the full wrapper model (including FiLM weights)

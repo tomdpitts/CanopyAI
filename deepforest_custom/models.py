@@ -66,7 +66,8 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
 
     def __init__(self, shadow_angle_deg=215.0, config=None, **kwargs):
         # Initialize DeepForest (LightningModule)
-        super().__init__(config=config, **kwargs)
+        # Explicit call to avoid MRO/super() issues with keyword args
+        deepforest_main.deepforest.__init__(self, config=config, **kwargs)
 
         # Add FiLM blocks for each FPN level (P3-P7)
         # DeepForest uses RetinaNet with 256 channels at each FPN level
