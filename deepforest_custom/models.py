@@ -25,6 +25,16 @@ class SolarAttentionBlock(nn.Module):
         self.gate_conv = nn.Conv2d(channels, 1, kernel_size=3, padding=1, bias=False)
         self.sigmoid = nn.Sigmoid()
 
+        # Learnable residual scale initialized to 0.
+        # CRITICAL: Even with zero-init on sun_mlp[2] output layer, the first
+        # optimizer step updates sun_mlp[2] weights by ±lr. Combined with random
+        # upstream hidden states (h~±5.6 norm), gamma immediately grows to ~0.21
+        # — a 21% feature perturbation across all 5 FPN levels simultaneously.
+        # The residual scale ensures: out = x + scale*(film_out - x).
+        # When scale=0, the output is EXACTLY x regardless of gamma/gate.
+        # Scale grows gradually via its own gradient, allowing FiLM to "fade in".
+        self.output_scale = nn.Parameter(torch.zeros(1))
+
     def forward(self, x, sun_vector, return_attn=False):
         """
         Args:
@@ -48,7 +58,11 @@ class SolarAttentionBlock(nn.Module):
         gate = self.sigmoid(self.gate_conv(x_modulated))  # (B, 1, H, W)
 
         # 3. Blend: Weighted combination of original and modulated features
-        out = x * (1 - gate) + x_modulated * gate
+        film_out = x * (1 - gate) + x_modulated * gate
+
+        # 4. Residual gate: blend FiLM output with identity using learnable scale.
+        # scale=0 → output=x exactly; scale grows as FiLM learns to be useful.
+        out = x + self.output_scale * (film_out - x)
 
         if return_attn:
             return out, gate
@@ -64,7 +78,14 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
     by θ degrees also rotates the shadow by θ degrees.
     """
 
-    def __init__(self, shadow_angle_deg=215.0, config=None, **kwargs):
+    def __init__(
+        self,
+        shadow_angle_deg=215.0,
+        train_csv=None,
+        film_lr=1e-4,
+        config=None,
+        **kwargs,
+    ):
         # Initialize DeepForest (LightningModule)
         # Explicit call to avoid MRO/super() issues with keyword args
         deepforest_main.deepforest.__init__(self, config=config, **kwargs)
@@ -78,17 +99,47 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
             }
         )
 
-        # Store base shadow angle (will be rotated during augmentation)
-        self.shadow_angle_deg = shadow_angle_deg
+        # Store FiLM-specific learning rate for differential lr
+        self.film_lr = film_lr
 
-        # Convert to (sin, cos) representation
+        # Store base shadow angle (fallback when no CSV lookup available)
+        self.shadow_angle_deg = shadow_angle_deg
         shadow_angle_rad = np.radians(shadow_angle_deg)
         self.base_shadow_vector = torch.tensor(
             [np.sin(shadow_angle_rad), np.cos(shadow_angle_rad)], dtype=torch.float32
         )
 
-        print(f"   ℹ️  Base shadow direction: {shadow_angle_deg}°")
-        print(f"   ℹ️  Rotation will provide shadow diversity")
+        # Build per-image shadow lookup from training CSV if provided.
+        # Maps image_path -> np.array([shadow_x, shadow_y]) using azimuth convention.
+        self.shadow_lookup = {}
+        if train_csv is not None:
+            try:
+                import pandas as pd
+
+                df = pd.read_csv(train_csv)
+                if "shadow_x" in df.columns and "shadow_y" in df.columns:
+                    for _, row in df.drop_duplicates("image_path").iterrows():
+                        self.shadow_lookup[row["image_path"]] = np.array(
+                            [row["shadow_x"], row["shadow_y"]], dtype=np.float32
+                        )
+                    print(
+                        f"   Loaded shadow vectors for {len(self.shadow_lookup)} images from CSV"
+                    )
+                else:
+                    print(
+                        "   No shadow_x/shadow_y in CSV — using base vector with rotation fallback"
+                    )
+            except Exception as e:
+                print(f"   Warning: could not load shadow lookup: {e}")
+
+        if self.shadow_lookup:
+            print(
+                f"   Per-image FiLM vectors: ENABLED ({len(self.shadow_lookup)} images)"
+            )
+        else:
+            print(
+                f"   Per-image FiLM vectors: DISABLED (base {shadow_angle_deg} deg + rotation)"
+            )
 
         # Track whether FiLM hooks are injected
         self._film_injected = False
@@ -96,101 +147,73 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
 
     def training_step(self, batch, batch_idx):
         """
-        Training step with rotation augmentation and FiLM conditioning.
-        Overrides DeepForest's training_step.
+        Training step with per-image FiLM shadow conditioning.
 
-        Args:
-            batch: Tuple of (images, targets) or (images, targets, image_ids)
-            batch_idx: Batch index
+        Reads shadow_x/shadow_y from the CSV lookup built at init (keyed by image path).
+        The CSV is expected to have pre-augmented images with matching shadow vectors
+        (as generated by augment_with_shadows.py). No random rotation is applied here.
 
-        Returns:
-            Loss dictionary
+        Raises RuntimeError if shadow lookup is missing or any image path is not found.
         """
-        # Import here to avoid circular dependencies
-        try:
-            from .rotation_augmentation import (
-                rotate_image_and_boxes,
-                rotate_shadow_vector,
-            )
-        except ImportError:
-            # If running as script
-            from rotation_augmentation import (
-                rotate_image_and_boxes,
-                rotate_shadow_vector,
-            )
-
-        base_shadow_vector = self.base_shadow_vector
-
-        # DeepForest batch can be (images, targets) or (images, targets, image_ids)
         images = batch[0]
         targets = batch[1]
+        # batch[2] = list of image paths (from DeepForest dataloader collate_fn)
+        image_paths = batch[2] if len(batch) > 2 else None
 
-        # Apply rotation to each sample
-        rotated_images = []
-        rotated_targets = []
-        rotated_shadows = []
-
-        for image, target in zip(images, targets):
-            # Random rotation angle (±180°)
-            angle = np.random.uniform(-180, 180)
-
-            # Convert tensor to numpy for rotation
-            img_np = image.permute(1, 2, 0).cpu().numpy()  # (C, H, W) -> (H, W, C)
-            boxes_np = target["boxes"].cpu().numpy()
-
-            # Rotate image and boxes
-            rotated_img, rotated_boxes = rotate_image_and_boxes(img_np, boxes_np, angle)
-
-            # Rotate shadow vector
-            base_shadow_np = base_shadow_vector.cpu().numpy()
-            rotated_shadow = rotate_shadow_vector(base_shadow_np, angle)
-
-            # Convert back to tensors
-            rotated_img_tensor = (
-                torch.from_numpy(rotated_img).permute(2, 0, 1).to(image.device)
-            )  # (H, W, C) -> (C, H, W)
-            rotated_boxes_tensor = (
-                torch.from_numpy(rotated_boxes).float().to(target["boxes"].device)
+        if not self.shadow_lookup:
+            raise RuntimeError(
+                "ShadowConditionedDeepForest: shadow_lookup is empty. "
+                "Pass train_csv= at init so shadow_x/shadow_y can be read from the CSV. "
+                "The CSV must have 'shadow_x' and 'shadow_y' columns."
             )
 
-            # Update target
-            target["boxes"] = rotated_boxes_tensor
+        if image_paths is None:
+            raise RuntimeError(
+                "ShadowConditionedDeepForest: batch[2] (image paths) is missing. "
+                "Expected DeepForest dataloader to provide image paths as batch[2]."
+            )
 
-            rotated_images.append(rotated_img_tensor)
-            rotated_targets.append(target)
-            rotated_shadows.append(rotated_shadow)
+        # Look up per-image shadow vectors — fail loudly on missing paths
+        missing = [p for p in image_paths if p not in self.shadow_lookup]
+        if missing:
+            raise RuntimeError(
+                f"ShadowConditionedDeepForest: {len(missing)} image path(s) not found in shadow_lookup.\n"
+                f"Missing: {missing[:5]}{'...' if len(missing) > 5 else ''}\n"
+                "Check that image paths in the batch match those in the training CSV exactly."
+            )
 
-        # Store shadow vectors for forward pass
-        shadow_vectors = (
-            torch.from_numpy(np.array(rotated_shadows)).float().to(images[0].device)
+        shadow_vectors_np = np.array(
+            [self.shadow_lookup[p] for p in image_paths], dtype=np.float32
         )
-        self.current_shadow_vector = shadow_vectors  # Set for hooks
+        shadow_vectors = torch.from_numpy(shadow_vectors_np).to(images[0].device)
+        self.current_shadow_vector = shadow_vectors
 
-        # Reconstruct the batch with rotated images/targets and original image_ids
-        if len(batch) > 2:
-            new_batch = (rotated_images, rotated_targets) + batch[2:]
-        else:
-            new_batch = (rotated_images, rotated_targets)
-
-        # Call original training_step from super class (DeepForest)
-        # DeepForest's training_step eventually calls self.model(images, targets)
-        # We need to ensure we call the method on the super class, not recursively
-        return super().training_step(new_batch, batch_idx)
+        # Images and boxes are already correctly oriented — augment_with_shadows.py
+        # pre-generates the 4 rotations with matching shadow vectors in the CSV.
+        return super().training_step(batch, batch_idx)
 
     def configure_optimizers(self):
         """
-        Configure optimizers for both RetinaNet and FiLM layers.
+        Configure optimizers with differential learning rates.
+
+        Uses oscar50's proven SGD+momentum=0.9 for the backbone. This is now
+        safe because the output_scale residual gate in SolarAttentionBlock
+        ensures FiLM is exactly identity at init — backbone trains as if FiLM
+        doesn't exist. FiLM blocks use a lower lr so output_scale grows slowly.
         """
-        # Collect all parameters
+        backbone_lr = self.config.train.lr if self.config else 0.001
+        film_lr = self.film_lr
+
         params = [
-            {"params": self.model.parameters()},
-            {"params": self.film_blocks.parameters()},
+            {"params": self.model.parameters(), "lr": backbone_lr},
+            {"params": self.film_blocks.parameters(), "lr": film_lr},
         ]
 
-        # Use simple SGD as default for DeepForest
-        lr = self.config.train.lr if self.config else 0.001
+        print(f"   Optimizer: SGD(momentum=0.9)  backbone_lr={backbone_lr}  film_lr={film_lr}")
 
-        optimizer = torch.optim.SGD(params, lr=lr, momentum=0.9, weight_decay=0.0001)
+        optimizer = torch.optim.SGD(
+            params, lr=backbone_lr, momentum=0.9, weight_decay=1e-4
+        )
         return optimizer
 
     def set_shadow_vector(self, shadow_vector):

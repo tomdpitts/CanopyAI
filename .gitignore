@@ -53,3 +53,8 @@ models/*
 *won_tile*
 zebra*
 foxtrot_output_test_film
+*.ckpt
+deepforest_custom/annotation*
+checkpoints/*
+debug_vis*
+*training_vis*
