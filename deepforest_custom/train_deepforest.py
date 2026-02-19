@@ -23,6 +23,9 @@ from deepforest import main as deepforest_main
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 
+# Set matmul precision for A100/H100 tensor cores
+torch.set_float32_matmul_precision("medium")
+
 
 # Import model classes from separate file
 try:
@@ -108,7 +111,10 @@ def train_deepforest(
             )
         print("   Shadow conditioning: ENABLED (FiLM)")
         model = ShadowConditionedDeepForest(
-            shadow_angle_deg=shadow_angle_deg, train_csv=train_csv, film_lr=film_lr
+            shadow_angle_deg=shadow_angle_deg,
+            train_csv=train_csv,
+            val_csv=val_csv,
+            film_lr=film_lr
         )
     else:
         print("   Shadow conditioning: DISABLED (baseline)")
@@ -172,8 +178,30 @@ def train_deepforest(
     if checkpoint_files:
         # Get most recent checkpoint by modification time
         checkpoint_path = str(max(checkpoint_files, key=lambda p: p.stat().st_mtime))
-        print(f"   ✅ Found checkpoint: {checkpoint_path}")
-        print(f"   🔄 Will resume training from this checkpoint")
+        if checkpoint_path:
+             print("   🔎 Validating checkpoint...")
+             try:
+                 ckpt = torch.load(checkpoint_path, map_location="cpu")
+                 if "optimizer_states" in ckpt and len(ckpt["optimizer_states"]) > 0:
+                     # Check if param_groups exists
+                     opt_state = ckpt["optimizer_states"][0]
+                     if "param_groups" not in opt_state:
+                         print("   ❌ Checkpoint corrupted: optimizer state missing 'param_groups'")
+                         checkpoint_path = None
+                     else:
+                         print("   ✅ Checkpoint valid")
+                 else:
+                      print("   ⚠️ Checkpoint has no optimizer state (might be okay if fresh finetune but risky for resume)")
+             except Exception as e:
+                 print(f"   ❌ Checkpoint unreadable: {e}")
+                 checkpoint_path = None
+
+        if checkpoint_path:
+            print(f"   ✅ Found valid checkpoint: {checkpoint_path}")
+            print(f"   🔄 Will resume training from this checkpoint")
+        else:
+            print(f"   ⚠️  No valid checkpoint found in {run_output_dir} (or verification failed)")
+            print("   Starting fresh training")
     else:
         print(f"   ⚠️  No checkpoint found in {run_output_dir}")
         print("   Starting fresh training")

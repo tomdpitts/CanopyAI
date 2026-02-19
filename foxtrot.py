@@ -496,8 +496,22 @@ def detect_trees_deepforest(
 
         # Try loading into full model first
         try:
-            df_model.load_state_dict(state_dict)
-            print(f"   ✅ Loaded full ShadowConditionedDeepForest weights")
+            # Load with strict=False to allow missing aux_head weights (from older checkpoints)
+            # but we should still check if major components are missing
+            missing, unexpected = df_model.load_state_dict(state_dict, strict=False)
+            
+            # Filter out aux_head from missing keys, as it's optional for inference
+            critical_missing = [k for k in missing if not k.startswith("aux_head")]
+            
+            if critical_missing:
+                # If we're missing non-aux keys, that's a real problem
+                raise RuntimeError(f"Missing critical keys: {critical_missing}")
+                
+            if "aux_head.0.weight" in missing:
+                print("   ⚠️  Loaded weights without Auxiliary Head (legacy checkpoint). This is fine for inference.")
+            else:
+                print("   ✅ Loaded full ShadowConditionedDeepForest weights")
+                
         except RuntimeError as e:
             print(f"   ❌ Model load failed: {e}")
             raise e
