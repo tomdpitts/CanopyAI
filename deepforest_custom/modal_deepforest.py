@@ -15,8 +15,8 @@ Step 1 — Upload images (phase3 data goes under /phase3/ to avoid touching exis
 Step 2 — Launch baseline training (no shadow conditioning)
 
     cd deepforest_custom && modal run modal_deepforest.py \\
-        --train-csv /phase3/train_phase3_augmented.csv \\
-        --val-csv /phase3/val_phase3_combined.csv \\
+        --train-csv /data/phase3/train_phase3_augmented.csv \\
+        --val-csv /data/phase3/val_phase3_combined.csv \\
         --run-name phase3_runQ_baseline_no_shadow \\
         --epochs 50 --patience 15 --lr 0.001 --batch-size 16
 
@@ -185,10 +185,18 @@ def train_deepforest_modal(
         if not archives:
             archives = sorted(glob.glob("/data/*.tar.gz"))
         for archive in archives:
+            marker_file = archive + ".extracted"
+            if os.path.exists(marker_file):
+                print(f"   Skipping {archive} (already extracted)")
+                continue
+
             print(f"   Extracting {archive}...")
             try:
                 with tarfile.open(archive, "r:gz") as tar:
                     tar.extractall("/data/images")
+                # Create marker file
+                with open(marker_file, "w") as f:
+                    f.write("extracted")
                 print(f"   ✅ Done")
             except Exception as e:
                 print(f"   ⚠️  Failed to extract {archive}: {e}")
