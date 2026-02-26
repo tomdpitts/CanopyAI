@@ -20,7 +20,96 @@ from pycocotools import mask as mask_utils
 import matplotlib.pyplot as plt
 import cv2
 
-from detectree2.preprocessing.tiling import tile_data
+
+
+# ── Shadow probability map (Phase 6) ──────────────────────────────────────────
+
+def generate_shadow_map(img_rgb: np.ndarray, shadow_angle_deg: float) -> np.ndarray:
+    """
+    Generate a shadow probability map for a tile.
+
+    Uses a directional asymmetry (DirGrad) × local darkness formulation:
+      - DirGrad: for each pixel, accumulate max(0, brightness_toward_anti_shadow
+                                                  - brightness_toward_shadow)
+                 over offset distances d = 8..35 px (Gaussian weighted).
+                 This fires where one side of a pixel, along the shadow axis,
+                 is distinctly brighter than the other — the shadow/ground boundary.
+      - Darkness: how much darker each pixel is than its 30-px-sigma local mean,
+                  normalised to the 95th percentile so contrast is image-relative.
+      - Product: DirGrad × darkness → high only where the pixel is both genuinely
+                 dark AND sits at a directionally asymmetric boundary.
+      - Otsu sigmoid (k=12): sharpens the map using the image's own bimodal
+                 histogram split as the sigmoid centre.
+      - Boundary mask (+3px erode): zeros out black rotation corners
+                 and the 1-2px warpAffine interpolation bleed.
+
+    Args:
+        img_rgb:          H×W×3 uint8 numpy array (RGB order)
+        shadow_angle_deg: Sun azimuth in degrees (0=North, 90=East, CW convention).
+                          Shadows point in direction (180 + azimuth) mod 360 from the tree.
+
+    Returns:
+        shadow_map: H×W float32 array in [0, 1]
+    """
+    D_MIN, D_MAX = 8, 35
+
+    # Convert to grayscale float
+    gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY).astype(np.float32)
+    h, w = gray.shape
+
+    # Shadow vector: shadow points FROM tree IN this direction
+    # Convention: azimuth 0=North CW, image y increases downward
+    ang_rad = np.radians(shadow_angle_deg)
+    sx =  np.sin(ang_rad)   # shadow x-component (image right)
+    sy = -np.cos(ang_rad)   # shadow y-component (image down, so negate cos)
+    # Anti-shadow direction (toward crown)
+    adx, ady = -sx, -sy
+    # Shadow direction (beyond shadow tip)
+    sdx, sdy =  sx,  sy
+
+    # ── 1. Directional gradient ────────────────────────────────────────────
+    ds  = np.arange(D_MIN, D_MAX + 1, 3).astype(np.float32)
+    d_c = (D_MIN + D_MAX) / 2.0
+    wts = np.exp(-0.5 * ((ds - d_c) / 8.0) ** 2)
+    wts /= wts.sum()
+
+    dg = np.zeros((h, w), dtype=np.float32)
+    for d, wt in zip(ds, wts):
+        Ma = np.float32([[1, 0, int(round(d * adx))], [0, 1, int(round(d * ady))]])
+        Ms = np.float32([[1, 0, int(round(d * sdx))], [0, 1, int(round(d * sdy))]])
+        anti = cv2.warpAffine(gray, Ma, (w, h), borderMode=cv2.BORDER_REFLECT)
+        shad = cv2.warpAffine(gray, Ms, (w, h), borderMode=cv2.BORDER_REFLECT)
+        dg  += wt * np.clip((anti - shad).astype(np.float32), 0, None)
+    dg = cv2.GaussianBlur(dg, (0, 0), sigmaX=4)
+    dg /= (dg.max() + 1e-6)
+
+    # ── 2. Percentile-normalised darkness ──────────────────────────────────
+    lm   = cv2.GaussianBlur(gray, (0, 0), sigmaX=30)
+    dark = np.clip(lm - gray, 0, None).astype(np.float32)
+    dark /= (np.percentile(dark, 95) + 1e-6)
+    dark  = np.clip(dark, 0, 1)
+
+    # ── 3. Product ─────────────────────────────────────────────────────────
+    base = dg * dark
+    base /= (base.max() + 1e-6)
+
+    # ── 4. Otsu sigmoid (image-adaptive threshold) ─────────────────────────
+    m_u8 = (base * 255).astype(np.uint8)
+    thresh, _ = cv2.threshold(m_u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    ctr = float(np.clip(thresh / 255.0, 0.10, 0.70))
+    k   = 12.0
+    sig = 1.0 / (1.0 + np.exp(-k * (base - ctr)))
+    sig = (sig - sig.min()) / (sig.max() - sig.min() + 1e-6)
+    sig = sig.astype(np.float32)
+
+    # ── 5. Boundary mask: zero out black corners + 3-px bleed ──────────────
+    valid = (gray > 15).astype(np.uint8)
+    k3    = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))  # 3px erode
+    valid = cv2.erode(valid, k3).astype(np.float32)
+
+    result = sig * valid
+    mx = result.max()
+    return (result / mx).astype(np.float32) if mx > 0 else result
 
 
 def is_australia(x):
@@ -639,6 +728,23 @@ def visualize_validation_results(
 
         draw_pred_outline(ax, p, color)
 
+        # --- Small score label at centroid ---
+        if gt is not None and (score_tree > 0 or score_canopy > 0):
+            best_score = score_tree if score_tree >= score_canopy else score_canopy
+            metric_name = "IoU" if score_tree >= score_canopy else "IoP"
+            centroid = p.centroid
+            ax.text(
+                centroid.x,
+                centroid.y,
+                f"{metric_name}:{best_score:.2f}",
+                ha="center",
+                va="center",
+                fontsize=5,
+                color="white",
+                alpha=0.85,
+                clip_on=True,
+            )
+
     # === 5. Draw ground-truth crowns & canopy (if available) ===
     if gt is not None:
         for idx, g in enumerate(gt.geometry):
@@ -897,72 +1003,6 @@ def coco_meta_to_geodf(meta: dict) -> gpd.GeoDataFrame:
 
     return gpd.GeoDataFrame({"geometry": world_geoms, "category": cats}, crs=crs_str)
 
-
-# -------------------------------------------------------------------
-# Tiling
-# -------------------------------------------------------------------
-
-
-def tile_all_tcd_tiles(
-    raw_dir: Path,
-    tiles_root: Path,
-    buffer: int = 30,
-    tile_width: int = 40,
-    tile_height: int = 40,
-    threshold: float = 0.0,
-):
-    """
-    For each .tif + _meta.json in raw_dir:
-
-      - load metadata
-      - convert COCO segs to polygons (GeoDataFrame)
-      - tile with Detectree2 tile_data (with crowns)
-
-    Output: one chips folder per tile under tiles_root.
-    """
-    tif_files = sorted(raw_dir.glob("tcd_tile_*.tif"))
-    if not tif_files:
-        raise FileNotFoundError(f"No tcd_tile_*.tif files found in {raw_dir}")
-
-    tiles_root.mkdir(parents=True, exist_ok=True)
-
-    print(f"📸 Found {len(tif_files)} TCD tiles to tile")
-
-    for img_path in tif_files:
-        stem = img_path.stem  # e.g. "tcd_tile_0"
-        meta_path = raw_dir / f"{stem}_meta.json"
-
-        if not meta_path.exists():
-            print(f"⚠️  Missing metadata {meta_path}, skipping {img_path}")
-            continue
-
-        with open(meta_path, "r", encoding="utf-8") as f:
-            meta = json.load(f)
-
-        # Convert COCO segs → polygons
-        crowns_gdf = coco_meta_to_geodf(meta)
-
-        chips_dir = tiles_root / f"{stem}_chips"
-        print(f"🧩 Tiling {img_path.name} → {chips_dir}")
-
-        if crowns_gdf.empty:
-            print(f"⚠️  No polygons found in metadata for {stem}, skipping.")
-            print(f"   (Background is learned from non-tree areas in annotated tiles)")
-            continue
-
-        tile_data(
-            img_path=str(img_path),
-            out_dir=str(chips_dir),
-            buffer=buffer,
-            tile_width=tile_width,
-            tile_height=tile_height,
-            crowns=crowns_gdf,
-            threshold=threshold,
-            nan_threshold=0.4,
-            mode="rgb",
-        )
-
-        print(f"✅ Finished tiling → {chips_dir}")
 
 
 # Non Maximum Suppression (NMS) for GeoJSON predictions

@@ -62,20 +62,9 @@ def visualize_annotations(csv_path, output_dir="visualization_output", num_sampl
             xmax, ymax = int(row["xmax"]), int(row["ymax"])
             label = row["label"]
 
-            # Draw rectangle (green for trees)
+            # Draw rectangle (green for trees), thiner line width=1
             color = (0, 255, 0) if label == "Tree" else (0, 0, 255)
-            cv2.rectangle(image, (xmin, ymin), (xmax, ymax), color, 2)
-
-            # Add label
-            cv2.putText(
-                image,
-                label,
-                (xmin, ymin - 5),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                color,
-                1,
-            )
+            cv2.rectangle(image, (xmin, ymin), (xmax, ymax), color, 1)
 
         # Save visualization
         output_file = output_path / f"{Path(img_path).stem}_annotated.png"

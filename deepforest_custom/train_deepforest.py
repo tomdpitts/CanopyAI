@@ -41,6 +41,31 @@ except ImportError:
     )
 
 
+def widen_first_conv_for_shadow_channel(model):
+    """
+    Replace backbone.body.conv1 ([64,3,7,7]) with a 4-channel version ([64,4,7,7]).
+    The first 3 channel slices keep pretrained RGB weights; the 4th is zero-initialised
+    so the model starts from identical behaviour to the 3-channel baseline at step 0.
+    Call this AFTER loading pretrained / checkpoint weights.
+    """
+    inner = model.model if hasattr(model, 'model') else model
+    old_conv = inner.backbone.body.conv1
+    new_conv = nn.Conv2d(
+        4, old_conv.out_channels,
+        kernel_size=old_conv.kernel_size,
+        stride=old_conv.stride,
+        padding=old_conv.padding,
+        bias=old_conv.bias is not None,
+    )
+    with torch.no_grad():
+        new_conv.weight[:, :3] = old_conv.weight        # copy RGB weights
+        new_conv.weight[:, 3:] = 0                       # 4th channel = 0
+        if old_conv.bias is not None:
+            new_conv.bias.copy_(old_conv.bias)
+    inner.backbone.body.conv1 = new_conv
+    print("   ✅ First conv widened to 4 channels (shadow map channel zero-initialised)")
+
+
 def train_deepforest(
     train_csv,
     val_csv=None,
@@ -57,6 +82,9 @@ def train_deepforest(
     film_lr=1e-4,  # Learning rate for FiLM blocks (lower than backbone to prevent explosion)
     checkpoint=None,  # Optional checkpoint path for DeepForest weights
     accelerator=None,  # Force accelerator (cpu, gpu, mps)
+    freeze_backbone=False,  # If True, freeze backbone weights (train only FiLM/Aux)
+    aux_loss_weight=1.0,  # Weight of auxiliary shadow-prediction loss (0.0 = disabled)
+    shadow_channel=False,   # If True, add shadow map as 4th input channel
 ):
     """
     Train a DeepForest model using DeepForest 2.0 config-based API.
@@ -76,6 +104,7 @@ def train_deepforest(
         wandb_project: Weights & Biases project name (unused in this version)
         shadow_conditioning: If True, use FiLM conditioning with constant 215° shadow
         checkpoint: Optional path to DeepForest checkpoint file to load initial weights from
+        shadow_channel: If True, add directional shadow map as 4th input channel (Phase 6)
     """
     # Create run-specific output directory
     run_output_dir = str(Path(output_dir) / run_name)
@@ -114,7 +143,10 @@ def train_deepforest(
             shadow_angle_deg=shadow_angle_deg,
             train_csv=train_csv,
             val_csv=val_csv,
-            film_lr=film_lr
+            film_lr=film_lr,
+            freeze_backbone=freeze_backbone,
+            aux_loss_weight=aux_loss_weight,
+            shadow_channel=shadow_channel,
         )
     else:
         print("   Shadow conditioning: DISABLED (baseline)")
@@ -169,6 +201,11 @@ def train_deepforest(
             print(f"   Full traceback:")
             traceback.print_exc()
             raise RuntimeError("Cannot continue without pretrained weights") from e
+
+    # Widen first conv to 4 channels AFTER weights are loaded (shadow_channel mode)
+    if shadow_channel:
+        print("\n🔑 Shadow channel mode: widening first conv to 4 channels...")
+        widen_first_conv_for_shadow_channel(model)
 
     # Auto-detect and resume from checkpoint if it exists
     # This handles Modal auto-restarts gracefully
@@ -414,6 +451,22 @@ def main():
     parser.add_argument(
         "--checkpoint", type=str, default=None, help="Path to checkpoint to resume from"
     )
+    parser.add_argument(
+        "--freeze-backbone",
+        action="store_true",
+        help="Freeze backbone weights and only train FiLM/Aux head",
+    )
+    parser.add_argument(
+        "--aux-loss-weight",
+        type=float,
+        default=1.0,
+        help="Weight of auxiliary shadow-prediction loss (default: 1.0, set 0.0 to disable)",
+    )
+    parser.add_argument(
+        "--shadow_channel",
+        action="store_true",
+        help="Add directional shadow map as 4th input channel (Phase 6)",
+    )
 
     args = parser.parse_args()
 
@@ -432,6 +485,9 @@ def main():
         film_lr=args.film_lr,
         checkpoint=args.checkpoint,
         accelerator=args.accelerator,
+        freeze_backbone=args.freeze_backbone,
+        aux_loss_weight=args.aux_loss_weight,
+        shadow_channel=args.shadow_channel,
     )
 
 

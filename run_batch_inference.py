@@ -27,8 +27,7 @@ def main():
     )
     parser.add_argument(
         "--deepforest_model", 
-        type=str, 
-        default="phase3_runT_film_aggressive_lr.pth",
+        type=str,
         help="Path to DeepForest model"
     )
     parser.add_argument(
@@ -77,9 +76,10 @@ def main():
             sys.executable, "foxtrot.py",
             "--image_path", str(img_path),
             "--output_dir", args.output_dir,
-            "--deepforest_model", args.deepforest_model,
             "--shadow_model", args.shadow_model
         ]
+        if args.deepforest_model:
+            cmd += ["--deepforest_model", args.deepforest_model]
         
         if args.dry_run:
             print(f"\n[DRY RUN] {' '.join(cmd)}")

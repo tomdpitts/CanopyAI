@@ -35,6 +35,37 @@ Step 4 — Download checkpoint
         /checkpoints/phase3_runQ_baseline_no_shadow/deepforest_final.pth \\
         ./phase3_runQ_baseline_no_shadow.pth
 
+## Phase 4 (BRU splits)
+
+Step 1 — Upload images and CSVs
+    cd deepforest_custom
+    tar -czf /tmp/bru_tiles.tar.gz bru_tiles
+    modal volume put canopyai-deepforest-data /tmp/bru_tiles.tar.gz /phase4/bru_tiles.tar.gz
+    modal volume put canopyai-deepforest-data bru_train.csv /phase4/bru_train.csv
+    modal volume put canopyai-deepforest-data bru_val.csv /phase4/bru_val.csv
+
+Step 2 — Launch training (initializing from oscar50 checkpoint)
+    # Checkpoint path on volume: /checkpoints/model_oscar50.pth
+    # (Assuming it was uploaded there previously by user or earlier run)
+
+    cd deepforest_custom && modal run modal_deepforest.py \
+        --train-csv /data/phase4/bru_train.csv \
+        --val-csv /data/phase4/bru_val.csv \
+        --run-name phase4_bru_baseline \
+        --epochs 50 --lr 0.001 \
+        --checkpoint /checkpoints/model_oscar50.pth
+
+Step 3 — Launch FiLM shadow-conditioned training (initializing from oscar50 checkpoint)
+    # Note: FiLM weights will be initialized randomly, backbone from oscar50
+
+    cd deepforest_custom && modal run modal_deepforest.py \
+        --train-csv /data/phase4/bru_train.csv \
+        --val-csv /data/phase4/bru_val.csv \
+        --run-name phase4_bru_film \
+        --epochs 50 --lr 0.001 --film-lr 1e-4 \
+        --shadow-conditioning \
+        --checkpoint /checkpoints/model_oscar50.pth
+
 ## Legacy dataset mode (tcd / won / both) — unchanged, existing data untouched
 
     cd deepforest_custom && modal run modal_deepforest.py \\
@@ -76,14 +107,16 @@ image = (
     )
     # Mount specific files and directories instead of the whole root.
     # Large data folders are intentionally excluded — data lives on Modal volumes.
-    .add_local_file("../pyproject.toml", remote_path="/root/canopyAI/pyproject.toml")
+    .add_local_file("pyproject.toml", remote_path="/root/canopyAI/pyproject.toml")
     .add_local_dir(
-        ".",
+        "deepforest_custom",
         remote_path="/root/canopyAI/deepforest_custom",
-        ignore=["__pycache__", "lightning_logs/", "wandb/", "data/", "checkpoints/", "won/", "annotation_tiles/"],
+        ignore=["__pycache__", "lightning_logs/", "wandb/", "data/", "checkpoints/",
+                "won/", "annotation_tiles/", "bru_tiles/", "phase5_tiles/",
+                "won_visualizations/", "*.tif", "*.tiff", "*.png", "*.jpg"],
     )
-    .add_local_dir("../configs", remote_path="/root/canopyAI/configs")
-    .add_local_file("../utils.py", remote_path="/root/canopyAI/utils.py")
+    .add_local_dir("configs", remote_path="/root/canopyAI/configs")
+    .add_local_file("utils.py", remote_path="/root/canopyAI/utils.py")
 )
 
 # ---------------------------------------------------------------------------
@@ -127,6 +160,9 @@ def train_deepforest_modal(
     wandb_project: str = None,
     checkpoint: str = None,            # Optional path to initial weights in /data volume
     dry_run: bool = False,             # If True, print config and exit without training
+    freeze_backbone: bool = False,     # If True, freeze backbone weights (train only FiLM)
+    aux_loss_weight: float = 1.0,      # Weight of auxiliary shadow-prediction loss (0.0 = disabled)
+    shadow_channel: bool = False,      # If True, add shadow map as 4th input channel (Phase 6)
 ):
     """
     Train DeepForest on Modal GPU. Auto-resumes from checkpoint if one exists
@@ -156,6 +192,13 @@ def train_deepforest_modal(
     # ------------------------------------------------------------------
     # Resolve CSVs (direct mode vs legacy dataset mode)
     # ------------------------------------------------------------------
+    # Phase5 uses direct-CSV mode so the auto-glob tar extraction picks up
+    # /phase5_images.tar.gz (legacy mode only knows won/tcd tarballs).
+    if dataset == "phase5" and train_csv is None:
+        train_csv = "/data/phase5_train_aug.csv"
+        val_csv   = "/data/phase5_val_aug.csv"
+        print("📄 Phase5 → direct-CSV mode (images extracted via glob)")
+
     if train_csv is not None:
         # ── Direct-CSV mode ──────────────────────────────────────────────
         print(f"\n📄 Direct-CSV mode:")
@@ -226,6 +269,33 @@ def train_deepforest_modal(
         if val_csv:
             _rewrite_csv(val_csv)
 
+        # ------------------------------------------------------------------
+        # DEBUG: Verify images exist and have correct dimensions
+        # ------------------------------------------------------------------
+        print("\n🕵️‍♀️ Verifying image paths and dimensions (first 5)...")
+        import cv2
+        for csv_path in filter(None, [train_csv, val_csv]):
+            try:
+                df = pd.read_csv(csv_path)
+                for i, row in df.head(5).iterrows():
+                    img_path = row["image_path"]
+                    if not os.path.exists(img_path):
+                        print(f"   ❌ Missing: {img_path}")
+                    else:
+                        img = cv2.imread(img_path)
+                        if img is None:
+                            print(f"   ❌ Failed to load: {img_path}")
+                        else:
+                            h, w = img.shape[:2]
+                            print(f"   ✅ Found: {img_path} ({w}x{h})")
+                            
+                            # Check bbox
+                            xmin, ymin, xmax, ymax = row["xmin"], row["ymin"], row["xmax"], row["ymax"]
+                            if xmax > w or ymax > h:
+                                print(f"      ⚠️  BBox out of bounds: [{xmin}, {ymin}, {xmax}, {ymax}] vs {w}x{h}")
+            except Exception as e:
+                print(f"   ⚠️  Verification failed for {csv_path}: {e}")
+
     else:
         # ── Legacy dataset mode ───────────────────────────────────────────
         dataset = dataset or "tcd"
@@ -254,11 +324,14 @@ def train_deepforest_modal(
             train_csv = "/data/tcd_train.csv"
             val_csv = "/data/tcd_val.csv"
         elif dataset == "won":
-            train_csv = "/data/won_train.csv"
+            train_csv = "/data/won_train_pruned.csv"
             val_csv = "/data/won_val.csv"
+        elif dataset == "phase5":
+            train_csv = "/data/phase5_train_aug.csv"
+            val_csv = "/data/phase5_val_aug.csv"
         elif dataset == "both":
             tcd_train = pd.read_csv("/data/tcd_train.csv")
-            won_train = pd.read_csv("/data/won_train.csv")
+            won_train = pd.read_csv("/data/won_train_pruned.csv")
             combined_train = pd.concat([tcd_train, won_train], ignore_index=True)
             train_csv = "/tmp/combined_train.csv"
             combined_train.to_csv(train_csv, index=False)
@@ -322,6 +395,9 @@ def train_deepforest_modal(
         shadow_angle_deg=shadow_angle_deg,
         checkpoint=checkpoint,
         accelerator="gpu",   # Force CUDA — we always have an NVIDIA GPU on Modal
+        freeze_backbone=freeze_backbone,
+        aux_loss_weight=aux_loss_weight,
+        shadow_channel=shadow_channel,
     )
 
     # Persist checkpoints
@@ -361,6 +437,9 @@ def main(
     wandb_project: str = None,
     checkpoint: str = None,
     dry_run: bool = False,
+    freeze_backbone: bool = False,
+    aux_loss_weight: float = 1.0,
+    shadow_channel: bool = False,      # Phase 6: 4th shadow channel input
 ):
     """
     Launch DeepForest training on Modal GPU.
@@ -378,7 +457,7 @@ def main(
             --val-csv /phase3/val_phase3_combined.csv \\
             --run-name phase3_runQ_film_shadow \\
             --epochs 50 --patience 15 --lr 0.001 --film-lr 1e-4 --batch-size 16 \\
-            --shadow-conditioning
+            --shadow-conditioning --freeze-backbone
 
     Legacy mode:
         modal run modal_deepforest.py --dataset tcd --epochs 20 --run-name tcd_v1
@@ -400,6 +479,9 @@ def main(
         wandb_project=wandb_project,
         checkpoint=checkpoint,
         dry_run=dry_run,
+        freeze_backbone=freeze_backbone,
+        aux_loss_weight=aux_loss_weight,
+        shadow_channel=shadow_channel,
     )
 
     if results:

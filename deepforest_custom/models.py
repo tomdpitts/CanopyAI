@@ -2,10 +2,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+import cv2
 from deepforest import main as deepforest_main
 
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
+
+try:
+    from .utils import generate_shadow_map   # package import
+except ImportError:
+    from utils import generate_shadow_map     # script import
 
 
 class SolarAttentionBlock(nn.Module):
@@ -92,12 +98,28 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
         train_csv=None,
         val_csv=None,
         film_lr=1e-4,
+        freeze_backbone=False,
+        aux_loss_weight=1.0,
+        shadow_channel=False,   # If True, widen first conv to 4 channels
         config=None,
         **kwargs,
     ):
+        self.shadow_channel = shadow_channel
         # Initialize DeepForest (LightningModule)
         # Explicit call to avoid MRO/super() issues with keyword args
         deepforest_main.deepforest.__init__(self, config=config, **kwargs)
+
+        self.freeze_backbone = freeze_backbone
+        if freeze_backbone:
+            print("   ❄️  Freezing backbone parameters (training FiLM only)")
+            for param in self.model.parameters():
+                param.requires_grad = False
+                # Also set eval mode for batchnorm? Usually keeping them in train mode is better 
+                # if existing stats are not representative, but for "freezing" typically we want eval mode 
+                # or at least no grad. DeepForest handles train/eval mode. 
+                # Lightning will call .train() which sets training=True.
+                # If we want strict freezing, we might want to force eval mode on backbone, 
+                # but let's stick to requires_grad=False for now.
 
         # Add FiLM blocks for each FPN level (P3-P7)
         # DeepForest uses RetinaNet with 256 channels at each FPN level
@@ -182,7 +204,37 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
             nn.Linear(128, 2),  # Predict (sin, cos)
         )
         # Initialize aux head logic for loss weighting
-        self.aux_loss_weight = 1.0
+        self.aux_loss_weight = aux_loss_weight
+
+        # Shadow channel: 4th input channel (shadow probability map)
+        # We store the flag but actually widen the conv AFTER pretrained weights are
+        # loaded externally (see train_deepforest.py: widen_first_conv_for_shadow_channel).
+        # This flag is serialised in the checkpoint so inference can detect it.
+        self.shadow_channel = shadow_channel
+
+    def _prepend_shadow_channel(self, images, image_paths):
+        """
+        For each image in the batch, compute a shadow probability map and
+        concatenate it as a 4th channel.  Images are expected as a list of
+        [3, H, W] float tensors in [0,1] range (DeepForest default).
+        Returns a list of [4, H, W] float tensors.
+        """
+        result = []
+        for img_t, path in zip(images, image_paths):
+            sv = self.shadow_lookup.get(path)
+            if sv is None:
+                # Fallback: zero channel (no shadow info)
+                shadow_t = torch.zeros(1, img_t.shape[1], img_t.shape[2],
+                                       dtype=img_t.dtype, device=img_t.device)
+            else:
+                # img_t is [3, H, W] float [0,1] — convert to uint8 RGB for generate_shadow_map
+                img_np  = (img_t.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                angle   = float(np.degrees(np.arctan2(sv[0], sv[1])))  # sx,sy → degrees
+                shadow_np = generate_shadow_map(img_np, angle)          # H×W float32
+                shadow_t  = torch.from_numpy(shadow_np).unsqueeze(0)    # [1,H,W]
+                shadow_t  = shadow_t.to(img_t.device, dtype=img_t.dtype)
+            result.append(torch.cat([img_t, shadow_t], dim=0))          # [4,H,W]
+        return result
 
     def training_step(self, batch, batch_idx):
         """
@@ -226,6 +278,12 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
         )
         shadow_vectors = torch.from_numpy(shadow_vectors_np).to(images[0].device)
         self.current_shadow_vector = shadow_vectors
+
+        # Prepend shadow map as 4th channel if enabled
+        if self.shadow_channel:
+            batch = (self._prepend_shadow_channel(images, image_paths),
+                     targets,
+                     *batch[2:])
 
         # 1. Main DeepForest loss (box regression + classification)
         loss_result = super().training_step(batch, batch_idx)
@@ -272,12 +330,20 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
         backbone_lr = self.config.train.lr if self.config else 0.001
         film_lr = self.film_lr
 
-        params = [
-            {"params": self.model.parameters(), "lr": backbone_lr},
-            {"params": self.film_blocks.parameters(), "lr": film_lr},
-        ]
-
-        print(f"   Optimizer: SGD(momentum=0.9)  backbone_lr={backbone_lr}  film_lr={film_lr}")
+        if self.freeze_backbone:
+            params = [
+                {"params": self.film_blocks.parameters(), "lr": film_lr},
+                 # Aux head is part of the new logic, should be trained too
+                {"params": self.aux_head.parameters(), "lr": film_lr},
+            ]
+            print(f"   Optimizer: SGD(momentum=0.9)  film_lr={film_lr} (Backbone FROZEN)")
+        else:
+            params = [
+                {"params": self.model.parameters(), "lr": backbone_lr},
+                {"params": self.film_blocks.parameters(), "lr": film_lr},
+                {"params": self.aux_head.parameters(), "lr": film_lr},
+            ]
+            print(f"   Optimizer: SGD(momentum=0.9)  backbone_lr={backbone_lr}  film_lr={film_lr}")
 
         optimizer = torch.optim.SGD(
             params, lr=backbone_lr, momentum=0.9, weight_decay=1e-4

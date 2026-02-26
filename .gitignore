@@ -58,3 +58,9 @@ deepforest_custom/annotation*
 checkpoints/*
 debug_vis*
 *training_vis*
+*shadow_map*
+*.png
+*.xml
+*.tif
+*.jpg
+*.geojson

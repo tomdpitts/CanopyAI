@@ -494,6 +494,18 @@ def detect_trees_deepforest(
         else:
             state_dict = checkpoint
 
+        # Detect shadow_channel flag from checkpoint hyper-parameters and
+        # widen first conv BEFORE loading weights so shapes match
+        hp = checkpoint.get("hyper_parameters", {})
+        use_shadow_channel = hp.get("shadow_channel", False)
+        if use_shadow_channel:
+            print("   🔑 Checkpoint uses shadow_channel=True — widening first conv to 4 channels")
+            try:
+                from deepforest_custom.train_deepforest import widen_first_conv_for_shadow_channel
+            except ImportError:
+                from train_deepforest import widen_first_conv_for_shadow_channel
+            widen_first_conv_for_shadow_channel(df_model)
+
         # Try loading into full model first
         try:
             # Load with strict=False to allow missing aux_head weights (from older checkpoints)
@@ -532,6 +544,7 @@ def detect_trees_deepforest(
 
         df_model.model.to(device)
         df_model.model.eval()
+        use_shadow_channel = False   # standard DF never uses shadow channel
 
     print(f"   🖥️  Device: {device}")
 
@@ -583,6 +596,18 @@ def detect_trees_deepforest(
             try:
                 # Prepare input tensor
                 image_tensor = torch.tensor(tile).permute(2, 0, 1).float() / 255.0
+
+                # Prepend shadow map as 4th channel if model was trained with it
+                if use_shadow_channel and shadow_angle is not None:
+                    try:
+                        from utils import generate_shadow_map
+                    except ImportError:
+                        from deepforest_custom.utils import generate_shadow_map  # type: ignore
+                    tile_u8 = tile.astype(np.uint8) if tile.dtype != np.uint8 else tile
+                    shadow_np = generate_shadow_map(tile_u8, shadow_angle)
+                    shadow_t  = torch.from_numpy(shadow_np).unsqueeze(0).float()
+                    image_tensor = torch.cat([image_tensor, shadow_t], dim=0)
+
                 image_tensor = image_tensor.to(device).unsqueeze(0)  # (1, C, H, W)
 
                 # Inference
@@ -1448,16 +1473,20 @@ def main(args):
 
     # Create visualization (loads masks from cache)
     vis_start = time.time()
-    vis_path = create_visualization(
-        image,
-        cache_files,
-        valid_bboxes,
-        valid_scores,
-        Path(args.output_dir),
-        tif_path.stem,
-        smooth_masks=args.smooth_masks,
-    )
-    timings["Visualization"] = time.time() - vis_start
+    if not getattr(args, 'no_viz', False):
+        vis_path = create_visualization(
+            image,
+            cache_files,
+            valid_bboxes,
+            valid_scores,
+            Path(args.output_dir),
+            tif_path.stem,
+            smooth_masks=args.smooth_masks,
+        )
+        timings["Visualization"] = time.time() - vis_start
+    else:
+        vis_path = "(skipped)"
+        print("🎨 Visualization skipped (--no_viz)")
 
     # Cleanup cache if using temp directory
     if args.cache_dir is None and cache_files:
@@ -1650,6 +1679,12 @@ def parse_args():
         "--debug_single_box",
         action="store_true",
         help="Debug: limit to single bbox to inspect SAM output.",
+    )
+
+    ap.add_argument(
+        "--no_viz",
+        action="store_true",
+        help="Skip visualization output (useful for batch/evaluation runs).",
     )
 
     return ap.parse_args()
