@@ -160,9 +160,10 @@ def train_deepforest_modal(
     wandb_project: str = None,
     checkpoint: str = None,            # Optional path to initial weights in /data volume
     dry_run: bool = False,             # If True, print config and exit without training
-    freeze_backbone: bool = False,     # If True, freeze backbone weights (train only FiLM)
+    freeze_backbone: bool = False,
     aux_loss_weight: float = 1.0,      # Weight of auxiliary shadow-prediction loss (0.0 = disabled)
     shadow_channel: bool = False,      # If True, add shadow map as 4th input channel (Phase 6)
+    use_film: bool = False,            # If True, enable FiLM conditioning blocks
 ):
     """
     Train DeepForest on Modal GPU. Auto-resumes from checkpoint if one exists
@@ -398,6 +399,7 @@ def train_deepforest_modal(
         freeze_backbone=freeze_backbone,
         aux_loss_weight=aux_loss_weight,
         shadow_channel=shadow_channel,
+        use_film=use_film,
     )
 
     # Persist checkpoints
@@ -440,6 +442,7 @@ def main(
     freeze_backbone: bool = False,
     aux_loss_weight: float = 1.0,
     shadow_channel: bool = False,      # Phase 6: 4th shadow channel input
+    use_film: bool = False,            # Phase 6: Disable FiLM by default for clean ablation
 ):
     """
     Launch DeepForest training on Modal GPU.
@@ -482,6 +485,7 @@ def main(
         freeze_backbone=freeze_backbone,
         aux_loss_weight=aux_loss_weight,
         shadow_channel=shadow_channel,
+        use_film=use_film,
     )
 
     if results:

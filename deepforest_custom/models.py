@@ -101,10 +101,12 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
         freeze_backbone=False,
         aux_loss_weight=1.0,
         shadow_channel=False,   # If True, widen first conv to 4 channels
+        use_film=False,         # Defaults to False. If True, use SolarAttentionBlock (FiLM) conditioning
         config=None,
         **kwargs,
     ):
         self.shadow_channel = shadow_channel
+        self.use_film = use_film
         # Initialize DeepForest (LightningModule)
         # Explicit call to avoid MRO/super() issues with keyword args
         deepforest_main.deepforest.__init__(self, config=config, **kwargs)
@@ -179,17 +181,21 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
              except Exception as e:
                  print(f"   Warning: could not load shadow lookup from val_csv: {e}")
 
-        if self.shadow_lookup:
-            print(
-                f"   Per-image FiLM vectors: ENABLED ({len(self.shadow_lookup)} images)"
-            )
+        if self.use_film:
+            if self.shadow_lookup:
+                print(
+                    f"   Per-image FiLM vectors: ENABLED ({len(self.shadow_lookup)} images)"
+                )
+            else:
+                print(
+                    f"   Per-image FiLM vectors: DISABLED (base {shadow_angle_deg} deg + rotation)"
+                )
         else:
-            print(
-                f"   Per-image FiLM vectors: DISABLED (base {shadow_angle_deg} deg + rotation)"
-            )
+            print("   FiLM / SolarAttentionBlocks: DISABLED completely (shadow_channel mode usually)")
 
         # Track whether FiLM hooks are injected
-        self._film_injected = False
+        # If use_film is False, pretend they are already injected so we skip them
+        self._film_injected = not self.use_film
         self.current_shadow_vector = None
 
         # Auxiliary head: Predict shadow vector from FPN P5 features
@@ -292,7 +298,7 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
         aux_loss = 0.0
         
         # Retrieve captured features from the hook
-        if hasattr(self, "_last_p5_features") and self._last_p5_features is not None:
+        if self.use_film and hasattr(self, "_last_p5_features") and self._last_p5_features is not None:
             # Predict shadow vector from features
             pred_shadow = self.aux_head(self._last_p5_features)  # (B, 2)
             
@@ -330,7 +336,11 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
         backbone_lr = self.config.train.lr if self.config else 0.001
         film_lr = self.film_lr
 
-        if self.freeze_backbone:
+        if not self.use_film:
+            # Standard DeepForest optimiser if FiLM explicitly disabled
+            params = [{"params": self.model.parameters(), "lr": backbone_lr}]
+            print(f"   Optimizer: SGD(momentum=0.9)  backbone_lr={backbone_lr} (FiLM/Aux disabled)")
+        elif self.freeze_backbone:
             params = [
                 {"params": self.film_blocks.parameters(), "lr": film_lr},
                  # Aux head is part of the new logic, should be trained too
@@ -507,11 +517,21 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
     def validation_step(self, batch, batch_idx):
         """
         Validation step with shadow conditioning.
-        Ensures shadow vectors are correctly set for the validation batch.
+        Ensures shadow vectors are correctly set for the validation batch (FiLM)
+        and prepends the shadow map if shadow_channel=True.
         """
-        # Set shadow vector for this batch
+        # Set shadow vector for this batch (used by FiLM blocks if enabled)
         self._set_batch_shadow_vector(batch)
         
+        # Prepend shadow map channel (Phase 6)
+        if self.shadow_channel:
+            images = batch[0]
+            targets = batch[1]
+            image_paths = batch[2] if len(batch) > 2 else None
+            batch = (self._prepend_shadow_channel(images, image_paths),
+                     targets,
+                     *batch[2:])
+
         # Run base validation (forward pass)
         return super().validation_step(batch, batch_idx)
 
@@ -520,6 +540,29 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
         Prediction step with shadow conditioning.
         """
         self._set_batch_shadow_vector(batch)
+
+        if self.shadow_channel:
+            if isinstance(batch, list):
+                if isinstance(batch[0], torch.Tensor):
+                    images = batch
+                    image_paths = [None] * len(images)
+                else: # tuple from dataloader
+                    images = batch[0]
+                    image_paths = batch[2] if len(batch) > 2 else [None] * len(images)
+            else:
+                images = batch # batched tensor
+                image_paths = [None] * len(images)
+                images = list(images)
+
+            prepended_images = self._prepend_shadow_channel(images, image_paths)
+            
+            if isinstance(batch, torch.Tensor):
+                batch = torch.stack(prepended_images)
+            elif isinstance(batch, list) and not isinstance(batch[0], torch.Tensor):
+                batch = (prepended_images, batch[1], *batch[2:])
+            else:
+                batch = prepended_images
+
         return super().predict_step(batch, batch_idx, dataloader_idx)
 
     def _set_batch_shadow_vector(self, batch):

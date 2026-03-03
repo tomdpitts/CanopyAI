@@ -27,6 +27,125 @@ from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 torch.set_float32_matmul_precision("medium")
 
 
+# ---------------------------------------------------------------------------
+# Monkey-patch: fix deepforest evaluate_boxes index-alignment bug
+#
+# When an image in ground_df has zero predictions, evaluate_boxes builds a
+# placeholder DataFrame mixing:
+#   - pd.Series([...] * n) with default index [0, 1, ..., n-1]
+#   - group.label / group.geometry with the original DataFrame index (e.g. [5, 6])
+# Pandas unions the two index sets → length 2n, then rejects the numpy arrays
+# of length n → ValueError: "array length 1 does not match index length 2".
+# Fix: reset the group index before building the placeholder.
+# ---------------------------------------------------------------------------
+def _patched_evaluate_boxes(predictions, ground_df, iou_threshold=0.4):
+    import geopandas as gpd
+    import numpy as np
+    import pandas as pd
+    import shapely
+    from deepforest import evaluate as _ev
+    from deepforest.utilities import determine_geometry_type
+
+    if ground_df.empty:
+        return {
+            "results": None,
+            "box_recall": None,
+            "box_precision": 0,
+            "class_recall": None,
+            "predictions": predictions,
+            "ground_df": ground_df,
+        }
+
+    if not isinstance(predictions, gpd.GeoDataFrame):
+        if "geometry" not in predictions.columns and all(
+            c in predictions.columns for c in ["xmin", "ymin", "xmax", "ymax"]
+        ):
+            predictions = predictions.copy()
+            predictions["geometry"] = shapely.box(
+                predictions["xmin"], predictions["ymin"],
+                predictions["xmax"], predictions["ymax"],
+            )
+        predictions = gpd.GeoDataFrame(predictions, geometry="geometry")
+
+    if not isinstance(ground_df, gpd.GeoDataFrame):
+        if "geometry" not in ground_df.columns and all(
+            c in ground_df.columns for c in ["xmin", "ymin", "xmax", "ymax"]
+        ):
+            ground_df = ground_df.copy()
+            ground_df["geometry"] = shapely.box(
+                ground_df["xmin"], ground_df["ymin"],
+                ground_df["xmax"], ground_df["ymax"],
+            )
+        ground_df = gpd.GeoDataFrame(ground_df, geometry="geometry")
+
+    predictions_by_image = {
+        name: group.reset_index(drop=True)
+        for name, group in predictions.groupby("image_path")
+    }
+
+    results, box_recalls, box_precisions = [], [], []
+    for image_path, group in ground_df.groupby("image_path"):
+        image_predictions = predictions_by_image.get(image_path, pd.DataFrame())
+        if not isinstance(image_predictions, pd.DataFrame) or image_predictions.empty:
+            image_predictions = pd.DataFrame()
+
+        if image_predictions.empty:
+            # FIX: reset_index so all Series share the same 0-based index
+            g = group.reset_index(drop=True)
+            n = len(g)
+            result = pd.DataFrame({
+                "truth_id":       group.index.values,
+                "prediction_id":  [None]  * n,
+                "IoU":            [0.0]   * n,
+                "predicted_label":[None]  * n,
+                "score":          [None]  * n,
+                "match":          [False] * n,
+                "true_label":     g.label.values,
+                "geometry":       g.geometry.values,
+            })
+            box_recalls.append(0)
+            results.append(result)
+            continue
+        else:
+            group = group.reset_index(drop=True)
+            result = _ev.evaluate_image_boxes(
+                predictions=image_predictions, ground_df=group
+            )
+
+        result["image_path"] = image_path
+        result["match"] = result.IoU > iou_threshold
+        result["match"] = result["match"].fillna(False)
+        true_positive = sum(result["match"])
+        box_recalls.append(true_positive / result.shape[0])
+        box_precisions.append(true_positive / image_predictions.shape[0])
+        results.append(result)
+
+    if results:
+        results = pd.concat(results, ignore_index=True)
+    else:
+        results = pd.DataFrame(columns=[
+            "truth_id", "prediction_id", "IoU", "predicted_label",
+            "score", "match", "true_label", "geometry", "image_path",
+        ])
+
+    box_recall = np.mean(box_recalls)
+    box_precision = np.mean(box_precisions) if box_precisions else np.nan
+    class_recall = _ev.compute_class_recall(results[results.match])
+
+    return {
+        "results": results,
+        "box_precision": box_precision,
+        "box_recall": box_recall,
+        "class_recall": class_recall,
+        "predictions": predictions,
+        "ground_df": ground_df,
+    }
+
+from deepforest import evaluate as _deepforest_evaluate
+_deepforest_evaluate.evaluate_boxes = _patched_evaluate_boxes
+# ---------------------------------------------------------------------------
+
+
 # Import model classes from separate file
 try:
     from .models import (
@@ -46,6 +165,8 @@ def widen_first_conv_for_shadow_channel(model):
     Replace backbone.body.conv1 ([64,3,7,7]) with a 4-channel version ([64,4,7,7]).
     The first 3 channel slices keep pretrained RGB weights; the 4th is zero-initialised
     so the model starts from identical behaviour to the 3-channel baseline at step 0.
+    Also extends the RetinaNet transform's image_mean/image_std to 4 elements so the
+    built-in normalizer doesn't broadcast-fail on 4-channel tensors.
     Call this AFTER loading pretrained / checkpoint weights.
     """
     inner = model.model if hasattr(model, 'model') else model
@@ -63,6 +184,16 @@ def widen_first_conv_for_shadow_channel(model):
         if old_conv.bias is not None:
             new_conv.bias.copy_(old_conv.bias)
     inner.backbone.body.conv1 = new_conv
+
+    # Extend the RetinaNet transform normalizer to 4 channels.
+    # Default ImageNet mean/std are 3-element; broadcasting crashes on 4-ch input.
+    # Shadow map is [0,1] float → mean=0.5, std=0.25 keeps it in a similar range.
+    transform = inner.transform
+    if len(transform.image_mean) == 3:
+        transform.image_mean = list(transform.image_mean) + [0.5]
+        transform.image_std  = list(transform.image_std)  + [0.25]
+        print("   ✅ Normalizer extended to 4 channels (shadow: mean=0.5 std=0.25)")
+
     print("   ✅ First conv widened to 4 channels (shadow map channel zero-initialised)")
 
 
@@ -84,7 +215,8 @@ def train_deepforest(
     accelerator=None,  # Force accelerator (cpu, gpu, mps)
     freeze_backbone=False,  # If True, freeze backbone weights (train only FiLM/Aux)
     aux_loss_weight=1.0,  # Weight of auxiliary shadow-prediction loss (0.0 = disabled)
-    shadow_channel=False,   # If True, add shadow map as 4th input channel
+    shadow_channel=False,   # If True, add shadow map as 4th input channel (Phase 6)
+    use_film=False,         # Defaults to False. If True, use FiLM blocks.
 ):
     """
     Train a DeepForest model using DeepForest 2.0 config-based API.
@@ -120,7 +252,7 @@ def train_deepforest(
     # Initialize model
     print("\n⚙️  Initializing model...")
 
-    if shadow_conditioning:
+    if shadow_conditioning or shadow_channel:
         # Auto-derive base shadow angle from CSV if not explicitly provided
         if shadow_angle_deg is None:
             _df = pd.read_csv(train_csv)
@@ -138,7 +270,7 @@ def train_deepforest(
             print(
                 f"   Shadow angle (explicit): {shadow_angle_deg} deg (azimuth 0=North CW)"
             )
-        print("   Shadow conditioning: ENABLED (FiLM)")
+        print(f"   Shadow conditioning (FiLM): {'ENABLED' if use_film else 'DISABLED'}")
         model = ShadowConditionedDeepForest(
             shadow_angle_deg=shadow_angle_deg,
             train_csv=train_csv,
@@ -147,6 +279,7 @@ def train_deepforest(
             freeze_backbone=freeze_backbone,
             aux_loss_weight=aux_loss_weight,
             shadow_channel=shadow_channel,
+            use_film=use_film,
         )
     else:
         print("   Shadow conditioning: DISABLED (baseline)")
@@ -180,7 +313,7 @@ def train_deepforest(
                 # Load into model.model (the inner DeepForest backbone); FiLM stays random
                 model.model.load_state_dict(state_dict, strict=False)
                 print(f"   Loaded backbone-only checkpoint ({len(ck_keys)} keys)")
-                if shadow_conditioning:
+                if use_film:
                     print("   FiLM layers initialized randomly (not in checkpoint)")
 
             print("   Checkpoint loaded successfully")
@@ -251,8 +384,8 @@ def train_deepforest(
     model.config.train.lr = lr
     model.config.batch_size = batch_size
 
-    # Configure rotation augmentation for FiLM training
-    if shadow_conditioning:
+    # Configure rotation augmentation for FiLM/shadow channel training
+    if shadow_conditioning or shadow_channel:
         print("   🔄 Rotation augmentation: PRE-COMPUTED (in CSV)")
         print(
             "   ℹ️  Disabling default DeepForest augmentations to prevent shadow vector mismatch"
@@ -319,8 +452,8 @@ def train_deepforest(
     print(f"\n🚀 Starting training...")
     print("-" * 60)
 
-    if shadow_conditioning:
-        # ── FiLM path ─────────────────────────────────────────────────────────
+    if shadow_conditioning or shadow_channel:
+        # ── FiLM / Shadow Channel path ─────────────────────────────────────────
         # ShadowConditionedDeepForest is a raw LightningModule, so we must build
         # the trainer manually.  Gradient clipping is kept here because FiLM
         # hooks can cause gradient explosion.
@@ -403,8 +536,8 @@ def train_deepforest(
     final_model_path = Path(run_output_dir) / "deepforest_final.pth"
     print(f"💾 Saved final model to {final_model_path}")
 
-    if shadow_conditioning:
-        # Save the full wrapper model (including FiLM weights)
+    if shadow_conditioning or shadow_channel:
+        # Save the full wrapper model (including FiLM weights / shadow conv)
         torch.save(model.state_dict(), str(final_model_path))
     else:
         # Save only the inner DeepForest model (backward compatibility)
@@ -467,6 +600,11 @@ def main():
         action="store_true",
         help="Add directional shadow map as 4th input channel (Phase 6)",
     )
+    parser.add_argument(
+        "--use-film",
+        action="store_true",
+        help="Enable FiLM conditioning blocks (default is OFF for clean shadow_channel ablation)",
+    )
 
     args = parser.parse_args()
 
@@ -488,6 +626,7 @@ def main():
         freeze_backbone=args.freeze_backbone,
         aux_loss_weight=args.aux_loss_weight,
         shadow_channel=args.shadow_channel,
+        use_film=args.use_film,
     )
 
 
