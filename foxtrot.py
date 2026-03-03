@@ -410,6 +410,8 @@ def detect_trees_deepforest(
     tile_overlap=0.05,
     confidence_threshold=0.35,
     debug_tile_dir=None,
+    shadow_map_path=None,      # If set, write full-image shadow map as GeoTIFF here
+    geo_meta=None,             # (crs, transform) tuple for shadow map GeoTIFF
 ):
     """
     Pass 1: Run DeepForest detection on 400px tiles.
@@ -591,6 +593,10 @@ def detect_trees_deepforest(
     tile_count = 0
     debug_tiles_saved = 0  # track how many non-nodata debug tiles saved
 
+    # Accumulation canvas for shadow map GeoTIFF (averaged over overlapping tiles)
+    shadow_canvas = np.zeros((h, w), dtype=np.float32)
+    shadow_weight = np.zeros((h, w), dtype=np.float32)
+
     # Process tiles
     y_starts = range(0, h, stride) if h > tile_size else [0]
     x_starts = range(0, w, stride) if w > tile_size else [0]
@@ -641,6 +647,12 @@ def detect_trees_deepforest(
                         shadow_np = np.zeros(tile.shape[:2], dtype=np.float32)
                     shadow_t = torch.from_numpy(shadow_np).unsqueeze(0).float()
                     image_tensor = torch.cat([image_tensor, shadow_t], dim=0)
+
+                    # Accumulate into full-image shadow canvas
+                    if shadow_map_path is not None:
+                        th, tw = shadow_np.shape
+                        shadow_canvas[y_start:y_start+th, x_start:x_start+tw] += shadow_np
+                        shadow_weight[y_start:y_start+th, x_start:x_start+tw] += 1.0
 
                 image_tensor = image_tensor.to(device).unsqueeze(0)  # (1, C, H, W)
 
@@ -751,6 +763,63 @@ def detect_trees_deepforest(
     warnings.filterwarnings("default")
 
     print(f"\n✅ DeepForest: {tile_count} tiles, {len(all_bboxes)} detections")
+
+    # ── Write shadow map GeoTIFF ─────────────────────────────────────────────
+    if shadow_map_path is not None and shadow_weight.max() > 0:
+        # Average overlapping tile contributions
+        with np.errstate(invalid="ignore"):
+            shadow_out = np.where(shadow_weight > 0, shadow_canvas / shadow_weight, 0).astype(np.float32)
+
+        import rasterio
+        from rasterio.transform import from_bounds as _from_bounds
+
+        Path(shadow_map_path).parent.mkdir(parents=True, exist_ok=True)
+        crs_out, transform_out = (geo_meta or (None, None))
+
+        profile = dict(
+            driver="GTiff",
+            dtype="float32",
+            width=w,
+            height=h,
+            count=1,
+            compress="lzw",
+        )
+        if crs_out:
+            profile["crs"] = crs_out
+        if transform_out is not None:
+            profile["transform"] = transform_out
+
+        with rasterio.open(shadow_map_path, "w", **profile) as dst:
+            dst.write(shadow_out[np.newaxis, ...])
+
+        print(f"   🗺️  Shadow map GeoTIFF → {shadow_map_path}")
+
+        # ── Companion PNG: shadow map + bounding boxes ─────────────────────
+        if all_bboxes:
+            import matplotlib.pyplot as _plt
+            import matplotlib.patches as _patches
+            from matplotlib.colors import Normalize as _Norm
+            from matplotlib.cm import ScalarMappable as _SM
+
+            dpi = 150
+            fig, ax = _plt.subplots(figsize=(w / dpi, h / dpi), dpi=dpi)
+            ax.imshow(shadow_out, cmap="gray", vmin=0, vmax=1, interpolation="nearest")
+            ax.set_axis_off()
+
+            cmap_boxes = _plt.get_cmap("RdYlGn")
+            norm = _Norm(vmin=0.35, vmax=1.0)
+            for (x1, y1, x2, y2), sc in zip(all_bboxes, all_scores):
+                color = cmap_boxes(norm(sc))
+                rect = _patches.Rectangle(
+                    (x1, y1), x2 - x1, y2 - y1,
+                    linewidth=0.6, edgecolor=color, facecolor="none", alpha=0.85,
+                )
+                ax.add_patch(rect)
+
+            viz_path = str(shadow_map_path).replace(".tif", "_viz.png")
+            _plt.savefig(viz_path, bbox_inches="tight", pad_inches=0, dpi=dpi)
+            _plt.close(fig)
+            print(f"   🖼️  Shadow map + boxes → {viz_path}")
 
     return all_bboxes, all_scores
 
@@ -1306,8 +1375,17 @@ def create_visualization(
     vis_image = image.copy()
 
     # Colors
-    bbox_color = (33, 240, 255)  # Electric blue for bboxes
-    polygon_color = (11, 89, 214)  # Steel blue for polygons
+    polygon_color = (11, 89, 214)  # Steel blue for SAM polygon contours
+
+    # Confidence colour map: red (low) → yellow → green (high), range [0.35, 1.0]
+    import matplotlib.cm as _cm
+    import matplotlib.colors as _mcolors
+    _cmap = _cm.get_cmap("RdYlGn")
+    _cnorm = _mcolors.Normalize(vmin=0.35, vmax=1.0)
+
+    def _score_color_rgb(sc):
+        r, g, b, _ = _cmap(_cnorm(sc))
+        return (int(r * 255), int(g * 255), int(b * 255))  # RGB (image array is RGB)
 
     # Font settings for confidence labels
     font = cv2.FONT_HERSHEY_SIMPLEX
@@ -1318,6 +1396,7 @@ def create_visualization(
     print("   Drawing bounding boxes...")
     for bbox, score in zip(bboxes, scores):
         xmin, ymin, xmax, ymax = [int(c) for c in bbox]
+        bbox_color = _score_color_rgb(score)
         cv2.rectangle(vis_image, (xmin, ymin), (xmax, ymax), bbox_color, 1)
 
         # Draw confidence label above bbox
@@ -1482,6 +1561,11 @@ def main(args):
         tile_size=args.df_tile_size,
         confidence_threshold=args.deepforest_confidence,
         debug_tile_dir=str(Path(args.output_dir) / "debug_tiles") if args.debug_tiles else None,
+        shadow_map_path=(
+            str(Path(args.output_dir) / (Path(args.image_path).stem + "_shadow_map.tif"))
+            if args.save_shadow_map else None
+        ),
+        geo_meta=(crs, transform) if args.save_shadow_map else None,
     )
     timings["DeepForest"] = time.time() - df_start
 
@@ -1796,6 +1880,15 @@ def parse_args():
         help="Save side-by-side RGB + shadow-map visualizations of the first 3 "
         "processed tiles to <output_dir>/debug_tiles/. Only active when a "
         "shadow-channel model is loaded.",
+    )
+
+    ap.add_argument(
+        "--save_shadow_map",
+        action="store_true",
+        help="Write the full-image shadow probability map as a georeferenced GeoTIFF "
+        "(<output_dir>/<image_stem>_shadow_map.tif). Load this alongside the "
+        "prediction GeoJSON in QGIS to inspect shadow signal at FP/FN locations. "
+        "Only active when a shadow-channel model is used.",
     )
 
     return ap.parse_args()
