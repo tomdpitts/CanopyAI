@@ -102,6 +102,7 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
         aux_loss_weight=1.0,
         shadow_channel=False,   # If True, widen first conv to 4 channels
         use_film=False,         # Defaults to False. If True, use SolarAttentionBlock (FiLM) conditioning
+        shadow_norm_stats=None, # Optional (dg_scale, dark_scale, otsu_ctr) from compute_shadow_normalization_stats
         config=None,
         **kwargs,
     ):
@@ -218,14 +219,32 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
         # This flag is serialised in the checkpoint so inference can detect it.
         self.shadow_channel = shadow_channel
 
+        # Global normalization stats for the shadow map, computed from the full
+        # training image (or None to fall back to per-tile normalization).
+        # Shape: (dg_scale: float, dark_scale: float, otsu_ctr: float)
+        self.shadow_norm_stats = shadow_norm_stats
+        if shadow_norm_stats is not None:
+            print(
+                f"   📊 Shadow norm stats (global): dg_scale={shadow_norm_stats[0]:.1f}  "
+                f"dark_scale={shadow_norm_stats[1]:.1f}  otsu_ctr={shadow_norm_stats[2]:.3f}"
+            )
+
     def _prepend_shadow_channel(self, images, image_paths):
         """
         For each image in the batch, compute a shadow probability map and
         concatenate it as a 4th channel.  Images are expected as a list of
         [3, H, W] float tensors in [0,1] range (DeepForest default).
         Returns a list of [4, H, W] float tensors.
+        Uses self.shadow_norm_stats (dg_scale, dark_scale, otsu_ctr) if available,
+        otherwise falls back to per-tile normalisation.
         """
         result = []
+        # Unpack global normalization stats if available
+        norm_kwargs = {}
+        if self.shadow_norm_stats is not None:
+            dg_s, dark_s, otsu_s = self.shadow_norm_stats
+            norm_kwargs = dict(dg_scale=dg_s, dark_scale=dark_s, otsu_ctr=otsu_s)
+
         for img_t, path in zip(images, image_paths):
             sv = self.shadow_lookup.get(path)
             if sv is None:
@@ -236,7 +255,7 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
                 # img_t is [3, H, W] float [0,1] — convert to uint8 RGB for generate_shadow_map
                 img_np  = (img_t.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
                 angle   = float(np.degrees(np.arctan2(sv[0], sv[1])))  # sx,sy → degrees
-                shadow_np = generate_shadow_map(img_np, angle)          # H×W float32
+                shadow_np = generate_shadow_map(img_np, angle, **norm_kwargs)  # H×W float32
                 shadow_t  = torch.from_numpy(shadow_np).unsqueeze(0)    # [1,H,W]
                 shadow_t  = shadow_t.to(img_t.device, dtype=img_t.dtype)
             result.append(torch.cat([img_t, shadow_t], dim=0))          # [4,H,W]

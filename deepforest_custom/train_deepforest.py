@@ -271,6 +271,61 @@ def train_deepforest(
                 f"   Shadow angle (explicit): {shadow_angle_deg} deg (azimuth 0=North CW)"
             )
         print(f"   Shadow conditioning (FiLM): {'ENABLED' if use_film else 'DISABLED'}")
+
+        # Compute global shadow normalization stats from a sample of training images.
+        # This is done BEFORE model init so every _prepend_shadow_channel call
+        # uses consistent scales rather than renormalizing per-tile.
+        shadow_norm_stats = None
+        if shadow_channel and shadow_angle_deg is not None:
+            try:
+                import rasterio, random
+                try:
+                    from utils import compute_shadow_normalization_stats
+                except ImportError:
+                    from deepforest_custom.utils import compute_shadow_normalization_stats
+
+                _df_for_stats = pd.read_csv(train_csv)
+                _unique_imgs  = _df_for_stats["image_path"].unique().tolist()
+                N_SAMPLE = min(5, len(_unique_imgs))
+                _sample_imgs = random.sample(_unique_imgs, N_SAMPLE)
+                print(f"   📊 Computing shadow normalization stats from {N_SAMPLE} training images...")
+
+                all_dg, all_dark = [], []
+                _img_dir = str(Path(train_csv).parent)
+
+                for img_path in _sample_imgs:
+                    full_path = img_path if Path(img_path).is_absolute() else str(Path(_img_dir) / img_path)
+                    try:
+                        with rasterio.open(full_path) as _src:
+                            _img = _src.read([1, 2, 3]).transpose(1, 2, 0)
+                        _stats = compute_shadow_normalization_stats(_img, shadow_angle_deg)
+                        all_dg.append(_stats[0])
+                        all_dark.append(_stats[1])
+                    except Exception as _e:
+                        print(f"      ⚠️  Skipping {img_path}: {_e}")
+
+                if all_dg:
+                    # Use 95th pct across sampled images for a robust global scale
+                    import numpy as _np
+                    g_dg   = float(_np.percentile(all_dg,   95))
+                    g_dark = float(_np.percentile(all_dark, 95))
+                    # Re-run on the first image to get a representative Otsu ctr
+                    with rasterio.open(
+                        _sample_imgs[0] if Path(_sample_imgs[0]).is_absolute()
+                        else str(Path(_img_dir) / _sample_imgs[0])
+                    ) as _src:
+                        _img0 = _src.read([1, 2, 3]).transpose(1, 2, 0)
+                    _, _, g_otsu = compute_shadow_normalization_stats(_img0, shadow_angle_deg)
+                    # Clamp dg/dark to at least the single-image minimums
+                    g_dg   = max(g_dg, 30.0)
+                    g_dark = max(g_dark, 10.0)
+                    shadow_norm_stats = (g_dg, g_dark, g_otsu)
+                    print(f"   ✅ shadow_norm_stats: dg={g_dg:.1f}  dark={g_dark:.1f}  otsu={g_otsu:.3f}")
+                else:
+                    print("   ⚠️  Could not load any training images for shadow stats — falling back to per-tile")
+            except Exception as _e:
+                print(f"   ⚠️  shadow_norm_stats computation failed ({_e}) — falling back to per-tile")
+
         model = ShadowConditionedDeepForest(
             shadow_angle_deg=shadow_angle_deg,
             train_csv=train_csv,
@@ -280,6 +335,7 @@ def train_deepforest(
             aux_loss_weight=aux_loss_weight,
             shadow_channel=shadow_channel,
             use_film=use_film,
+            shadow_norm_stats=shadow_norm_stats,
         )
     else:
         print("   Shadow conditioning: DISABLED (baseline)")

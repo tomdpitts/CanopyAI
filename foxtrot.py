@@ -409,6 +409,7 @@ def detect_trees_deepforest(
     tile_size=400,
     tile_overlap=0.05,
     confidence_threshold=0.35,
+    debug_tile_dir=None,
 ):
     """
     Pass 1: Run DeepForest detection on 400px tiles.
@@ -494,12 +495,12 @@ def detect_trees_deepforest(
         else:
             state_dict = checkpoint
 
-        # Detect shadow_channel flag from checkpoint hyper-parameters and
-        # widen first conv BEFORE loading weights so shapes match
-        hp = checkpoint.get("hyper_parameters", {})
-        use_shadow_channel = hp.get("shadow_channel", False)
+        # Detect shadow_channel by inspecting the saved conv1 weight shape directly.
+        # Do NOT rely on hyper_parameters — flat state-dict checkpoints have no such key.
+        saved_conv1 = state_dict.get("model.backbone.body.conv1.weight")
+        use_shadow_channel = (saved_conv1 is not None and saved_conv1.shape[1] == 4)
         if use_shadow_channel:
-            print("   🔑 Checkpoint uses shadow_channel=True — widening first conv to 4 channels")
+            print("   🔑 Checkpoint conv1 has 4 input channels — widening model first conv")
             try:
                 from deepforest_custom.train_deepforest import widen_first_conv_for_shadow_channel
             except ImportError:
@@ -530,6 +531,21 @@ def detect_trees_deepforest(
 
         df_model.to(device)
         df_model.eval()
+
+        # Bug 2 fix: derive shadow_angle (float degrees) from shadow_vector parameter
+        # so the tile loop can call generate_shadow_map(tile, shadow_angle).
+        shadow_angle = None
+        shadow_norm_stats = None   # (dg_scale, dark_scale, otsu_ctr) — computed once below
+        if shadow_vector is not None:
+            import math as _math
+            sv = shadow_vector
+            if hasattr(sv, "cpu"):
+                sv = sv.squeeze().cpu().numpy()
+            sv = np.array(sv, dtype=float).flatten()
+            shadow_angle = _math.degrees(_math.atan2(float(sv[0]), float(sv[1]))) % 360
+            print(f"   🌞 Shadow angle for tile shadow maps: {shadow_angle:.1f}°")
+        else:
+            print("   ⚠️  No shadow vector — will use zero shadow map for all tiles")
 
     else:
         print("   🌲 Using Standard DeepForest")
@@ -573,6 +589,7 @@ def detect_trees_deepforest(
     all_bboxes = []
     all_scores = []
     tile_count = 0
+    debug_tiles_saved = 0  # track how many non-nodata debug tiles saved
 
     # Process tiles
     y_starts = range(0, h, stride) if h > tile_size else [0]
@@ -597,18 +614,103 @@ def detect_trees_deepforest(
                 # Prepare input tensor
                 image_tensor = torch.tensor(tile).permute(2, 0, 1).float() / 255.0
 
-                # Prepend shadow map as 4th channel if model was trained with it
-                if use_shadow_channel and shadow_angle is not None:
+                # Prepend shadow map as 4th channel if model was trained with it.
+                # Bug 3 fix: always append the 4th channel when use_shadow_channel is True,
+                # using a zero map as a safe fallback if no shadow angle is available.
+                if use_shadow_channel:
                     try:
-                        from utils import generate_shadow_map
+                        from utils import generate_shadow_map, compute_shadow_normalization_stats
                     except ImportError:
-                        from deepforest_custom.utils import generate_shadow_map  # type: ignore
+                        from deepforest_custom.utils import generate_shadow_map, compute_shadow_normalization_stats  # type: ignore
+
+                    # Compute global normalization stats once on first tile
+                    if shadow_angle is not None and shadow_norm_stats is None:
+                        shadow_norm_stats = compute_shadow_normalization_stats(image, shadow_angle)
+                        dg_s, dark_s, otsu_s = shadow_norm_stats
+                        print(f"   📊 Shadow norm stats: dg_scale={dg_s:.1f}  dark_scale={dark_s:.1f}  otsu_ctr={otsu_s:.3f}")
+
                     tile_u8 = tile.astype(np.uint8) if tile.dtype != np.uint8 else tile
-                    shadow_np = generate_shadow_map(tile_u8, shadow_angle)
-                    shadow_t  = torch.from_numpy(shadow_np).unsqueeze(0).float()
+                    if shadow_angle is not None:
+                        dg_s, dark_s, otsu_s = shadow_norm_stats
+                        shadow_np = generate_shadow_map(tile_u8, shadow_angle,
+                                                        dg_scale=dg_s,
+                                                        dark_scale=dark_s,
+                                                        otsu_ctr=otsu_s)
+                    else:
+                        # No shadow vector predicted — zero map keeps tensor shape correct
+                        shadow_np = np.zeros(tile.shape[:2], dtype=np.float32)
+                    shadow_t = torch.from_numpy(shadow_np).unsqueeze(0).float()
                     image_tensor = torch.cat([image_tensor, shadow_t], dim=0)
 
                 image_tensor = image_tensor.to(device).unsqueeze(0)  # (1, C, H, W)
+
+                # ── Debug tile visualization (first 3 content tiles) ─────────
+                # Skip nodata tiles: GeoTIFF may fill nodata with 0 OR 255.
+                # Reject tiles that are near-uniform (std < 5) across all channels,
+                # which catches both all-black and all-white nodata regions.
+                _tile_std = tile.std()
+                _is_content_tile = _tile_std > 5.0
+                if (
+                    debug_tile_dir is not None
+                    and use_shadow_channel
+                    and debug_tiles_saved < 3
+                    and _is_content_tile
+                ):
+                    import matplotlib
+                    matplotlib.use("Agg")
+                    import matplotlib.pyplot as plt
+                    import matplotlib.patches as mpatches
+
+                    Path(debug_tile_dir).mkdir(parents=True, exist_ok=True)
+
+                    # Reconstruct numpy arrays for plotting
+                    # tile is float32 [0..255]; clamp + cast safely for imshow
+                    tile_rgb_plot = np.clip(tile, 0, 255).astype(np.uint8)
+                    shadow_map_plot = shadow_np  # float32 H×W in [0, 1]
+
+                    fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+                    fig.suptitle(
+                        f"Tile #{tile_count}  ({x_start},{y_start})  "
+                        f"shadow_angle={'%.1f°' % shadow_angle if shadow_angle is not None else 'zero (no vector)'}",
+                        fontsize=11,
+                    )
+
+                    # Left: RGB tile with shadow direction arrow
+                    axes[0].imshow(tile_rgb_plot)
+                    axes[0].set_title("RGB tile + shadow direction")
+                    axes[0].axis("off")
+                    if shadow_angle is not None:
+                        import math as _math
+                        h_t, w_t = tile_rgb_plot.shape[:2]
+                        cx, cy = w_t / 2, h_t / 2
+                        rad = _math.radians(shadow_angle)
+                        # shadow_angle: 0=North(up), 90=East(right), CW
+                        dx =  _math.sin(rad) * (w_t * 0.35)
+                        dy = -_math.cos(rad) * (h_t * 0.35)  # y-axis flipped in image
+                        axes[0].annotate(
+                            "",
+                            xy=(cx + dx, cy + dy),
+                            xytext=(cx - dx, cy - dy),
+                            arrowprops=dict(arrowstyle="->", color="yellow", lw=2.5),
+                        )
+                        axes[0].text(
+                            cx + dx + 5, cy + dy - 5,
+                            f"{shadow_angle:.0f}°",
+                            color="yellow", fontsize=9, fontweight="bold",
+                        )
+
+                    # Right: shadow map channel (4th channel)
+                    im = axes[1].imshow(shadow_map_plot, cmap="gray", vmin=0, vmax=1)
+                    axes[1].set_title("4th channel: shadow map")
+                    axes[1].axis("off")
+                    fig.colorbar(im, ax=axes[1], fraction=0.046, pad=0.04)
+
+                    debug_path = Path(debug_tile_dir) / f"tile_{tile_count:03d}_{x_start}_{y_start}.png"
+                    fig.savefig(str(debug_path), dpi=120, bbox_inches="tight")
+                    plt.close(fig)
+                    print(f"   📸 Saved debug tile viz → {debug_path}")
+                    debug_tiles_saved += 1
+                # ─────────────────────────────────────────────────────────────
 
                 # Inference
                 with torch.no_grad():
@@ -1379,6 +1481,7 @@ def main(args):
         shadow_vector=shadow_vector_tensor,
         tile_size=args.df_tile_size,
         confidence_threshold=args.deepforest_confidence,
+        debug_tile_dir=str(Path(args.output_dir) / "debug_tiles") if args.debug_tiles else None,
     )
     timings["DeepForest"] = time.time() - df_start
 
@@ -1685,6 +1788,14 @@ def parse_args():
         "--no_viz",
         action="store_true",
         help="Skip visualization output (useful for batch/evaluation runs).",
+    )
+
+    ap.add_argument(
+        "--debug_tiles",
+        action="store_true",
+        help="Save side-by-side RGB + shadow-map visualizations of the first 3 "
+        "processed tiles to <output_dir>/debug_tiles/. Only active when a "
+        "shadow-channel model is loaded.",
     )
 
     return ap.parse_args()
