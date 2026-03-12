@@ -148,16 +148,9 @@ _deepforest_evaluate.evaluate_boxes = _patched_evaluate_boxes
 
 # Import model classes from separate file
 try:
-    from .models import (
-        SolarAttentionBlock,
-        ShadowConditionedDeepForest,
-    )
+    from .models import ShadowConditionedDeepForest
 except ImportError:
-    # Fallback if run as script
-    from models import (
-        SolarAttentionBlock,
-        ShadowConditionedDeepForest,
-    )
+    from models import ShadowConditionedDeepForest
 
 
 def widen_first_conv_for_shadow_channel(model):
@@ -208,15 +201,12 @@ def train_deepforest(
     patience=5,
     pretrained=True,
     wandb_project=None,
-    shadow_conditioning=False,  # Enable FiLM conditioning
-    shadow_angle_deg=None,  # Base shadow azimuth (0=North CW); auto-derived from CSV if None
-    film_lr=1e-4,  # Learning rate for FiLM blocks (lower than backbone to prevent explosion)
-    checkpoint=None,  # Optional checkpoint path for DeepForest weights
-    accelerator=None,  # Force accelerator (cpu, gpu, mps)
-    freeze_backbone=False,  # If True, freeze backbone weights (train only FiLM/Aux)
-    aux_loss_weight=1.0,  # Weight of auxiliary shadow-prediction loss (0.0 = disabled)
-    shadow_channel=False,   # If True, add shadow map as 4th input channel (Phase 6)
-    use_film=False,         # Defaults to False. If True, use FiLM blocks.
+    shadow_angle_deg=None,
+    checkpoint=None,          # Optional path to initial weights
+    accelerator=None,
+    freeze_backbone=False,
+    shadow_channel=False,        # Run B/D: shadow as 4th input channel
+    shadow_cross_attention=False, # Run C/D: shadow cross-attention after layer4
 ):
     """
     Train a DeepForest model using DeepForest 2.0 config-based API.
@@ -234,9 +224,9 @@ def train_deepforest(
         patience: Early stopping patience
         pretrained: Whether to use pretrained weights
         wandb_project: Weights & Biases project name (unused in this version)
-        shadow_conditioning: If True, use FiLM conditioning with constant 215° shadow
         checkpoint: Optional path to DeepForest checkpoint file to load initial weights from
-        shadow_channel: If True, add directional shadow map as 4th input channel (Phase 6)
+        shadow_channel: If True, add directional shadow map as 4th input channel (Run B/D)
+        shadow_cross_attention: If True, graft cross-attention after layer4 (Run C/D)
     """
     # Create run-specific output directory
     run_output_dir = str(Path(output_dir) / run_name)
@@ -252,93 +242,30 @@ def train_deepforest(
     # Initialize model
     print("\n⚙️  Initializing model...")
 
-    if shadow_conditioning or shadow_channel:
+    # ── Model initialisation ──────────────────────────────────────────────
+    use_shadow = shadow_channel or shadow_cross_attention
+
+    if use_shadow:
         # Auto-derive base shadow angle from CSV if not explicitly provided
         if shadow_angle_deg is None:
             _df = pd.read_csv(train_csv)
             if "shadow_angle" in _df.columns:
                 shadow_angle_deg = float(_df["shadow_angle"].mode()[0])
-                print(
-                    f"   Shadow angle auto-derived from CSV: {shadow_angle_deg:.1f} deg (azimuth 0=North CW)"
-                )
+                print(f"   Shadow angle auto-derived from CSV: {shadow_angle_deg:.1f} deg")
             else:
                 shadow_angle_deg = 215.0
-                print(
-                    f"   Shadow angle defaulted to {shadow_angle_deg} deg (no shadow_angle column in CSV)"
-                )
-        else:
-            print(
-                f"   Shadow angle (explicit): {shadow_angle_deg} deg (azimuth 0=North CW)"
-            )
-        print(f"   Shadow conditioning (FiLM): {'ENABLED' if use_film else 'DISABLED'}")
-
-        # Compute global shadow normalization stats from a sample of training images.
-        # This is done BEFORE model init so every _prepend_shadow_channel call
-        # uses consistent scales rather than renormalizing per-tile.
-        shadow_norm_stats = None
-        if shadow_channel and shadow_angle_deg is not None:
-            try:
-                import rasterio, random
-                try:
-                    from utils import compute_shadow_normalization_stats
-                except ImportError:
-                    from deepforest_custom.utils import compute_shadow_normalization_stats
-
-                _df_for_stats = pd.read_csv(train_csv)
-                _unique_imgs  = _df_for_stats["image_path"].unique().tolist()
-                N_SAMPLE = min(5, len(_unique_imgs))
-                _sample_imgs = random.sample(_unique_imgs, N_SAMPLE)
-                print(f"   📊 Computing shadow normalization stats from {N_SAMPLE} training images...")
-
-                all_dg, all_dark = [], []
-                _img_dir = str(Path(train_csv).parent)
-
-                for img_path in _sample_imgs:
-                    full_path = img_path if Path(img_path).is_absolute() else str(Path(_img_dir) / img_path)
-                    try:
-                        with rasterio.open(full_path) as _src:
-                            _img = _src.read([1, 2, 3]).transpose(1, 2, 0)
-                        _stats = compute_shadow_normalization_stats(_img, shadow_angle_deg)
-                        all_dg.append(_stats[0])
-                        all_dark.append(_stats[1])
-                    except Exception as _e:
-                        print(f"      ⚠️  Skipping {img_path}: {_e}")
-
-                if all_dg:
-                    # Use 95th pct across sampled images for a robust global scale
-                    import numpy as _np
-                    g_dg   = float(_np.percentile(all_dg,   95))
-                    g_dark = float(_np.percentile(all_dark, 95))
-                    # Re-run on the first image to get a representative Otsu ctr
-                    with rasterio.open(
-                        _sample_imgs[0] if Path(_sample_imgs[0]).is_absolute()
-                        else str(Path(_img_dir) / _sample_imgs[0])
-                    ) as _src:
-                        _img0 = _src.read([1, 2, 3]).transpose(1, 2, 0)
-                    _, _, g_otsu = compute_shadow_normalization_stats(_img0, shadow_angle_deg)
-                    # Clamp dg/dark to at least the single-image minimums
-                    g_dg   = max(g_dg, 30.0)
-                    g_dark = max(g_dark, 10.0)
-                    shadow_norm_stats = (g_dg, g_dark, g_otsu)
-                    print(f"   ✅ shadow_norm_stats: dg={g_dg:.1f}  dark={g_dark:.1f}  otsu={g_otsu:.3f}")
-                else:
-                    print("   ⚠️  Could not load any training images for shadow stats — falling back to per-tile")
-            except Exception as _e:
-                print(f"   ⚠️  shadow_norm_stats computation failed ({_e}) — falling back to per-tile")
-
+                print(f"   Shadow angle defaulted to {shadow_angle_deg} deg (no shadow_angle column)")
+        print(f"   shadow_channel={shadow_channel}  shadow_cross_attention={shadow_cross_attention}")
         model = ShadowConditionedDeepForest(
             shadow_angle_deg=shadow_angle_deg,
             train_csv=train_csv,
             val_csv=val_csv,
-            film_lr=film_lr,
             freeze_backbone=freeze_backbone,
-            aux_loss_weight=aux_loss_weight,
             shadow_channel=shadow_channel,
-            use_film=use_film,
-            shadow_norm_stats=shadow_norm_stats,
+            shadow_cross_attention=shadow_cross_attention,
         )
     else:
-        print("   Shadow conditioning: DISABLED (baseline)")
+        print("   Shadow: DISABLED (baseline)")
         model = deepforest_main.deepforest()
 
     # Load weights
@@ -348,29 +275,19 @@ def train_deepforest(
         print(f"\n Loading checkpoint: {checkpoint}")
         try:
             state_dict = torch.load(checkpoint, map_location="cpu")
-            ck_keys = list(state_dict.keys())
-            has_film = any("film_blocks" in k for k in ck_keys)
+            ck_keys    = list(state_dict.keys())
             has_model_prefix = any(k.startswith("model.") for k in ck_keys)
 
-            if has_film or has_model_prefix:
-                # Full ShadowConditionedDeepForest state dict (e.g. oscar50_film_finetune)
-                # Keys: model.backbone.body.* and film_blocks.P3.*
-                # Load into the wrapper directly (with strict=False in case architecture changed)
+            if has_model_prefix and use_shadow:
+                # Full ShadowConditionedDeepForest state dict
                 missing, unexpected = model.load_state_dict(state_dict, strict=False)
-                print(f"   Loaded full FiLM checkpoint (backbone + FiLM weights)")
-                if missing:
-                    print(f"   Missing keys ({len(missing)}): {missing[:3]}...")
-                if unexpected:
-                    print(
-                        f"   Unexpected keys ({len(unexpected)}): {unexpected[:3]}..."
-                    )
+                print(f"   Loaded full wrapper checkpoint ({len(ck_keys)} keys)")
+                if missing:     print(f"   Missing ({len(missing)}): {missing[:3]}...")
+                if unexpected:  print(f"   Unexpected ({len(unexpected)}): {unexpected[:3]}...")
             else:
-                # Backbone-only state dict (e.g. oscar50.pth): bare keys like backbone.body.*
-                # Load into model.model (the inner DeepForest backbone); FiLM stays random
+                # Backbone-only state dict (e.g. oscar50.pth)
                 model.model.load_state_dict(state_dict, strict=False)
                 print(f"   Loaded backbone-only checkpoint ({len(ck_keys)} keys)")
-                if use_film:
-                    print("   FiLM layers initialized randomly (not in checkpoint)")
 
             print("   Checkpoint loaded successfully")
         except Exception as e:
@@ -440,18 +357,13 @@ def train_deepforest(
     model.config.train.lr = lr
     model.config.batch_size = batch_size
 
-    # Configure rotation augmentation for FiLM/shadow channel training
-    if shadow_conditioning or shadow_channel:
-        print("   🔄 Rotation augmentation: PRE-COMPUTED (in CSV)")
-        print(
-            "   ℹ️  Disabling default DeepForest augmentations to prevent shadow vector mismatch"
-        )
-        # Critical: DeepForest's default augmentations (horizontal flip) would flip the image
-        # but NOT the shadow vector, causing the model to learn incorrect associations.
-        # We perform rotation augmentation by pre-generating images in the CSV instead.
-        model.config.train.augmentations = []  # Remove default HorizontalFlip (breaks shadow vector alignment)
+    # Disable default augmentations when any shadow mode is active
+    # (to avoid shadow vector misalignment when images are flipped/rotated)
+    if use_shadow:
+        model.config.train.augmentations = []
+        print("   🔄 Default augmentations disabled (shadow modes active)")
     else:
-        print("   🔄 Rotation augmentation: DISABLED (baseline mode)")
+        print("   🔄 Default augmentations: active (baseline mode)")
 
     if val_csv:
         model.config.validation.csv_file = val_csv
@@ -505,86 +417,54 @@ def train_deepforest(
         )
         callbacks.append(early_stop_callback)
 
-    print(f"\n🚀 Starting training...")
+    print("\n🚀 Starting training...")
     print("-" * 60)
 
-    if shadow_conditioning or shadow_channel:
-        # ── FiLM / Shadow Channel path ─────────────────────────────────────────
-        # ShadowConditionedDeepForest is a raw LightningModule, so we must build
-        # the trainer manually.  Gradient clipping is kept here because FiLM
-        # hooks can cause gradient explosion.
-        from pytorch_lightning.loggers import CSVLogger
+    # All shadow modes (channel / cross-attention) use ShadowConditionedDeepForest
+    # which is a raw LightningModule — always train with the manual Trainer path.
+    from pytorch_lightning.loggers import CSVLogger
+    logger = CSVLogger(save_dir=output_dir, name=run_name)
 
-        logger = CSVLogger(save_dir=output_dir, name=run_name)
+    class MetrixPrinter(pl.Callback):
+        def on_train_epoch_end(self, trainer, pl_module):
+            metrics = trainer.callback_metrics
+            loss = metrics.get("box_loss") or metrics.get("train_loss")
+            if loss:
+                print(f"   📉 Epoch {trainer.current_epoch} Loss: {loss:.4f}")
 
-        class MetrixPrinter(pl.Callback):
-            def on_train_epoch_end(self, trainer, pl_module):
-                metrics = trainer.callback_metrics
-                loss = metrics.get("box_loss") or metrics.get("train_loss")
-                if loss:
-                    print(f"   📉 Epoch {trainer.current_epoch} Loss: {loss:.4f}")
+        def on_validation_epoch_end(self, trainer, pl_module):
+            metrics = trainer.callback_metrics
+            mAP = metrics.get("map")
+            if mAP:
+                print(f"   📈 Epoch {trainer.current_epoch} mAP: {mAP:.4f}")
 
-            def on_validation_epoch_end(self, trainer, pl_module):
-                metrics = trainer.callback_metrics
-                mAP = metrics.get("map")
-                if mAP:
-                    print(f"   📈 Epoch {trainer.current_epoch} mAP: {mAP:.4f}")
+    callbacks.append(MetrixPrinter())
 
-        callbacks.append(MetrixPrinter())
+    trainer_kwargs = {
+        "max_epochs": epochs,
+        "enable_checkpointing": True,
+        "callbacks": callbacks,
+        "logger": logger,
+        "check_val_every_n_epoch": 1,
+        "num_sanity_val_steps": 0,
+        "gradient_clip_val": 1.0,
+    }
 
-        trainer_kwargs = {
-            "max_epochs": epochs,
-            "enable_checkpointing": True,
-            "callbacks": callbacks,
-            "logger": logger,
-            "check_val_every_n_epoch": 1,
-            "num_sanity_val_steps": 0,
-            "gradient_clip_val": 1.0,  # FiLM-only: prevents hook-driven explosion
-        }
-
-        if accelerator:
-            print(f"   🖥️  Forcing accelerator: {accelerator}")
-            trainer_kwargs["accelerator"] = accelerator
-            if accelerator == "cpu":
-                trainer_kwargs["devices"] = 1
-        elif torch.backends.mps.is_available():
-            trainer_kwargs["accelerator"] = "mps"
+    if accelerator:
+        trainer_kwargs["accelerator"] = accelerator
+        if accelerator == "cpu":
             trainer_kwargs["devices"] = 1
-        elif torch.cuda.is_available():
-            trainer_kwargs["accelerator"] = "gpu"
-            trainer_kwargs["devices"] = 1
-        else:
-            trainer_kwargs["accelerator"] = "cpu"
-
-        model.trainer = pl.Trainer(**trainer_kwargs)
-        model.trainer.fit(model, ckpt_path=checkpoint_path)
-
+    elif torch.backends.mps.is_available():
+        trainer_kwargs["accelerator"] = "mps"
+        trainer_kwargs["devices"]     = 1
+    elif torch.cuda.is_available():
+        trainer_kwargs["accelerator"] = "gpu"
+        trainer_kwargs["devices"]     = 1
     else:
-        # ── Baseline path ─────────────────────────────────────────────────────
-        # Use DeepForest's own create_trainer() so that all internal hooks,
-        # metric keys, and data-loader wiring are set up correctly.
-        # This matches oscar_archive exactly.
-        trainer_kwargs = {
-            "callbacks": callbacks,
-            "max_epochs": epochs,
-            "enable_checkpointing": True,
-            # No gradient_clip_val: standard fine-tuning doesn't need it
-        }
+        trainer_kwargs["accelerator"] = "cpu"
 
-        if accelerator:
-            print(f"   🖥️  Forcing accelerator: {accelerator}")
-            trainer_kwargs["accelerator"] = accelerator
-            if accelerator == "cpu":
-                trainer_kwargs["devices"] = 1
-        elif torch.backends.mps.is_available():
-            trainer_kwargs["accelerator"] = "mps"
-            trainer_kwargs["devices"] = 1
-        elif torch.cuda.is_available():
-            trainer_kwargs["accelerator"] = "gpu"
-            trainer_kwargs["devices"] = 1
-
-        model.create_trainer(**trainer_kwargs)
-        model.trainer.fit(model, ckpt_path=checkpoint_path)
+    trainer = pl.Trainer(**trainer_kwargs)
+    trainer.fit(model, ckpt_path=checkpoint_path)
 
     print("\n✅ Training complete!")
 
@@ -592,11 +472,9 @@ def train_deepforest(
     final_model_path = Path(run_output_dir) / "deepforest_final.pth"
     print(f"💾 Saved final model to {final_model_path}")
 
-    if shadow_conditioning or shadow_channel:
-        # Save the full wrapper model (including FiLM weights / shadow conv)
+    if use_shadow:
         torch.save(model.state_dict(), str(final_model_path))
     else:
-        # Save only the inner DeepForest model (backward compatibility)
         torch.save(model.model.state_dict(), str(final_model_path))
 
     return model, None
@@ -621,45 +499,20 @@ def main():
         help="Force accelerator (cpu, gpu, mps, auto)",
     )
     parser.add_argument(
-        "--shadow_conditioning",
+        "--shadow-channel",
         action="store_true",
-        help="Enable FiLM shadow conditioning",
+        help="Run B/D: add shadow map as 4th input channel",
     )
     parser.add_argument(
-        "--shadow_angle_deg",
+        "--shadow-cross-attention",
+        action="store_true",
+        help="Run C/D: shadow cross-attention module after layer4",
+    )
+    parser.add_argument(
+        "--shadow-angle-deg",
         type=float,
         default=None,
-        help="Base shadow azimuth in degrees (0=North CW). Auto-derived from CSV shadow_angle column if not set.",
-    )
-    parser.add_argument(
-        "--film_lr",
-        type=float,
-        default=1e-4,
-        help="Learning rate for FiLM blocks (default: 1e-4, lower than backbone lr to prevent explosion)",
-    )
-    parser.add_argument(
-        "--checkpoint", type=str, default=None, help="Path to checkpoint to resume from"
-    )
-    parser.add_argument(
-        "--freeze-backbone",
-        action="store_true",
-        help="Freeze backbone weights and only train FiLM/Aux head",
-    )
-    parser.add_argument(
-        "--aux-loss-weight",
-        type=float,
-        default=1.0,
-        help="Weight of auxiliary shadow-prediction loss (default: 1.0, set 0.0 to disable)",
-    )
-    parser.add_argument(
-        "--shadow_channel",
-        action="store_true",
-        help="Add directional shadow map as 4th input channel (Phase 6)",
-    )
-    parser.add_argument(
-        "--use-film",
-        action="store_true",
-        help="Enable FiLM conditioning blocks (default is OFF for clean shadow_channel ablation)",
+        help="Base shadow azimuth in degrees. Auto-derived from CSV if not set.",
     )
 
     args = parser.parse_args()
@@ -674,15 +527,12 @@ def main():
         lr=args.lr,
         patience=args.patience,
         pretrained=not args.no_pretrained,
-        shadow_conditioning=args.shadow_conditioning,
         shadow_angle_deg=args.shadow_angle_deg,
-        film_lr=args.film_lr,
         checkpoint=args.checkpoint,
         accelerator=args.accelerator,
         freeze_backbone=args.freeze_backbone,
-        aux_loss_weight=args.aux_loss_weight,
         shadow_channel=args.shadow_channel,
-        use_film=args.use_film,
+        shadow_cross_attention=args.shadow_cross_attention,
     )
 
 

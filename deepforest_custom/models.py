@@ -14,82 +14,112 @@ except ImportError:
     from utils import generate_shadow_map     # script import
 
 
-class SolarAttentionBlock(nn.Module):
-    """
-    Solar-Gated Spatial Attention for FiLM conditioning.
+# ---------------------------------------------------------------------------
+# Shadow Encoder
+# ---------------------------------------------------------------------------
 
-    Injects global shadow vector into FPN feature maps.
-    Learns to upweight features consistent with shadow direction.
+class ShadowEncoder(nn.Module):
     """
+    Lightweight CNN that maps a 1-channel shadow probability map to
+    feature tokens at the same spatial scale as ResNet layer4
+    (i.e. H/32 x W/32 for a standard crop).
 
-    def __init__(self, channels):
+    Output is zero-initialized so the module starts fully silent.
+    """
+    def __init__(self, out_channels=256):
         super().__init__()
-        self.channels = channels
-
-        # Project shadow vector to channel-wise modulation (FiLM)
-        self.sun_mlp = nn.Sequential(
-            nn.Linear(2, channels // 4), nn.ReLU(), nn.Linear(channels // 4, channels)
+        # 5x stride-2 convolutions bring H -> H/32
+        self.net = nn.Sequential(
+            nn.Conv2d(1, 32, 3, stride=2, padding=1),  nn.ReLU(),
+            nn.Conv2d(32, 64, 3, stride=2, padding=1), nn.ReLU(),
+            nn.Conv2d(64, 128, 3, stride=2, padding=1), nn.ReLU(),
+            nn.Conv2d(128, out_channels, 3, stride=2, padding=1), nn.ReLU(),
+            nn.Conv2d(out_channels, out_channels, 3, stride=2, padding=1),
         )
+        # Zero-init output conv so encoder is silent at epoch 0
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
 
-        # Spatial gating convolution
-        self.gate_conv = nn.Conv2d(channels, 1, kernel_size=3, padding=1, bias=False)
-        self.sigmoid = nn.Sigmoid()
+    def forward(self, x):
+        # x: (B, 1, H, W) shadow map in [0,1]
+        return self.net(x)   # -> (B, out_channels, H/32, W/32)
 
-        # Learnable residual scale initialized to 0.
-        # CRITICAL: Even with zero-init on sun_mlp[2] output layer, the first
-        # optimizer step updates sun_mlp[2] weights by ±lr. Combined with random
-        # upstream hidden states (h~±5.6 norm), gamma immediately grows to ~0.21
-        # — a 21% feature perturbation across all 5 FPN levels simultaneously.
-        # The residual scale ensures: out = x + scale*(film_out - x).
-        # When scale=0, the output is EXACTLY x regardless of gamma/gate.
-        # Scale grows gradually via its own gradient, allowing FiLM to "fade in".
-        # Learnable residual scale initialized to 0.1 (was 0).
-        # CRITICAL: We initialize to 0.1 to ensure the shadow pathway has
-        # non-zero gradients immediately, forcing the model to use it.
-        # If 0, it might get stuck in a "ignore shadows" local minimum.
-        self.output_scale = nn.Parameter(torch.tensor([0.1]))
 
-    def forward(self, x, sun_vector, return_attn=False):
+# ---------------------------------------------------------------------------
+# Shadow Cross-Attention
+# ---------------------------------------------------------------------------
+
+class ShadowCrossAttention(nn.Module):
+    """
+    Cross-attention module inserted after ResNet layer4.
+
+    RGB layer4 features are used as Queries.
+    Shadow encoder tokens are Keys and Values.
+
+    The learned gate scalar is initialized to 0 so the module is provably
+    identity at epoch 0 — oscar50 weights are completely unaffected initially.
+    """
+    def __init__(self, rgb_channels=2048, shadow_channels=256, num_heads=8):
+        super().__init__()
+        self.q_proj   = nn.Linear(rgb_channels, shadow_channels)
+        self.attn     = nn.MultiheadAttention(shadow_channels, num_heads, batch_first=True)
+        self.out_proj  = nn.Linear(shadow_channels, rgb_channels)
+        self.norm      = nn.LayerNorm(rgb_channels)
+        # Gate init: tiny nonzero value so gradients flow from step 1.
+        # out_proj stays zero-init so at epoch 0 the output is ~0 * attn + rgb = rgb (identity).
+        # The small gate gives a real gradient signal to start learning from.
+        self.gate = nn.Parameter(torch.ones(1) * 0.01)
+        nn.init.zeros_(self.out_proj.weight)
+        nn.init.zeros_(self.out_proj.bias)
+
+    def forward(self, rgb_feat, shadow_feat):
         """
-        Args:
-            x: Feature map (B, C, H, W)
-            sun_vector: Shadow direction (B, 2) - unit vector
-            return_attn: If True, return attention map for visualization
-
-        Returns:
-            modulated_features: (B, C, H, W)
+        rgb_feat:    (B, 2048, H, W) from ResNet layer4
+        shadow_feat: (B, 256,  H, W) from ShadowEncoder
+        Returns:     (B, 2048, H, W) — same shape, zero-perturbation at init
         """
-        B, C, H, W = x.shape
+        B, C, H, W = rgb_feat.shape
 
-        # 1. FiLM: Channel-wise modulation from shadow vector
-        gamma = self.sun_mlp(sun_vector)  # (B, C)
-        gamma = gamma.unsqueeze(-1).unsqueeze(-1)  # (B, C, 1, 1)
+        # Flatten spatial dims to token sequences
+        q  = rgb_feat.flatten(2).permute(0, 2, 1)     # (B, H*W, 2048)
+        kv = shadow_feat.flatten(2).permute(0, 2, 1)  # (B, H*W, 256)
 
-        # Apply FiLM modulation (affine transformation)
-        x_modulated = x * (1 + gamma)  # Scale features based on shadow
+        # Project Q down to shadow_channels
+        q = self.q_proj(q)                             # (B, H*W, 256)
 
-        # 2. Spatial Gating: Learn where to apply shadow-conditioned features
-        gate = self.sigmoid(self.gate_conv(x_modulated))  # (B, 1, H, W)
+        # Cross-attention: RGB queries attend to Shadow keys/values
+        attn_out, _ = self.attn(q, kv, kv)            # (B, H*W, 256)
 
-        # 3. Blend: Weighted combination of original and modulated features
-        film_out = x * (1 - gate) + x_modulated * gate
+        # Project back up to RGB channel width
+        attn_out = self.out_proj(attn_out)             # (B, H*W, 2048)
+        attn_out = attn_out.permute(0, 2, 1).view(B, C, H, W)
 
-        # 4. Residual gate: blend FiLM output with identity using learnable scale.
-        # scale=0 → output=x exactly; scale grows as FiLM learns to be useful.
-        out = x + self.output_scale * (film_out - x)
-
-        if return_attn:
-            return out, gate
+        # Residual with zero-init gate — starts as identity, grows via gradient
+        out = rgb_feat + self.gate * attn_out
+        # LayerNorm applied over channel dim
+        out = self.norm(out.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
         return out
 
 
+# ---------------------------------------------------------------------------
+# Main model class
+# ---------------------------------------------------------------------------
+
 class ShadowConditionedDeepForest(deepforest_main.deepforest):
     """
-    DeepForest with FiLM conditioning on shadow vectors.
+    DeepForest fine-tuned with optional shadow awareness.
 
-    Uses a base shadow direction (215° for WON003) that gets rotated during
-    augmentation. Rotation provides natural shadow diversity: rotating the image
-    by θ degrees also rotates the shadow by θ degrees.
+    Two orthogonal shadow mechanisms, independently togglable:
+
+    1. shadow_channel=True  — shadow probability map is prepended as a 4th
+       input channel to conv1 (widen_first_conv_for_shadow_channel must be
+       called after weight loading in train_deepforest.py).
+
+    2. shadow_cross_attention=True — a ShadowCrossAttention module is grafted
+       after ResNet layer4 via a forward hook. The shadow map becomes K/V
+       tokens that RGB features (Q) can attend to.
+
+    Both mechanisms can be combined (Run D in the ablation study).
     """
 
     def __init__(
@@ -97,526 +127,281 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
         shadow_angle_deg=215.0,
         train_csv=None,
         val_csv=None,
-        film_lr=1e-4,
         freeze_backbone=False,
-        aux_loss_weight=1.0,
-        shadow_channel=False,   # If True, widen first conv to 4 channels
-        use_film=False,         # Defaults to False. If True, use SolarAttentionBlock (FiLM) conditioning
-        shadow_norm_stats=None, # Optional (dg_scale, dark_scale, otsu_ctr) from compute_shadow_normalization_stats
+        shadow_channel=False,
+        shadow_cross_attention=False,
         config=None,
         **kwargs,
     ):
         self.shadow_channel = shadow_channel
-        self.use_film = use_film
+        self.shadow_cross_attention = shadow_cross_attention
+
         # Initialize DeepForest (LightningModule)
-        # Explicit call to avoid MRO/super() issues with keyword args
         deepforest_main.deepforest.__init__(self, config=config, **kwargs)
 
         self.freeze_backbone = freeze_backbone
         if freeze_backbone:
-            print("   ❄️  Freezing backbone parameters (training FiLM only)")
+            print("   ❄️  Freezing backbone parameters")
             for param in self.model.parameters():
                 param.requires_grad = False
-                # Also set eval mode for batchnorm? Usually keeping them in train mode is better 
-                # if existing stats are not representative, but for "freezing" typically we want eval mode 
-                # or at least no grad. DeepForest handles train/eval mode. 
-                # Lightning will call .train() which sets training=True.
-                # If we want strict freezing, we might want to force eval mode on backbone, 
-                # but let's stick to requires_grad=False for now.
 
-        # Add FiLM blocks for each FPN level (P3-P7)
-        # DeepForest uses RetinaNet with 256 channels at each FPN level
-        self.film_blocks = nn.ModuleDict(
-            {
-                f"P{level}": SolarAttentionBlock(channels=256)
-                for level in [3, 4, 5, 6, 7]
-            }
-        )
-
-        # Store FiLM-specific learning rate for differential lr
-        self.film_lr = film_lr
-
-        # Store base shadow angle (fallback when no CSV lookup available)
+        # Store base shadow angle for fallback
         self.shadow_angle_deg = shadow_angle_deg
         shadow_angle_rad = np.radians(shadow_angle_deg)
         self.base_shadow_vector = torch.tensor(
             [np.sin(shadow_angle_rad), np.cos(shadow_angle_rad)], dtype=torch.float32
         )
 
-        # Build per-image shadow lookup from training CSV if provided.
-        # Maps image_path -> np.array([shadow_x, shadow_y]) using azimuth convention.
+        # Per-image shadow lookup: image_path -> np.array([shadow_x, shadow_y])
         self.shadow_lookup = {}
-        if train_csv is not None:
+        for csv_path, label in [(train_csv, "train"), (val_csv, "val")]:
+            if csv_path is None:
+                continue
             try:
                 import pandas as pd
-
-                df = pd.read_csv(train_csv)
+                df = pd.read_csv(csv_path)
                 if "shadow_x" in df.columns and "shadow_y" in df.columns:
+                    before = len(self.shadow_lookup)
                     for _, row in df.drop_duplicates("image_path").iterrows():
                         self.shadow_lookup[row["image_path"]] = np.array(
                             [row["shadow_x"], row["shadow_y"]], dtype=np.float32
                         )
-                    print(
-                        f"   Loaded shadow vectors for {len(self.shadow_lookup)} images from CSV"
-                    )
+                    print(f"   Loaded {len(self.shadow_lookup)-before} shadow vectors from {label} CSV")
                 else:
-                    print(
-                        "   No shadow_x/shadow_y in CSV — using base vector with rotation fallback"
-                    )
+                    print(f"   No shadow_x/shadow_y in {label} CSV — will use angle fallback")
             except Exception as e:
-                print(f"   Warning: could not load shadow lookup from train_csv: {e}")
+                print(f"   Warning: could not load {label} shadow lookup: {e}")
 
-        # Also load from val_csv if provided
-        if val_csv is not None:
-             try:
-                import pandas as pd
-                df_val = pd.read_csv(val_csv)
-                if "shadow_x" in df_val.columns and "shadow_y" in df_val.columns:
-                    count_before = len(self.shadow_lookup)
-                    for _, row in df_val.drop_duplicates("image_path").iterrows():
-                         # Only add if not present (or overwrite? overwrite is fine)
-                         self.shadow_lookup[row["image_path"]] = np.array(
-                            [row["shadow_x"], row["shadow_y"]], dtype=np.float32
-                         )
-                    print(f"   Loaded {len(self.shadow_lookup) - count_before} new shadow vectors from val CSV")
-             except Exception as e:
-                 print(f"   Warning: could not load shadow lookup from val_csv: {e}")
-
-        if self.use_film:
-            if self.shadow_lookup:
-                print(
-                    f"   Per-image FiLM vectors: ENABLED ({len(self.shadow_lookup)} images)"
-                )
-            else:
-                print(
-                    f"   Per-image FiLM vectors: DISABLED (base {shadow_angle_deg} deg + rotation)"
-                )
+        # Shadow Cross-Attention modules
+        if self.shadow_cross_attention:
+            self.shadow_encoder = ShadowEncoder(out_channels=256)
+            self.shadow_cross_attn = ShadowCrossAttention(
+                rgb_channels=2048, shadow_channels=256, num_heads=8
+            )
+            print("   ✅ Shadow Cross-Attention: ENABLED (gate=0, identity at init)")
         else:
-            print("   FiLM / SolarAttentionBlocks: DISABLED completely (shadow_channel mode usually)")
+            print("   Shadow Cross-Attention: DISABLED")
 
-        # Track whether FiLM hooks are injected
-        # If use_film is False, pretend they are already injected so we skip them
-        self._film_injected = not self.use_film
-        self.current_shadow_vector = None
+        # Flag to track hook registration
+        self._sca_hook_injected = False
+        self._current_shadow_enc = None  # set per forward pass
 
-        # Auxiliary head: Predict shadow vector from FPN P5 features
-        # This "mathematically induces" the features to contain shadow info.
-        # P5 is high-level (semantic), good for global shadow direction.
-        # AdaptiveAvgPool ensures fixed size regardless of input image size.
-        self.aux_head = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Flatten(),
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Linear(128, 2),  # Predict (sin, cos)
-        )
-        # Initialize aux head logic for loss weighting
-        self.aux_loss_weight = aux_loss_weight
-
-        # Shadow channel: 4th input channel (shadow probability map)
-        # We store the flag but actually widen the conv AFTER pretrained weights are
-        # loaded externally (see train_deepforest.py: widen_first_conv_for_shadow_channel).
-        # This flag is serialised in the checkpoint so inference can detect it.
+        # Shadow channel flag is serialised in checkpoint for inference detection
         self.shadow_channel = shadow_channel
 
-        # Global normalization stats for the shadow map, computed from the full
-        # training image (or None to fall back to per-tile normalization).
-        # Shape: (dg_scale: float, dark_scale: float, otsu_ctr: float)
-        self.shadow_norm_stats = shadow_norm_stats
-        if shadow_norm_stats is not None:
-            print(
-                f"   📊 Shadow norm stats (global): dg_scale={shadow_norm_stats[0]:.1f}  "
-                f"dark_scale={shadow_norm_stats[1]:.1f}  otsu_ctr={shadow_norm_stats[2]:.3f}"
-            )
+    # ------------------------------------------------------------------
+    # Shadow map computation helpers
+    # ------------------------------------------------------------------
+
+    def _compute_shadow_map(self, img_t, shadow_vector):
+        """
+        Compute a single shadow probability map for one [3,H,W] float image tensor.
+
+        - Uses the shadow_x/shadow_y vector to derive the angle.
+        - Applies 10th-percentile luma max for brightness gating.
+        Returns a [1, H, W] float32 tensor in [0, 1].
+        """
+        img_np = (img_t.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+        angle  = float(np.degrees(np.arctan2(shadow_vector[0], shadow_vector[1])))
+
+        shadow_np = generate_shadow_map(img_np, angle)
+        return torch.from_numpy(shadow_np).unsqueeze(0)   # [1, H, W]
 
     def _prepend_shadow_channel(self, images, image_paths):
         """
-        For each image in the batch, compute a shadow probability map and
-        concatenate it as a 4th channel.  Images are expected as a list of
-        [3, H, W] float tensors in [0,1] range (DeepForest default).
-        Returns a list of [4, H, W] float tensors.
-        Uses self.shadow_norm_stats (dg_scale, dark_scale, otsu_ctr) if available,
-        otherwise falls back to per-tile normalisation.
+        Prepend a shadow probability map as a 4th channel.
+        Images: list of [3, H, W] float tensors in [0,1].
+        Returns: list of [4, H, W] float tensors.
         """
         result = []
-        # Unpack global normalization stats if available
-        norm_kwargs = {}
-        if self.shadow_norm_stats is not None:
-            dg_s, dark_s, otsu_s = self.shadow_norm_stats
-            norm_kwargs = dict(dg_scale=dg_s, dark_scale=dark_s, otsu_ctr=otsu_s)
-
         for img_t, path in zip(images, image_paths):
             sv = self.shadow_lookup.get(path)
             if sv is None:
-                # Fallback: zero channel (no shadow info)
                 shadow_t = torch.zeros(1, img_t.shape[1], img_t.shape[2],
                                        dtype=img_t.dtype, device=img_t.device)
             else:
-                # img_t is [3, H, W] float [0,1] — convert to uint8 RGB for generate_shadow_map
-                img_np  = (img_t.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-                angle   = float(np.degrees(np.arctan2(sv[0], sv[1])))  # sx,sy → degrees
-                shadow_np = generate_shadow_map(img_np, angle, **norm_kwargs)  # H×W float32
-                shadow_t  = torch.from_numpy(shadow_np).unsqueeze(0)    # [1,H,W]
-                shadow_t  = shadow_t.to(img_t.device, dtype=img_t.dtype)
-            result.append(torch.cat([img_t, shadow_t], dim=0))          # [4,H,W]
+                shadow_t = self._compute_shadow_map(img_t, sv)
+                shadow_t = shadow_t.to(img_t.device, dtype=img_t.dtype)
+            result.append(torch.cat([img_t, shadow_t], dim=0))  # [4, H, W]
         return result
 
-    def training_step(self, batch, batch_idx):
+    def _compute_shadow_enc_batch(self, images, image_paths):
         """
-        Training step with per-image FiLM shadow conditioning.
-
-        Reads shadow_x/shadow_y from the CSV lookup built at init (keyed by image path).
-        The CSV is expected to have pre-augmented images with matching shadow vectors
-        (as generated by augment_with_shadows.py). No random rotation is applied here.
-
-        Raises RuntimeError if shadow lookup is missing or any image path is not found.
+        Compute ShadowEncoder features for a batch for use in cross-attention.
+        Returns tensor (B, 256, H/32, W/32) on the same device as images.
         """
-        images = batch[0]
-        targets = batch[1]
-        # batch[2] = list of image paths (from DeepForest dataloader collate_fn)
-        image_paths = batch[2] if len(batch) > 2 else None
+        device = images[0].device
+        # Target spatial size: use first image's H/W so all maps are uniform.
+        # Batches can contain variable-size crops; stack requires equal shapes.
+        target_h, target_w = images[0].shape[1], images[0].shape[2]
+        shadow_maps = []
+        for img_t, path in zip(images, image_paths):
+            sv = self.shadow_lookup.get(path)
+            if sv is None:
+                sv = np.array([np.sin(np.radians(self.shadow_angle_deg)),
+                                np.cos(np.radians(self.shadow_angle_deg))], dtype=np.float32)
+            shadow_t = self._compute_shadow_map(img_t, sv)  # [1, H_i, W_i]
+            if shadow_t.shape[1] != target_h or shadow_t.shape[2] != target_w:
+                shadow_t = F.interpolate(
+                    shadow_t.unsqueeze(0), size=(target_h, target_w),
+                    mode="bilinear", align_corners=False
+                ).squeeze(0)
+            shadow_maps.append(shadow_t)
+        shadow_batch = torch.stack(shadow_maps).to(device)   # (B, 1, H, W)
+        return self.shadow_encoder(shadow_batch)              # (B, 256, H/32, W/32)
 
-        if not self.shadow_lookup:
-            raise RuntimeError(
-                "ShadowConditionedDeepForest: shadow_lookup is empty. "
-                "Pass train_csv= at init so shadow_x/shadow_y can be read from the CSV. "
-                "The CSV must have 'shadow_x' and 'shadow_y' columns."
-            )
+    # ------------------------------------------------------------------
+    # Hook injection for Shadow Cross-Attention
+    # ------------------------------------------------------------------
 
-        if image_paths is None:
-            raise RuntimeError(
-                "ShadowConditionedDeepForest: batch[2] (image paths) is missing. "
-                "Expected DeepForest dataloader to provide image paths as batch[2]."
-            )
-
-        # Look up per-image shadow vectors — fail loudly on missing paths
-        missing = [p for p in image_paths if p not in self.shadow_lookup]
-        if missing:
-            raise RuntimeError(
-                f"ShadowConditionedDeepForest: {len(missing)} image path(s) not found in shadow_lookup.\n"
-                f"Missing: {missing[:5]}{'...' if len(missing) > 5 else ''}\n"
-                "Check that image paths in the batch match those in the training CSV exactly."
-            )
-
-        shadow_vectors_np = np.array(
-            [self.shadow_lookup[p] for p in image_paths], dtype=np.float32
-        )
-        shadow_vectors = torch.from_numpy(shadow_vectors_np).to(images[0].device)
-        self.current_shadow_vector = shadow_vectors
-
-        # Prepend shadow map as 4th channel if enabled
-        if self.shadow_channel:
-            batch = (self._prepend_shadow_channel(images, image_paths),
-                     targets,
-                     *batch[2:])
-
-        # 1. Main DeepForest loss (box regression + classification)
-        loss_result = super().training_step(batch, batch_idx)
-        
-        # 2. Auxiliary Shadow Loss
-        aux_loss = 0.0
-        
-        # Retrieve captured features from the hook
-        if self.use_film and hasattr(self, "_last_p5_features") and self._last_p5_features is not None:
-            # Predict shadow vector from features
-            pred_shadow = self.aux_head(self._last_p5_features)  # (B, 2)
-            
-            # Ground truth
-            gt_shadow = self.current_shadow_vector  # (B, 2)
-            
-            # Computed MSE loss
-            aux_loss = F.mse_loss(pred_shadow, gt_shadow)
-            
-            # Log it
-            self.log("aux_loss", aux_loss, on_step=True, on_epoch=True, prog_bar=True)
-            
-            # Clear for next step
-            self._last_p5_features = None
-            
-        # Combine losses
-        # Check if loss_result is a dict (DeepForest < 2.0?) or Tensor (DeepForest >= 2.0 via Lightning?)
-        if isinstance(loss_result, dict):
-            loss_result["loss"] += self.aux_loss_weight * aux_loss
-            return loss_result
-        else:
-            # It's a scalar tensor
-            total_loss = loss_result + self.aux_loss_weight * aux_loss
-            return total_loss
-
-    def configure_optimizers(self):
-        """
-        Configure optimizers with differential learning rates.
-
-        Uses oscar50's proven SGD+momentum=0.9 for the backbone. This is now
-        safe because the output_scale residual gate in SolarAttentionBlock
-        ensures FiLM is exactly identity at init — backbone trains as if FiLM
-        doesn't exist. FiLM blocks use a lower lr so output_scale grows slowly.
-        """
-        backbone_lr = self.config.train.lr if self.config else 0.001
-        film_lr = self.film_lr
-
-        if not self.use_film:
-            # Standard DeepForest optimiser if FiLM explicitly disabled
-            params = [{"params": self.model.parameters(), "lr": backbone_lr}]
-            print(f"   Optimizer: SGD(momentum=0.9)  backbone_lr={backbone_lr} (FiLM/Aux disabled)")
-        elif self.freeze_backbone:
-            params = [
-                {"params": self.film_blocks.parameters(), "lr": film_lr},
-                 # Aux head is part of the new logic, should be trained too
-                {"params": self.aux_head.parameters(), "lr": film_lr},
-            ]
-            print(f"   Optimizer: SGD(momentum=0.9)  film_lr={film_lr} (Backbone FROZEN)")
-        else:
-            params = [
-                {"params": self.model.parameters(), "lr": backbone_lr},
-                {"params": self.film_blocks.parameters(), "lr": film_lr},
-                {"params": self.aux_head.parameters(), "lr": film_lr},
-            ]
-            print(f"   Optimizer: SGD(momentum=0.9)  backbone_lr={backbone_lr}  film_lr={film_lr}")
-
-        optimizer = torch.optim.SGD(
-            params, lr=backbone_lr, momentum=0.9, weight_decay=1e-4
-        )
-
-        # Add scheduler: Reduce LR when mAP plateaus
-        # Patience=5 matches early stopping (but early stopping is 15 in run args, so maybe 5 is good for scheduler)
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="max", factor=0.1, patience=5, verbose=True
-        )
-
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": {
-                "scheduler": scheduler,
-                "monitor": "map",
-                "interval": "epoch",
-                "frequency": 1,
-            },
-        }
-
-    def set_shadow_vector(self, shadow_vector):
-        """Set the current shadow vector (called by dataloader during augmentation)."""
-        self.current_shadow_vector = shadow_vector
-
-    def _inject_film_hooks(self):
-        """
-        Inject forward hooks into DeepForest's backbone to apply FiLM conditioning.
-        We hook the backbone output dict directly.
-        """
-        if self._film_injected:
+    def _inject_sca_hook(self):
+        """Register a forward hook on ResNet layer4 to apply cross-attention."""
+        if self._sca_hook_injected:
             return
 
-        def backbone_hook(module, input, output):
-            """
-            Input: Tensor/List of images
-            Output: OrderedDict({'0': P3, '1': P4, '2': P5, 'p6': P6, 'p7': P7})
-            """
-            if self.current_shadow_vector is None:
-                return output
-                
-            # Mapping from backbone keys to FiLM block names
-            # RetinaNet BackboneWithFPN: '0'->P3, '1'->P4, '2'->P5, 'p6'->P6, 'p7'->P7 or similar
-            # DeepForest/Torchvision convention:
-            # ResNet FPN usually: 0,1,2,pool -> P3,P4,P5,P6,P7
-            # We verified keys are: '0', '1', '2', 'p6', 'p7'
-            key_map = {
-                '0': 'P3',
-                '1': 'P4',
-                '2': 'P5',
-                'p6': 'P6',
-                'p7': 'P7'
-            }
-            
-            # Modify features in-place (or return new dict)
-            # We must return the modified dict for the head to use.
-            
-            # Note: `output` is usually an OrderedDict.
-            # We shouldn't modify it in-place if it affects other things, but here it's fine.
-            
-            for key, film_name in key_map.items():
-                if key in output:
-                    feat = output[key]
-                    
-                    # Apply FiLM
-                    if film_name in self.film_blocks:
-                        modulated = self.film_blocks[film_name](feat, self.current_shadow_vector)
-                        output[key] = modulated
-                        
-                        # Capture P5 for aux head
-                        if film_name == 'P5':
-                            self._last_p5_features = modulated
-            
+        def layer4_hook(module, input, output):
+            if self._current_shadow_enc is not None:
+                return self.shadow_cross_attn(output, self._current_shadow_enc)
             return output
 
-        # Register hook on backbone
         try:
-            # Handle wrapping: self.model -> (optional .model) -> .backbone
-            backbone = None
-            if hasattr(self.model, "backbone"):
-                backbone = self.model.backbone
-            elif hasattr(self.model, "model") and hasattr(self.model.model, "backbone"):
-                backbone = self.model.model.backbone
-            
-            if backbone:
-                backbone.register_forward_hook(backbone_hook)
-                print("   ✅ FiLM hooks injected into Backbone (output dict)")
-            else:
-                print("   ⚠️  Could not find Backbone to inject hooks.")
-                
-        except Exception as e:
-            print(f"⚠️  Warning: Could not inject FiLM hooks: {e}")
-            print("   FiLM conditioning will be skipped.")
+            # Navigate to layer4 through the DeepForest model wrappers
+            body = None
+            if hasattr(self.model, "backbone") and hasattr(self.model.backbone, "body"):
+                body = self.model.backbone.body
+            elif (hasattr(self.model, "model") and
+                  hasattr(self.model.model, "backbone") and
+                  hasattr(self.model.model.backbone, "body")):
+                body = self.model.model.backbone.body
 
-        self._film_injected = True
+            if body and hasattr(body, "layer4"):
+                body.layer4.register_forward_hook(layer4_hook)
+                print("   ✅ Shadow Cross-Attention hook injected on layer4")
+            else:
+                print("   ⚠️  Could not find layer4 to inject SCA hook")
+        except Exception as e:
+            print(f"   ⚠️  SCA hook injection failed: {e}")
+
+        self._sca_hook_injected = True
+
+    # ------------------------------------------------------------------
+    # Lightning lifecycle hooks
+    # ------------------------------------------------------------------
 
     def on_train_start(self):
-        """DeepForest hook: called when training starts."""
-        if not self._film_injected:
-            self._inject_film_hooks()
-        # Call super just in case
+        if self.shadow_cross_attention and not self._sca_hook_injected:
+            self._inject_sca_hook()
         if hasattr(super(), "on_train_start"):
             super().on_train_start()
 
     def on_validation_start(self):
-        """DeepForest hook: called when validation starts."""
-        if not self._film_injected:
-            self._inject_film_hooks()
+        if self.shadow_cross_attention and not self._sca_hook_injected:
+            self._inject_sca_hook()
         if hasattr(super(), "on_validation_start"):
             super().on_validation_start()
 
     def on_predict_start(self):
-        """DeepForest hook: called when prediction starts."""
-        if not self._film_injected:
-            self._inject_film_hooks()
+        if self.shadow_cross_attention and not self._sca_hook_injected:
+            self._inject_sca_hook()
         if hasattr(super(), "on_predict_start"):
             super().on_predict_start()
 
-    def forward(self, x, targets=None, shadow_vectors=None):
-        """
-        Forward pass with shadow conditioning.
+    # ------------------------------------------------------------------
+    # Training / Validation steps
+    # ------------------------------------------------------------------
 
-        Args:
-            x: Input images - List[(C, H, W)] or (B, C, H, W)
-            targets: Optional targets for training
-            shadow_vectors: Optional per-sample shadow vectors (B, 2)
-                          If None, uses base shadow vector
+    def training_step(self, batch, batch_idx):
+        images      = batch[0]
+        targets     = batch[1]
+        image_paths = batch[2] if len(batch) > 2 else [None] * len(images)
 
-        Returns:
-            DeepForest predictions (losses dict during training, detections during eval)
-        """
-        # Use provided shadow vectors or default to base
-        if shadow_vectors is not None:
-            self.current_shadow_vector = shadow_vectors
+        # Compute shadow encoder features (set on self so layer4 hook can read them)
+        if self.shadow_cross_attention:
+            self._current_shadow_enc = self._compute_shadow_enc_batch(images, image_paths)
         else:
-            # Create shadow vector batch from base
-            if isinstance(x, list):
-                batch_size = len(x)
-                device = x[0].device
-            else:
-                batch_size = x.shape[0]
-                device = x.device
+            self._current_shadow_enc = None
 
-            self.current_shadow_vector = (
-                self.base_shadow_vector.to(device).unsqueeze(0).repeat(batch_size, 1)
-            )
+        # Prepend shadow as 4th input channel if enabled
+        if self.shadow_channel:
+            images = self._prepend_shadow_channel(images, image_paths)
+            batch  = (images, targets, *batch[2:])
 
-        # Inject hooks on first forward pass if not already done
-        if not self._film_injected:
-            self._inject_film_hooks()
-
-        # Forward through DeepForest (FiLM hooks will activate)
-        # self.model is the backbone+head in DeepForest class
-        if targets is not None:
-            # Training mode
-            return self.model(x, targets)
-        else:
-            # Inference mode
-            return self.model(x)
+        return super().training_step(batch, batch_idx)
 
     def validation_step(self, batch, batch_idx):
-        """
-        Validation step with shadow conditioning.
-        Ensures shadow vectors are correctly set for the validation batch (FiLM)
-        and prepends the shadow map if shadow_channel=True.
-        """
-        # Set shadow vector for this batch (used by FiLM blocks if enabled)
-        self._set_batch_shadow_vector(batch)
-        
-        # Prepend shadow map channel (Phase 6)
-        if self.shadow_channel:
-            images = batch[0]
-            targets = batch[1]
-            image_paths = batch[2] if len(batch) > 2 else None
-            batch = (self._prepend_shadow_channel(images, image_paths),
-                     targets,
-                     *batch[2:])
+        images      = batch[0]
+        targets     = batch[1]
+        image_paths = batch[2] if len(batch) > 2 else [None] * len(images)
 
-        # Run base validation (forward pass)
+        if self.shadow_cross_attention:
+            self._current_shadow_enc = self._compute_shadow_enc_batch(images, image_paths)
+        else:
+            self._current_shadow_enc = None
+
+        if self.shadow_channel:
+            images = self._prepend_shadow_channel(images, image_paths)
+            batch  = (images, targets, *batch[2:])
+
         return super().validation_step(batch, batch_idx)
 
     def predict_step(self, batch, batch_idx, dataloader_idx=0):
-        """
-        Prediction step with shadow conditioning.
-        """
-        self._set_batch_shadow_vector(batch)
+        if isinstance(batch, (list, tuple)) and len(batch) > 2:
+            images      = batch[0]
+            image_paths = batch[2]
+        elif isinstance(batch, list):
+            images      = batch
+            image_paths = [None] * len(images)
+        else:
+            images      = list(batch)
+            image_paths = [None] * len(images)
+
+        if self.shadow_cross_attention:
+            self._current_shadow_enc = self._compute_shadow_enc_batch(images, image_paths)
+        else:
+            self._current_shadow_enc = None
 
         if self.shadow_channel:
-            if isinstance(batch, list):
-                if isinstance(batch[0], torch.Tensor):
-                    images = batch
-                    image_paths = [None] * len(images)
-                else: # tuple from dataloader
-                    images = batch[0]
-                    image_paths = batch[2] if len(batch) > 2 else [None] * len(images)
+            prepended = self._prepend_shadow_channel(images, image_paths)
+            if isinstance(batch, (list, tuple)) and len(batch) > 2:
+                batch = (prepended, batch[1], *batch[2:])
             else:
-                images = batch # batched tensor
-                image_paths = [None] * len(images)
-                images = list(images)
-
-            prepended_images = self._prepend_shadow_channel(images, image_paths)
-            
-            if isinstance(batch, torch.Tensor):
-                batch = torch.stack(prepended_images)
-            elif isinstance(batch, list) and not isinstance(batch[0], torch.Tensor):
-                batch = (prepended_images, batch[1], *batch[2:])
-            else:
-                batch = prepended_images
+                batch = prepended
 
         return super().predict_step(batch, batch_idx, dataloader_idx)
 
-    def _set_batch_shadow_vector(self, batch):
-        """Helper to look up and set shadow vector for a batch."""
-        # Check if batch has image paths (index 2)
-        # DeepForest batches are usually: (images, targets, image_paths)
-        if len(batch) > 2:
-            image_paths = batch[2]
-            
-            # Look up vectors
-            # Use base vector as fallback for missing paths (e.g. if val set incomplete)
-            vectors = []
-            device = batch[0][0].device if isinstance(batch[0], list) else batch[0].device
-            
-            for p in image_paths:
-                if p in self.shadow_lookup:
-                    vectors.append(self.shadow_lookup[p])
-                else:
-                    # Fallback to base shadow vector
-                    vectors.append(self.base_shadow_vector.numpy())
-            
-            shadow_vectors_np = np.array(vectors, dtype=np.float32)
-            self.current_shadow_vector = torch.from_numpy(shadow_vectors_np).to(device)
+    # ------------------------------------------------------------------
+    # Optimizer
+    # ------------------------------------------------------------------
+
+    def configure_optimizers(self):
+        backbone_lr = self.config.train.lr if self.config else 0.001
+        sca_lr      = backbone_lr * 10   # SCA modules need to adapt faster than pretrained backbone
+
+        if self.freeze_backbone:
+            extra = []
+            if self.shadow_cross_attention:
+                extra += list(self.shadow_encoder.parameters())
+                extra += list(self.shadow_cross_attn.parameters())
+            params = [{"params": extra, "lr": sca_lr}]
+            print(f"   Optimizer: SGD  sca_lr={sca_lr} (backbone FROZEN, SCA only)")
         else:
-             # No paths? Use base shadow vector for entire batch
-             # This happens if dataloader doesn't return paths
-             if isinstance(batch[0], list):
-                 batch_size = len(batch[0])
-                 device = batch[0][0].device
-             else:
-                 batch_size = batch[0].shape[0]
-                 device = batch[0].device
-                 
-             self.current_shadow_vector = (
-                 self.base_shadow_vector.to(device).unsqueeze(0).repeat(batch_size, 1)
-             )
+            params = [{"params": self.model.parameters(), "lr": backbone_lr}]
+            if self.shadow_cross_attention:
+                params += [
+                    {"params": self.shadow_encoder.parameters(),   "lr": sca_lr},
+                    {"params": self.shadow_cross_attn.parameters(), "lr": sca_lr},
+                ]
+                print(f"   Optimizer: SGD  backbone_lr={backbone_lr}  sca_lr={sca_lr} (10x backbone)")
+            else:
+                print(f"   Optimizer: SGD  backbone_lr={backbone_lr}")
 
+        optimizer = torch.optim.SGD(params, lr=backbone_lr, momentum=0.9, weight_decay=1e-4)
 
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="max", factor=0.1, patience=5, verbose=True
+        )
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {"scheduler": scheduler, "monitor": "map",
+                             "interval": "epoch", "frequency": 1},
+        }

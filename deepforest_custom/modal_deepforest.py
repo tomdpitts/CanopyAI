@@ -2,79 +2,58 @@
 Modal deployment for DeepForest fine-tuning
 ============================================
 
-## Phase 3 training (new, direct-CSV mode)
+## Phase 8 — Shadow Cross-Attention Ablation Study
 
-Step 1 — Upload images (phase3 data goes under /phase3/ to avoid touching existing won/tcd data)
+Phase 5 training data is already in Modal storage:
+    phase5_train_aug.csv  (152 KiB)
+    phase5_val_aug.csv    (38.5 KiB)
+    phase5_images.tar.gz
 
-    cd deepforest_custom
-    tar -czf /tmp/phase3_images.tar.gz won/raw won/raw_test annotation_tiles
-    modal volume put canopyai-deepforest-data /tmp/phase3_images.tar.gz /phase3/phase3_images.tar.gz
-    modal volume put canopyai-deepforest-data train_phase3_augmented.csv /phase3/train_phase3_augmented.csv
-    modal volume put canopyai-deepforest-data val_phase3_combined.csv /phase3/val_phase3_combined.csv
+### Run A — Baseline (no shadow)
 
-Step 2 — Launch baseline training (no shadow conditioning)
+    source venv310/bin/activate && cd deepforest_custom && modal run --detach modal_deepforest.py \\
+        --train-csv /data/phase5_train_aug.csv \\
+        --val-csv /data/phase5_val_aug.csv \\
+        --run-name phase8_A_baseline \\
+        --epochs 50 --patience 10 --lr 0.001 --batch-size 16
 
-    cd deepforest_custom && modal run modal_deepforest.py \\
-        --train-csv /data/phase3/train_phase3_augmented.csv \\
-        --val-csv /data/phase3/val_phase3_combined.csv \\
-        --run-name phase3_runQ_baseline_no_shadow \\
-        --epochs 50 --patience 15 --lr 0.001 --batch-size 16
+### Run B — Shadow 4th input channel
 
-Step 3 — Launch FiLM shadow-conditioned training
+    source venv310/bin/activate && cd deepforest_custom && modal run --detach modal_deepforest.py \\
+        --train-csv /data/phase5_train_aug.csv \\
+        --val-csv /data/phase5_val_aug.csv \\
+        --run-name phase8_B_shadow_channel \\
+        --epochs 50 --patience 10 --lr 0.001 --batch-size 16 \\
+        --shadow-channel
 
-    cd deepforest_custom && modal run modal_deepforest.py \\
-        --train-csv /phase3/train_phase3_augmented.csv \\
-        --val-csv /phase3/val_phase3_combined.csv \\
-        --run-name phase3_runQ_film_shadow \\
-        --epochs 50 --patience 15 --lr 0.001 --film-lr 1e-4 --batch-size 16 \\
-        --shadow-conditioning
+### Run C — Shadow cross-attention only (no 4th channel)
 
-Step 4 — Download checkpoint
+    source venv310/bin/activate && cd deepforest_custom && modal run --detach modal_deepforest.py \\
+        --train-csv /data/phase5_train_aug.csv \\
+        --val-csv /data/phase5_val_aug.csv \\
+        --run-name phase8_C_shadow_crossattn \\
+        --epochs 50 --patience 10 --lr 0.001 --batch-size 16 \\
+        --shadow-cross-attention
 
-    modal volume get canopyai-deepforest-checkpoints \\
-        /checkpoints/phase3_runQ_baseline_no_shadow/deepforest_final.pth \\
-        ./phase3_runQ_baseline_no_shadow.pth
+### Run D — Both (channel + cross-attention)
 
-## Phase 4 (BRU splits)
-
-Step 1 — Upload images and CSVs
-    cd deepforest_custom
-    tar -czf /tmp/bru_tiles.tar.gz bru_tiles
-    modal volume put canopyai-deepforest-data /tmp/bru_tiles.tar.gz /phase4/bru_tiles.tar.gz
-    modal volume put canopyai-deepforest-data bru_train.csv /phase4/bru_train.csv
-    modal volume put canopyai-deepforest-data bru_val.csv /phase4/bru_val.csv
-
-Step 2 — Launch training (initializing from oscar50 checkpoint)
-    # Checkpoint path on volume: /checkpoints/model_oscar50.pth
-    # (Assuming it was uploaded there previously by user or earlier run)
-
-    cd deepforest_custom && modal run modal_deepforest.py \
-        --train-csv /data/phase4/bru_train.csv \
-        --val-csv /data/phase4/bru_val.csv \
-        --run-name phase4_bru_baseline \
-        --epochs 50 --lr 0.001 \
-        --checkpoint /checkpoints/model_oscar50.pth
-
-Step 3 — Launch FiLM shadow-conditioned training (initializing from oscar50 checkpoint)
-    # Note: FiLM weights will be initialized randomly, backbone from oscar50
-
-    cd deepforest_custom && modal run modal_deepforest.py \
-        --train-csv /data/phase4/bru_train.csv \
-        --val-csv /data/phase4/bru_val.csv \
-        --run-name phase4_bru_film \
-        --epochs 50 --lr 0.001 --film-lr 1e-4 \
-        --shadow-conditioning \
-        --checkpoint /checkpoints/model_oscar50.pth
-
-## Legacy dataset mode (tcd / won / both) — unchanged, existing data untouched
-
-    cd deepforest_custom && modal run modal_deepforest.py \\
-        --dataset tcd --epochs 20 --run-name tcd_v1
+    source venv310/bin/activate && cd deepforest_custom && modal run --detach modal_deepforest.py \\
+        --train-csv /data/phase5_train_aug.csv \\
+        --val-csv /data/phase5_val_aug.csv \\
+        --run-name phase8_D_full \\
+        --epochs 50 --patience 10 --lr 0.001 --batch-size 16 \\
+        --shadow-channel --shadow-cross-attention
 
 ## Utility commands
 
     modal run modal_deepforest.py::list_checkpoints
     modal run modal_deepforest.py::list_data
+
+## Download checkpoint after run
+
+    modal volume get canopyai-deepforest-checkpoints \\
+        /phase8_A_baseline/deepforest_final.pth \\
+        ./phase8_A_baseline.pth
 """
 
 import modal
@@ -141,29 +120,26 @@ data_volume = modal.Volume.from_name("canopyai-deepforest-data", create_if_missi
     timeout=86400,    # 24 hours
 )
 def train_deepforest_modal(
-    # ── Direct-CSV mode (phase3 and future runs) ──────────────────────────
-    train_csv: str = None,   # Absolute path inside /data volume, e.g. /phase3/train_phase3_augmented.csv
-    val_csv: str = None,     # Absolute path inside /data volume, e.g. /phase3/val_phase3_combined.csv
-    # ── Legacy dataset mode ────────────────────────────────────────────────
-    dataset: str = None,     # "tcd" | "won" | "both" — used when train_csv is not set
-    # ── Training hyper-parameters ──────────────────────────────────────────
+    # ── Direct-CSV mode ──────────────────────────────────────────────
+    train_csv: str = None,
+    val_csv: str = None,
+    # ── Legacy dataset mode ───────────────────────────────────────
+    dataset: str = None,
+    # ── Training hyper-parameters ────────────────────────────────
     epochs: int = 20,
     batch_size: int = 16,
     lr: float = 0.001,
     patience: int = 5,
     run_name: str = "default",
-    # ── FiLM / shadow conditioning ─────────────────────────────────────────
-    shadow_conditioning: bool = False,  # Enable FiLM conditioning
-    film_lr: float = 1e-4,             # LR for FiLM blocks (lower than backbone)
-    shadow_angle_deg: float = None,    # Auto-derived from CSV if None
-    # ── Misc ───────────────────────────────────────────────────────────────
+    # ── Shadow mechanisms ───────────────────────────────────────
+    shadow_channel: bool = False,         # Run B/D: 4th input channel
+    shadow_cross_attention: bool = False,  # Run C/D: cross-attn after layer4
+    shadow_angle_deg: float = None,
+    # ── Misc ───────────────────────────────────────────────────
     wandb_project: str = None,
-    checkpoint: str = None,            # Optional path to initial weights in /data volume
-    dry_run: bool = False,             # If True, print config and exit without training
+    checkpoint: str = None,
+    dry_run: bool = False,
     freeze_backbone: bool = False,
-    aux_loss_weight: float = 1.0,      # Weight of auxiliary shadow-prediction loss (0.0 = disabled)
-    shadow_channel: bool = False,      # If True, add shadow map as 4th input channel (Phase 6)
-    use_film: bool = False,            # If True, enable FiLM conditioning blocks
 ):
     """
     Train DeepForest on Modal GPU. Auto-resumes from checkpoint if one exists
@@ -182,13 +158,13 @@ def train_deepforest_modal(
 
     gpu_type = os.environ.get("MODAL_GPU_TYPE", "A100")
     print("🚀 DeepForest training on Modal")
-    print(f"   GPU           : {gpu_type}")
-    print(f"   Epochs        : {epochs}")
-    print(f"   Batch size    : {batch_size}")
-    print(f"   LR            : {lr}")
-    print(f"   Film LR       : {film_lr}")
-    print(f"   Shadow cond.  : {shadow_conditioning}")
-    print(f"   Run name      : {run_name}")
+    print(f"   GPU                  : {gpu_type}")
+    print(f"   Epochs               : {epochs}")
+    print(f"   Batch size           : {batch_size}")
+    print(f"   LR                   : {lr}")
+    print(f"   Shadow channel       : {shadow_channel}")
+    print(f"   Shadow cross-attn    : {shadow_cross_attention}")
+    print(f"   Run name             : {run_name}")
 
     # ------------------------------------------------------------------
     # Resolve CSVs (direct mode vs legacy dataset mode)
@@ -391,15 +367,12 @@ def train_deepforest_modal(
         pretrained=True,
         wandb_project=wandb_project,
         run_name=run_name,
-        shadow_conditioning=shadow_conditioning,
-        film_lr=film_lr,
         shadow_angle_deg=shadow_angle_deg,
         checkpoint=checkpoint,
-        accelerator="gpu",   # Force CUDA — we always have an NVIDIA GPU on Modal
+        accelerator="gpu",
         freeze_backbone=freeze_backbone,
-        aux_loss_weight=aux_loss_weight,
         shadow_channel=shadow_channel,
-        use_film=use_film,
+        shadow_cross_attention=shadow_cross_attention,
     )
 
     # Persist checkpoints
@@ -420,51 +393,88 @@ def train_deepforest_modal(
 # ---------------------------------------------------------------------------
 @app.local_entrypoint()
 def main(
-    # ── Direct-CSV mode ────────────────────────────────────────────────────
+    # ── Direct-CSV mode ──────────────────────────────────────────────
     train_csv: str = None,
     val_csv: str = None,
-    # ── Legacy dataset mode ────────────────────────────────────────────────
+    # ── Legacy dataset mode ───────────────────────────────────────
     dataset: str = None,
-    # ── Training hypers ────────────────────────────────────────────────────
+    # ── Training hypers ──────────────────────────────────────────
     epochs: int = 20,
     batch_size: int = 16,
     lr: float = 0.001,
     patience: int = 5,
     run_name: str = "default",
-    # ── FiLM / shadow conditioning ─────────────────────────────────────────
-    shadow_conditioning: bool = False,
-    film_lr: float = 1e-4,
+    # ── Shadow mechanisms ───────────────────────────────────────
+    shadow_channel: bool = False,
+    shadow_cross_attention: bool = False,
     shadow_angle_deg: float = None,
-    # ── Misc ───────────────────────────────────────────────────────────────
+    # ── Misc ───────────────────────────────────────────────────
     wandb_project: str = None,
     checkpoint: str = None,
     dry_run: bool = False,
     freeze_backbone: bool = False,
-    aux_loss_weight: float = 1.0,
-    shadow_channel: bool = False,      # Phase 6: 4th shadow channel input
-    use_film: bool = False,            # Phase 6: Disable FiLM by default for clean ablation
 ):
     """
-    Launch DeepForest training on Modal GPU.
+Modal deployment for DeepForest fine-tuning
+============================================
 
-    Phase3 baseline example:
-        modal run modal_deepforest.py \\
-            --train-csv /phase3/train_phase3_augmented.csv \\
-            --val-csv /phase3/val_phase3_combined.csv \\
-            --run-name phase3_runQ_baseline_no_shadow \\
-            --epochs 50 --patience 15 --lr 0.001 --batch-size 16
+## Phase 8 — Shadow Cross-Attention Ablation Study
 
-    Phase3 FiLM example:
-        modal run modal_deepforest.py \\
-            --train-csv /phase3/train_phase3_augmented.csv \\
-            --val-csv /phase3/val_phase3_combined.csv \\
-            --run-name phase3_runQ_film_shadow \\
-            --epochs 50 --patience 15 --lr 0.001 --film-lr 1e-4 --batch-size 16 \\
-            --shadow-conditioning --freeze-backbone
+Phase 5 training data is already in Modal storage:
+    phase5_train_aug.csv  (152 KiB)
+    phase5_val_aug.csv    (38.5 KiB)
+    phase5_images.tar.gz
 
-    Legacy mode:
-        modal run modal_deepforest.py --dataset tcd --epochs 20 --run-name tcd_v1
-    """
+### Run A — Baseline (no shadow)
+
+    cd deepforest_custom && modal run modal_deepforest.py \
+        --train-csv /data/phase5_train_aug.csv \
+        --val-csv /data/phase5_val_aug.csv \
+        --run-name phase8_A_baseline \
+        --epochs 50 --patience 10 --lr 0.001 --batch-size 16 \
+        --checkpoint /checkpoints/model_oscar50.pth
+
+### Run B — Shadow 4th input channel
+
+    cd deepforest_custom && modal run modal_deepforest.py \
+        --train-csv /data/phase5_train_aug.csv \
+        --val-csv /data/phase5_val_aug.csv \
+        --run-name phase8_B_shadow_channel \
+        --epochs 50 --patience 10 --lr 0.001 --batch-size 16 \
+        --shadow-channel \
+        --checkpoint /checkpoints/model_oscar50.pth
+
+### Run C — Shadow cross-attention only (no 4th channel)
+
+    cd deepforest_custom && modal run modal_deepforest.py \
+        --train-csv /data/phase5_train_aug.csv \
+        --val-csv /data/phase5_val_aug.csv \
+        --run-name phase8_C_shadow_crossattn \
+        --epochs 50 --patience 10 --lr 0.001 --batch-size 16 \
+        --shadow-cross-attention \
+        --checkpoint /checkpoints/model_oscar50.pth
+
+### Run D — Both (channel + cross-attention)
+
+    cd deepforest_custom && modal run modal_deepforest.py \
+        --train-csv /data/phase5_train_aug.csv \
+        --val-csv /data/phase5_val_aug.csv \
+        --run-name phase8_D_full \
+        --epochs 50 --patience 10 --lr 0.001 --batch-size 16 \
+        --shadow-channel --shadow-cross-attention \
+        --checkpoint /checkpoints/model_oscar50.pth
+
+## Utility commands
+
+    modal run modal_deepforest.py::list_checkpoints
+    modal run modal_deepforest.py::list_data
+
+## Download checkpoint after run
+
+    modal volume get canopyai-deepforest-checkpoints \
+        /phase8_A_baseline/deepforest_final.pth \
+        ./phase8_A_baseline.pth
+"""
     print("☁️  Submitting DeepForest training job to Modal...")
 
     results = train_deepforest_modal.remote(
@@ -476,16 +486,13 @@ def main(
         lr=lr,
         patience=patience,
         run_name=run_name,
-        shadow_conditioning=shadow_conditioning,
-        film_lr=film_lr,
+        shadow_channel=shadow_channel,
+        shadow_cross_attention=shadow_cross_attention,
         shadow_angle_deg=shadow_angle_deg,
         wandb_project=wandb_project,
         checkpoint=checkpoint,
         dry_run=dry_run,
         freeze_backbone=freeze_backbone,
-        aux_loss_weight=aux_loss_weight,
-        shadow_channel=shadow_channel,
-        use_film=use_film,
     )
 
     if results:
