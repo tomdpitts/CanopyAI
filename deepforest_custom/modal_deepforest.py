@@ -57,6 +57,7 @@ Phase 5 training data is already in Modal storage:
 """
 
 import modal
+import numpy as np
 import os
 import sys
 
@@ -343,6 +344,95 @@ def train_deepforest_modal(
                 )
                 df.to_csv(csv_path, index=False)
                 print(f"   ✅ Fixed paths in {csv_path}")
+
+    # ------------------------------------------------------------------
+    # Pre-compute global shadow normalization stats (pre-tiling equivalent)
+    # ------------------------------------------------------------------
+    # Shadow maps must use normalization stats derived from the full source
+    # orthomosaic so that shadow probability values are comparable across tiles.
+    #
+    # The rotation augmentation in phase5 creates 74 unique (shadow_x, shadow_y)
+    # groups — each with exactly 1 tile — so grouping by shadow vector is
+    # equivalent to per-tile normalization (no improvement).
+    #
+    # Correct approach: group by DOMAIN (BRU / WON).  All tiles in a domain
+    # came from the same orthomosaic.  We mosaic all domain tiles and compute
+    # stats at the domain's median shadow angle.  This gives consistent
+    # normalization across all tiles in a domain — the best approximation of
+    # full-orthomosaic stats when the source ortho is unavailable.
+    #
+    # dg_scale is angle-dependent; using the median angle for the mosaic
+    # introduces a small per-tile approximation error, but this is far better
+    # than per-tile amplification of noise in non-shadow tiles.
+    if shadow_channel or shadow_cross_attention:
+        print("\n📊 Pre-computing domain-level shadow normalization stats...")
+        import math as _math
+        import cv2
+        try:
+            from utils import compute_shadow_normalization_stats
+        except ImportError:
+            from deepforest_custom.utils import compute_shadow_normalization_stats  # type: ignore
+
+        def _add_shadow_norm_stats(csv_path):
+            if not csv_path or not os.path.exists(csv_path):
+                return
+            df = pd.read_csv(csv_path)
+            required = {"shadow_x", "shadow_y", "image_path"}
+            if not required.issubset(df.columns):
+                print(f"   ⚠️  {csv_path} missing shadow vector columns — skipping norm stats")
+                return
+            # Always recompute — algorithm may have changed since last run
+            if all(c in df.columns for c in ["dg_scale", "dark_scale", "otsu_ctr"]):
+                print(f"   ♻️  Recomputing shadow norm stats (algorithm may have changed)")
+
+            df["dg_scale"]   = 30.0
+            df["dark_scale"] = 10.0
+            df["otsu_ctr"]   = 0.5
+
+            # Determine grouping column: use 'domain' if present, else fall back
+            # to a single global group (all tiles treated as one scene).
+            group_col = "domain" if "domain" in df.columns else None
+
+            groups = df.groupby(group_col) if group_col else [("ALL", df)]
+            for group_key, group_df in groups:
+                unique_paths = group_df["image_path"].drop_duplicates().tolist()
+
+                # Median shadow angle for this domain (used for dg computation)
+                angles = group_df["shadow_angle"].values if "shadow_angle" in group_df.columns else None
+                if angles is not None and len(angles):
+                    median_angle = float(np.median(angles))
+                else:
+                    sx = group_df["shadow_x"].median()
+                    sy = group_df["shadow_y"].median()
+                    median_angle = _math.degrees(_math.atan2(float(sx), float(sy))) % 360
+
+                tiles = []
+                for p in unique_paths[:60]:
+                    img = cv2.imread(p)
+                    if img is not None:
+                        tiles.append(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+
+                if not tiles:
+                    print(f"   ⚠️  No readable tiles for domain={group_key} — using defaults")
+                    continue
+
+                mosaic = np.concatenate(tiles, axis=0)
+                dg_s, dark_s, otsu_s = compute_shadow_normalization_stats(mosaic, median_angle)
+
+                mask = df.index.isin(group_df.index)
+                df.loc[mask, "dg_scale"]   = dg_s
+                df.loc[mask, "dark_scale"] = dark_s
+                df.loc[mask, "otsu_ctr"]   = otsu_s
+                print(f"   domain={group_key}  {len(unique_paths)} tiles  "
+                      f"median_angle={median_angle:.1f}° → "
+                      f"dg={dg_s:.1f}")
+
+            df.to_csv(csv_path, index=False)
+            print(f"   ✅ Saved domain-level shadow norm stats → {csv_path}")
+
+        _add_shadow_norm_stats(train_csv)
+        if val_csv:
+            _add_shadow_norm_stats(val_csv)
 
     # ------------------------------------------------------------------
     # Dry-run exit

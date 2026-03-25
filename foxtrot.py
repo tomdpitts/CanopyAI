@@ -444,6 +444,8 @@ def detect_trees_deepforest(
 
     # Auto-detect model type if path provided
     use_film = False
+    use_shadow_channel = False
+    use_sca = False
 
     if model_path is not None and Path(model_path).exists():
         print(f"   🔍 Inspecting model: {Path(model_path).name}")
@@ -451,28 +453,45 @@ def detect_trees_deepforest(
             # Load checkpoint to CPU to inspect keys
             checkpoint = torch.load(model_path, map_location="cpu")
             if "state_dict" in checkpoint:
-                keys = checkpoint["state_dict"].keys()
+                state_dict = checkpoint["state_dict"]
             else:
-                keys = checkpoint.keys()
+                state_dict = checkpoint
+            keys = state_dict.keys()
 
-            # Check for FiLM specific keys
+            # Check for legacy FiLM specific keys or SCA
             has_film_blocks = any("film_blocks" in k for k in keys)
+            use_sca = any("shadow_encoder" in k or "shadow_cross_attn" in k for k in keys)
 
             if has_film_blocks:
-                print("   ✨ Detected FiLM-conditioned model")
-                use_film = True
+                print("   ⚠️  Detected legacy FiLM-conditioned model")
+                
+            # Detect shadow_channel by inspecting the saved conv1 weight shape directly.
+            saved_conv1 = state_dict.get("model.backbone.body.conv1.weight", state_dict.get("backbone.body.conv1.weight"))
+            use_shadow_channel = (saved_conv1 is not None and saved_conv1.shape[1] == 4)
+
+            use_film = use_shadow_channel or use_sca or has_film_blocks
+
+            if use_shadow_channel and use_sca:
+                print("   ✨ Detected ShadowChannel + ShadowCrossAttention model")
+            elif use_shadow_channel:
+                print("   ✨ Detected ShadowChannel model")
+            elif use_sca:
+                print("   ✨ Detected ShadowCrossAttention model")
+            elif has_film_blocks:
+                print("   ✨ Detected legacy FiLM-conditioned model")
             else:
                 print("   🌲 Detected Standard DeepForest model")
-                use_film = False
 
         except Exception as e:
             print(f"   ⚠️  Could not inspect model keys: {e}")
             print("   Assuming Standard DeepForest model")
             use_film = False
+            use_shadow_channel = False
+            use_sca = False
 
     # Check if we have shadow vector for FiLM
     if use_film and shadow_vector is None:
-        print("   ⚠️  FiLM model detected but no shadow vector provided/predicted.")
+        print("   ⚠️  Shadow-conditioned model detected but no shadow vector provided/predicted.")
         print("   ⚠️  Falling back to base shadow vector (0, 0) or similar.")
         # We'll see if the model handles None shadow_vector or if we need to provide a dummy one
         # ShadowConditionedDeepForest typically requires it, or has default in forward
@@ -480,15 +499,19 @@ def detect_trees_deepforest(
         pass
 
     if use_film:
-        print("   🌞 Using FiLM-conditioned DeepForest")
+        print("   🌞 Using Shadow-conditioned DeepForest")
         try:
             from deepforest_custom.models import ShadowConditionedDeepForest
         except ImportError as e:
-            print(f"❌ Error importing FiLM model: {e}")
+            print(f"❌ Error importing Shadow Conditioned model: {e}")
             raise
 
-        # Initialize FiLM model
-        df_model = ShadowConditionedDeepForest(shadow_angle_deg=0.0)
+        # Initialize Shadow Conditioned model
+        df_model = ShadowConditionedDeepForest(
+            shadow_angle_deg=0.0,
+            shadow_channel=use_shadow_channel,
+            shadow_cross_attention=use_sca
+        )
 
         # Load weights
         checkpoint = torch.load(model_path, map_location="cpu")
@@ -497,10 +520,7 @@ def detect_trees_deepforest(
         else:
             state_dict = checkpoint
 
-        # Detect shadow_channel by inspecting the saved conv1 weight shape directly.
-        # Do NOT rely on hyper_parameters — flat state-dict checkpoints have no such key.
-        saved_conv1 = state_dict.get("model.backbone.body.conv1.weight")
-        use_shadow_channel = (saved_conv1 is not None and saved_conv1.shape[1] == 4)
+        # Already inspected use_shadow_channel above
         if use_shadow_channel:
             print("   🔑 Checkpoint conv1 has 4 input channels — widening model first conv")
             try:
@@ -526,6 +546,9 @@ def detect_trees_deepforest(
                 print("   ⚠️  Loaded weights without Auxiliary Head (legacy checkpoint). This is fine for inference.")
             else:
                 print("   ✅ Loaded full ShadowConditionedDeepForest weights")
+                
+            if use_sca:
+                df_model._inject_sca_hook()
                 
         except RuntimeError as e:
             print(f"   ❌ Model load failed: {e}")
@@ -597,6 +620,21 @@ def detect_trees_deepforest(
     shadow_canvas = np.zeros((h, w), dtype=np.float32)
     shadow_weight = np.zeros((h, w), dtype=np.float32)
 
+    # Pre-compute global shadow normalization stats from the FULL image before tiling.
+    # This ensures every tile (shadow_channel and SCA) uses the same normalization
+    # scale, matching the semantics of foxtrot.py's full-orthomosaic inference.
+    if shadow_angle is not None and (use_shadow_channel or use_sca):
+        try:
+            from utils import compute_shadow_normalization_stats
+        except ImportError:
+            from deepforest_custom.utils import compute_shadow_normalization_stats  # type: ignore
+        shadow_norm_stats = compute_shadow_normalization_stats(image, shadow_angle)
+        dg_s, dark_s, otsu_s = shadow_norm_stats
+        print(f"   📊 Global shadow norm stats: dg_scale={dg_s:.1f}  dark_scale={dark_s:.1f}  otsu_ctr={otsu_s:.3f}")
+        # Make global stats available to the SCA model's _compute_shadow_enc_batch
+        if use_sca:
+            df_model.norm_stats_lookup = {None: shadow_norm_stats}
+
     # Process tiles
     y_starts = range(0, h, stride) if h > tile_size else [0]
     x_starts = range(0, w, stride) if w > tile_size else [0]
@@ -625,15 +663,9 @@ def detect_trees_deepforest(
                 # using a zero map as a safe fallback if no shadow angle is available.
                 if use_shadow_channel:
                     try:
-                        from utils import generate_shadow_map, compute_shadow_normalization_stats
+                        from utils import generate_shadow_map
                     except ImportError:
-                        from deepforest_custom.utils import generate_shadow_map, compute_shadow_normalization_stats  # type: ignore
-
-                    # Compute global normalization stats once on first tile
-                    if shadow_angle is not None and shadow_norm_stats is None:
-                        shadow_norm_stats = compute_shadow_normalization_stats(image, shadow_angle)
-                        dg_s, dark_s, otsu_s = shadow_norm_stats
-                        print(f"   📊 Shadow norm stats: dg_scale={dg_s:.1f}  dark_scale={dark_s:.1f}  otsu_ctr={otsu_s:.3f}")
+                        from deepforest_custom.utils import generate_shadow_map  # type: ignore
 
                     tile_u8 = tile.astype(np.uint8) if tile.dtype != np.uint8 else tile
                     if shadow_angle is not None:
@@ -726,14 +758,22 @@ def detect_trees_deepforest(
 
                 # Inference
                 with torch.no_grad():
-                    if use_film:
-                        # Pass shadow vector to FiLM model
-                        prediction = df_model(
-                            image_tensor, shadow_vectors=shadow_vector
-                        )
-                    else:
-                        # Standard DeepForest
-                        prediction = df_model.model(image_tensor)
+                    if use_sca:
+                        # Prepare shadow encoding for the cross-attention hook if needed
+                        if shadow_vector is not None:
+                            sv = shadow_vector
+                            if hasattr(sv, "cpu"):
+                                sv = sv.squeeze().cpu().numpy()
+                            # Key fix: sv_np must be [x, y] to be correctly used inside models.py,
+                            # not just flattened into a list if it already was.
+                            # It is later used as: sv = np.array([np.sin(angle), np.cos(angle)])
+                            sv_np = np.array(sv, dtype=np.float32).flatten()
+                            df_model.shadow_lookup = {None: sv_np}
+                        else:
+                            df_model.shadow_lookup = {}
+                        df_model._current_shadow_enc = df_model._compute_shadow_enc_batch([image_tensor[0, :3, :, :]], [None])
+
+                    prediction = df_model.model(image_tensor)
 
                 # Post-process
                 if len(prediction[0]["boxes"]) > 0:

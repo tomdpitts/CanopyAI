@@ -22,56 +22,97 @@ import cv2
 
 
 
-# ── Shadow probability map (Phase 6) ──────────────────────────────────────────
-# Public API:
-#   compute_shadow_normalization_stats(image_rgb, angle)  →  (dg_scale, dark_scale, otsu_ctr)
-#   generate_shadow_map(img_rgb, angle, dg_scale, dark_scale, otsu_ctr)  →  H×W float32
+# ── Shadow probability map ─────────────────────────────────────────────────────
+# Algorithm: shadow_tuner Slot 2 (tuned for BRU/WON aerials).
+# Public API (backward compatible):
+#   compute_shadow_normalization_stats(image_rgb, angle)  →  (norm_dg, None, None)
+#   generate_shadow_map(img_rgb, angle, dg_scale, ...)    →  H×W float32
+#
+# Key design choices vs the old algorithm:
+#   - Short + long range DG (8-35px and 35-150px) weighted equally.
+#   - Max-brightness ray accumulation with anti-sun directional penalty
+#     (replaces old Gaussian-weighted average of anti−sun difference).
+#   - Absolute luma gate (abs_luma_max=71): pixels brighter than this cannot
+#     be shadows — kills bare-ground false positives entirely.
+#   - Lateral edge penalty (Sobel): suppresses road edges running parallel
+#     to the shadow direction.
+#   - Fixed sigmoid centre (otsu_ctr=0.35) and activation floor (0.2):
+#     no per-tile dynamic threshold, so maps are globally consistent.
+#   - Speckle removal (min 150px²): removes isolated noise blobs.
 
-_SM_D_MIN    = 8
-_SM_D_MAX    = 35
-_SM_SIG_BLUR = 4
-_SM_SIG_DARK = 30
-_SM_K        = 12.0
+# Slot 2 defaults
+_SM_D_SHORT_MIN  = 8
+_SM_D_SHORT_MAX  = 35
+_SM_BLUR_SHORT   = 2.0
+_SM_D_LONG_MIN   = 35
+_SM_D_LONG_MAX   = 150
+_SM_BLUR_LONG    = 4.0
+_SM_SHORT_WEIGHT = 0.5
+_SM_ABS_LUMA_MAX = 71
+_SM_OTSU_CTR     = 0.35
+_SM_SIGMOID_K    = 12.0
+_SM_ACT_FLOOR    = 0.2
+_SM_SPECKLE_MIN  = 150
 
 
 def _sm_vectors(shadow_angle_deg: float):
-    """Return (adx,ady,sdx,sdy): anti-shadow and shadow unit-vector components."""
+    """Return (adx, ady, sdx, sdy): anti-shadow and shadow unit-vector components."""
     ang = np.radians(shadow_angle_deg)
-    sx, sy =  np.sin(ang), -np.cos(ang)
+    sx, sy = np.sin(ang), -np.cos(ang)
     return -sx, -sy, sx, sy
 
 
-def _sm_raw(gray: np.ndarray, adx, ady, sdx, sdy, valid_mask: np.ndarray):
+def _sm_valid_mask(gray: np.ndarray) -> np.ndarray:
+    """Binary valid-pixel mask: excludes black (nodata=0) and white (nodata=255) fill."""
+    valid = ((gray > 15) & (gray < 250)).astype(np.uint8)
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    return cv2.erode(valid, k).astype(np.float32)
+
+
+def _sm_dg(gray, valid, adx, ady, sdx, sdy, d_min, d_max, n_steps, blur):
     """
-    Compute RAW (unscaled) directional gradient and darkness maps.
-    Both are masked to valid_mask (float {0,1}).
-    Returns (dg, dark) — float32, same shape as gray.
+    Directional gradient: max brightness seen toward sun minus an anti-sun penalty.
+    Uses np.maximum accumulation (not Gaussian-weighted average) so the signal
+    fires as soon as any bright object is seen in the sun direction.
     """
     h, w = gray.shape
-    ds  = np.arange(_SM_D_MIN, _SM_D_MAX + 1, 3, dtype=np.float32)
-    d_c = (_SM_D_MIN + _SM_D_MAX) / 2.0
-    wts = np.exp(-0.5 * ((ds - d_c) / 8.0) ** 2)
-    wts /= wts.sum()
+    if d_min >= d_max:
+        return np.zeros((h, w), dtype=np.float32)
+    ds = np.unique(
+        np.round(np.linspace(d_min, d_max, max(n_steps, 2))).astype(int)
+    ).astype(float)
+    sun_max  = gray.copy()
+    anti_max = gray.copy()
+    for d in ds:
+        Ma = np.float32([[1, 0, round(d * adx)], [0, 1, round(d * ady)]])
+        Ms = np.float32([[1, 0, round(d * sdx)], [0, 1, round(d * sdy)]])
+        sun_side  = cv2.warpAffine(gray,  Ma, (w, h), borderMode=cv2.BORDER_REFLECT)
+        anti_side = cv2.warpAffine(gray,  Ms, (w, h), borderMode=cv2.BORDER_REFLECT)
+        va = cv2.warpAffine(valid, Ma, (w, h), borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        vs = cv2.warpAffine(valid, Ms, (w, h), borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        sun_side  *= (va > 0.5)
+        anti_side *= (vs > 0.5)
+        sun_max  = np.maximum(sun_max,  sun_side)
+        anti_max = np.maximum(anti_max, anti_side)
+    base_diff = np.clip(sun_max - gray, 0, None)
+    anti_diff = np.clip(anti_max - gray, 0, None)
+    diff = np.clip(base_diff - anti_diff * 0.4, 0, None)
+    if blur > 0:
+        diff = cv2.GaussianBlur(diff, (0, 0), sigmaX=float(blur))
+    return diff * valid
 
-    dg = np.zeros((h, w), dtype=np.float32)
-    for d, wt in zip(ds, wts):
-        Ma = np.float32([[1, 0, int(round(d * adx))], [0, 1, int(round(d * ady))]])
-        Ms = np.float32([[1, 0, int(round(d * sdx))], [0, 1, int(round(d * sdy))]])
-        anti = cv2.warpAffine(gray, Ma, (w, h), borderMode=cv2.BORDER_REFLECT)
-        shad = cv2.warpAffine(gray, Ms, (w, h), borderMode=cv2.BORDER_REFLECT)
-        dg  += wt * np.clip((anti - shad).astype(np.float32), 0, None)
 
-    dg   = cv2.GaussianBlur(dg, (0, 0), sigmaX=_SM_SIG_BLUR) * valid_mask
-    lm   = cv2.GaussianBlur(gray, (0, 0), sigmaX=_SM_SIG_DARK)
-    dark = np.clip(lm - gray, 0, None).astype(np.float32) * valid_mask
-    return dg, dark
-
-
-def _sm_valid_mask(gray: np.ndarray) -> np.ndarray:
-    """Binary valid-pixel mask: excludes both black (nodata=0) and white (nodata=255) fill."""
-    valid = ((gray > 15) & (gray < 250)).astype(np.uint8)
-    k3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-    return cv2.erode(valid, k3).astype(np.float32)
+def _sm_remove_speckle(prob: np.ndarray, min_area: int, threshold: float = 0.2) -> np.ndarray:
+    """Remove connected components smaller than min_area pixels."""
+    if min_area <= 0:
+        return prob
+    binary = (prob >= max(threshold, 0.01)).astype(np.uint8)
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    mask = np.zeros_like(binary)
+    for lab in range(1, n):
+        if stats[lab, cv2.CC_STAT_AREA] >= min_area:
+            mask[labels == lab] = 1
+    return prob * mask.astype(np.float32)
 
 
 def compute_shadow_normalization_stats(
@@ -80,26 +121,14 @@ def compute_shadow_normalization_stats(
     max_side: int = 2000,
 ) -> tuple:
     """
-    Compute image-level normalization statistics for the shadow map.
+    Compute norm_dg: 99.5th-percentile short-range directional gradient over
+    the full image (or domain mosaic).  Call ONCE before tiling and pass the
+    result to every generate_shadow_map call so that all tiles share the same
+    normalization scale.
 
-    Downsamples the full image to at most ``max_side`` pixels on its longest
-    edge, then computes the directional gradient (dg) and darkness (dark)
-    maps over the whole image and reads off the 99.5th-percentile values.
-
-    These statistics should be computed ONCE per source image (before tiling)
-    and passed to every ``generate_shadow_map`` call for that image so that
-    tiles containing only noise / bare ground are not amplified to 1.0.
-
-    Args:
-        image_rgb:        Full-image H×W×3 uint8 numpy array (RGB).
-        shadow_angle_deg: Shadow azimuth in degrees (same convention as
-                          generate_shadow_map).
-        max_side:         Downsample so that max(H, W) ≤ max_side before
-                          computing stats (for speed on large orthomosaics).
-
-    Returns:
-        (dg_scale, dark_scale, otsu_ctr) tuple of float.
-        Pass these directly to generate_shadow_map(...).
+    Returns (norm_dg, None, None) — 3-tuple for backward compatibility with
+    callers that unpack as (dg_s, dark_s, otsu_s).  Only the first element
+    is used by generate_shadow_map; the other two are ignored.
     """
     h, w = image_rgb.shape[:2]
     scale = min(max_side / max(h, w), 1.0)
@@ -109,213 +138,78 @@ def compute_shadow_normalization_stats(
     else:
         img_s = image_rgb
 
-    gray = cv2.cvtColor(img_s.astype(np.uint8), cv2.COLOR_RGB2GRAY).astype(np.float32)
+    gray  = cv2.cvtColor(img_s.astype(np.uint8), cv2.COLOR_RGB2GRAY).astype(np.float32)
     valid = _sm_valid_mask(gray)
     mask  = valid > 0
 
     if mask.sum() < 100:
-        return 30.0, 10.0, 0.5
+        return 30.0, None, None
 
     adx, ady, sdx, sdy = _sm_vectors(shadow_angle_deg)
-    dg, dark = _sm_raw(gray, adx, ady, sdx, sdy, valid)
-
-    dg_scale   = max(float(np.percentile(dg[mask],   99.5)), 30.0)
-    dark_scale = max(float(np.percentile(dark[mask], 99.5)), 10.0)
-
-    # Compute global Otsu threshold on the normalised base product
-    base  = np.clip(dg / dg_scale, 0, 1) * np.clip(dark / dark_scale, 0, 1)
-    m_u8  = (base * 255).astype(np.uint8)
-    thresh, _ = cv2.threshold(m_u8[mask], 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    otsu_ctr  = float(np.clip(thresh / 255.0, 0.15, 0.70))
-
-    return dg_scale, dark_scale, otsu_ctr
+    dg = _sm_dg(gray, valid, adx, ady, sdx, sdy,
+                _SM_D_SHORT_MIN, _SM_D_SHORT_MAX, 8, _SM_BLUR_SHORT)
+    norm_dg = max(float(np.percentile(dg[mask], 99.5)), 30.0)
+    return norm_dg, None, None
 
 
 def generate_shadow_map(
     img_rgb: np.ndarray,
     shadow_angle_deg: float,
-    dg_scale: float | None = None,
-    dark_scale: float | None = None,
-    otsu_ctr: float | None = None,
+    dg_scale: float | None = None,    # norm_dg from compute_shadow_normalization_stats()
+    dark_scale: float | None = None,  # unused — kept for API compatibility
+    otsu_ctr: float | None = None,    # if None uses Slot 2 default (0.35)
 ) -> np.ndarray:
     """
-    Generate a shadow probability map for a single tile.
-
-    Uses a directional asymmetry (DirGrad) × local darkness formulation:
-      - DirGrad: directional brightness asymmetry along the shadow axis,
-                 accumulated over offsets d=8..35 px (Gaussian weighted).
-      - Darkness: local darkness below the 30-px Gaussian mean.
-      - Product: fires only where a pixel is both dark AND at an asymmetric
-                 shadow boundary.
-      - Sigmoid (k=12): centred on the Otsu threshold of the product map.
-      - Boundary mask: zeros out nodata regions (black or white fill).
+    Generate a shadow probability map using the Slot 2 algorithm.
 
     Args:
         img_rgb:          H×W×3 uint8 numpy array (RGB).
         shadow_angle_deg: Sun azimuth in degrees (0=North, 90=East, CW).
-        dg_scale:         Global 99.5th-pct directional-gradient scale from
-                          compute_shadow_normalization_stats(). When None, the
-                          per-tile maximum is used (with a 30.0 floor).
-        dark_scale:       Global 99.5th-pct darkness scale from
-                          compute_shadow_normalization_stats(). When None, the
-                          per-tile 95th-pct is used (with a 10.0 floor).
-        otsu_ctr:         Global sigmoid centre from
-                          compute_shadow_normalization_stats(). When None,
-                          per-tile Otsu is computed.
+        dg_scale:         norm_dg from compute_shadow_normalization_stats().
+                          When None, falls back to per-tile max (not recommended).
+        dark_scale:       Ignored. Kept so existing callers don't break.
+        otsu_ctr:         Sigmoid centre. None → uses Slot 2 default (0.35).
 
     Returns:
         shadow_map: H×W float32 array in [0, 1].
     """
-    gray = cv2.cvtColor(img_rgb.astype(np.uint8), cv2.COLOR_RGB2GRAY).astype(np.float32)
+    gray  = cv2.cvtColor(img_rgb.astype(np.uint8), cv2.COLOR_RGB2GRAY).astype(np.float32)
     valid = _sm_valid_mask(gray)
-    mask  = valid > 0
-
     adx, ady, sdx, sdy = _sm_vectors(shadow_angle_deg)
-    dg, dark = _sm_raw(gray, adx, ady, sdx, sdy, valid)
 
-    # ── Normalisation ──────────────────────────────────────────────────────────
-    if dg_scale is None:
-        # Per-tile fallback: use tile max with a noise floor
-        dg_scale = max(float(dg.max()), 30.0)
-    if dark_scale is None:
-        dark_scale = max(float(np.percentile(dark[mask], 95)) if mask.sum() > 0 else 10.0, 10.0)
+    # ── Short + long range directional gradient ────────────────────────────────
+    dg_s = _sm_dg(gray, valid, adx, ady, sdx, sdy,
+                  _SM_D_SHORT_MIN, _SM_D_SHORT_MAX, 8,  _SM_BLUR_SHORT)
+    dg_l = _sm_dg(gray, valid, adx, ady, sdx, sdy,
+                  _SM_D_LONG_MIN,  _SM_D_LONG_MAX,  12, _SM_BLUR_LONG)
+    dg   = (_SM_SHORT_WEIGHT * dg_s + (1.0 - _SM_SHORT_WEIGHT) * dg_l) * valid
 
-    dg_n   = np.clip(dg   / dg_scale,   0, 1)
-    dark_n = np.clip(dark / dark_scale, 0, 1)
-    base   = dg_n * dark_n
+    # ── Absolute luma gate: pixels brighter than abs_luma_max cannot be shadows ─
+    luma_penalty = np.clip((_SM_ABS_LUMA_MAX - gray) / 20.0, 0.0, 1.0)
 
-    # ── Sigmoid threshold ──────────────────────────────────────────────────────
-    if otsu_ctr is None:
-        if mask.sum() > 100:
-            m_u8 = (base * 255).astype(np.uint8)
-            thresh, _ = cv2.threshold(m_u8[mask], 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            # Squash noise tiles whose signal is inherently very weak
-            otsu_ctr = 0.5 if base.max() < 0.2 else float(np.clip(thresh / 255.0, 0.15, 0.70))
-        else:
-            otsu_ctr = 0.5
+    # ── Lateral edge penalty: suppress edges running parallel to shadow dir ─────
+    ang = np.radians(shadow_angle_deg)
+    sun_dx, sun_dy = np.sin(ang), -np.cos(ang)
+    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    grad_sun  = cv2.GaussianBlur(np.abs(gx * sun_dx  + gy * sun_dy),  (5, 5), 2)
+    grad_perp = cv2.GaussianBlur(np.abs(gx * (-sun_dy) + gy * sun_dx), (5, 5), 2)
+    lateral_penalty = np.clip(1.5 - (grad_perp / (grad_sun + 1e-3)) * 0.5, 0.0, 1.0)
 
-    sig = 1.0 / (1.0 + np.exp(-_SM_K * (base - otsu_ctr)))
-    # Expand dynamic range only if the signal was meaningfully strong
-    if sig.max() > 0.5:
-        sig = (sig - sig.min()) / (sig.max() - sig.min() + 1e-6)
-    else:
-        sig = sig - sig.min()
+    # ── Normalise and combine ──────────────────────────────────────────────────
+    norm_dg = max(float(dg_scale), 1.0) if dg_scale is not None else max(float(dg.max()), 30.0)
+    dg_n    = np.clip(dg / norm_dg, 0.0, 1.0)
+    base    = dg_n * luma_penalty * lateral_penalty
 
-    result = sig.astype(np.float32) * valid
-    if result.max() > 0.5:
-        result = result / result.max()
-    return result
+    if base.max() <= 0:
+        return np.zeros(img_rgb.shape[:2], dtype=np.float32)
 
-
-    """
-    Generate a shadow probability map for a tile.
-
-    Uses a directional asymmetry (DirGrad) × local darkness formulation:
-      - DirGrad: for each pixel, accumulate max(0, brightness_toward_anti_shadow
-                                                  - brightness_toward_shadow)
-                 over offset distances d = 8..35 px (Gaussian weighted).
-                 This fires where one side of a pixel, along the shadow axis,
-                 is distinctly brighter than the other — the shadow/ground boundary.
-      - Darkness: how much darker each pixel is than its 30-px-sigma local mean,
-                  normalised to the 95th percentile so contrast is image-relative.
-      - Product: DirGrad × darkness → high only where the pixel is both genuinely
-                 dark AND sits at a directionally asymmetric boundary.
-      - Otsu sigmoid (k=12): sharpens the map using the image's own bimodal
-                 histogram split as the sigmoid centre.
-      - Boundary mask (+3px erode): zeros out black rotation corners
-                 and the 1-2px warpAffine interpolation bleed.
-
-    Args:
-        img_rgb:          H×W×3 uint8 numpy array (RGB order)
-        shadow_angle_deg: Sun azimuth in degrees (0=North, 90=East, CW convention).
-                          Shadows point in direction (180 + azimuth) mod 360 from the tree.
-
-    Returns:
-        shadow_map: H×W float32 array in [0, 1]
-    """
-    D_MIN, D_MAX = 8, 35
-
-    # Convert to grayscale float
-    gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY).astype(np.float32)
-    h, w = gray.shape
-
-    # Shadow vector: shadow points FROM tree IN this direction
-    # Convention: azimuth 0=North CW, image y increases downward
-    ang_rad = np.radians(shadow_angle_deg)
-    sx =  np.sin(ang_rad)   # shadow x-component (image right)
-    sy = -np.cos(ang_rad)   # shadow y-component (image down, so negate cos)
-    # Anti-shadow direction (toward crown)
-    adx, ady = -sx, -sy
-    # Shadow direction (beyond shadow tip)
-    sdx, sdy =  sx,  sy
-
-    # ── 1. Directional gradient ────────────────────────────────────────────
-    ds  = np.arange(D_MIN, D_MAX + 1, 3).astype(np.float32)
-    d_c = (D_MIN + D_MAX) / 2.0
-    wts = np.exp(-0.5 * ((ds - d_c) / 8.0) ** 2)
-    wts /= wts.sum()
-
-    valid = ((gray > 15) & (gray < 250)).astype(np.uint8)
-    k3    = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-    valid_eroded = cv2.erode(valid, k3).astype(np.float32)
-
-    dg = np.zeros((h, w), dtype=np.float32)
-    for d, wt in zip(ds, wts):
-        Ma = np.float32([[1, 0, int(round(d * adx))], [0, 1, int(round(d * ady))]])
-        Ms = np.float32([[1, 0, int(round(d * sdx))], [0, 1, int(round(d * sdy))]])
-        anti = cv2.warpAffine(gray, Ma, (w, h), borderMode=cv2.BORDER_REFLECT)
-        shad = cv2.warpAffine(gray, Ms, (w, h), borderMode=cv2.BORDER_REFLECT)
-        diff = (anti - shad).astype(np.float32)
-        dg  += wt * np.clip(diff, 0, None)
-    
-    dg = cv2.GaussianBlur(dg, (0, 0), sigmaX=4)
-    dg = dg * valid_eroded
-    # Minimum scale factor prevents amplifying small random noise on bare ground
-    dg /= max(float(dg.max()), 30.0)
-
-    # ── 2. Percentile-normalised darkness ──────────────────────────────────
-    lm   = cv2.GaussianBlur(gray, (0, 0), sigmaX=30)
-    dark = np.clip(lm - gray, 0, None).astype(np.float32)
-    dark = dark * valid_eroded
-    dark_p95 = float(np.percentile(dark[valid_eroded > 0], 95)) if valid_eroded.sum() > 0 else 10.0
-    dark /= max(dark_p95, 10.0)
-    dark  = np.clip(dark, 0, 1)
-
-    # ── 3. Product ─────────────────────────────────────────────────────────
-    base = dg * dark
-    # (Removed base /= base.max() here to preserve absolute weakness of noise)
-
-    # ── 4. Otsu sigmoid (image-adaptive threshold) ─────────────────────────
-    if valid_eroded.sum() > 100:
-        m_u8 = (base * 255).astype(np.uint8)
-        thresh, _ = cv2.threshold(m_u8[valid_eroded > 0], 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        
-        # If the highest shadow signal is very weak, force a high center 
-        # so the sigmoid squashes it, preventing Otsu from splitting random noise in half
-        if base.max() < 0.2:
-            ctr = 0.5
-        else:
-            ctr = float(np.clip(thresh / 255.0, 0.15, 0.70))
-    else:
-        ctr = 0.5
-
-    k   = 12.0
-    sig = 1.0 / (1.0 + np.exp(-k * (base - ctr)))
-    
-    # Only expand to [0,1] if the signal was reasonably strong
-    if sig.max() > 0.5:
-        sig = (sig - sig.min()) / (sig.max() - sig.min() + 1e-6)
-    else:
-        sig = sig - sig.min()
-    sig = sig.astype(np.float32)
-
-    # ── 5. Boundary mask ───────────────────────────────────────────────────
-    result = sig * valid_eroded
-    if result.max() > 0.5:
-        result = result / result.max()
-        
-    return result.astype(np.float32)
-
+    # ── Sigmoid + activation floor ─────────────────────────────────────────────
+    ctr = float(otsu_ctr) if otsu_ctr is not None else _SM_OTSU_CTR
+    sig = 1.0 / (1.0 + np.exp(-_SM_SIGMOID_K * (base - ctr)))
+    sig[sig < _SM_ACT_FLOOR] = 0.0
+    sig = _sm_remove_speckle(sig * valid, min_area=_SM_SPECKLE_MIN, threshold=_SM_ACT_FLOOR)
+    return sig.astype(np.float32)
 
 def is_australia(x):
     return -44 <= x["lat"] <= -10 and 112 <= x["lon"] <= 154
