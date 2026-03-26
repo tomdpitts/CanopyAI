@@ -460,7 +460,7 @@ def detect_trees_deepforest(
 
             # Check for legacy FiLM specific keys or SCA
             has_film_blocks = any("film_blocks" in k for k in keys)
-            use_sca = any("shadow_encoder" in k or "shadow_cross_attn" in k for k in keys)
+            use_sca = any("shadow_anticipation" in k or "shadow_encoder" in k or "shadow_cross_attn" in k for k in keys)
 
             if has_film_blocks:
                 print("   ⚠️  Detected legacy FiLM-conditioned model")
@@ -630,8 +630,10 @@ def detect_trees_deepforest(
             from deepforest_custom.utils import compute_shadow_normalization_stats  # type: ignore
         shadow_norm_stats = compute_shadow_normalization_stats(image, shadow_angle)
         dg_s, dark_s, otsu_s = shadow_norm_stats
-        print(f"   📊 Global shadow norm stats: dg_scale={dg_s:.1f}  dark_scale={dark_s:.1f}  otsu_ctr={otsu_s:.3f}")
-        # Make global stats available to the SCA model's _compute_shadow_enc_batch
+        dark_s_str = f"{dark_s:.1f}" if dark_s is not None else "N/A"
+        otsu_s_str = f"{otsu_s:.3f}" if otsu_s is not None else "N/A"
+        print(f"   📊 Global shadow norm stats: dg_scale={dg_s:.1f}  dark_scale={dark_s_str}  otsu_ctr={otsu_s_str}")
+        # Make global stats available to the shadow model's _compute_shadow_map_batch
         if use_sca:
             df_model.norm_stats_lookup = {None: shadow_norm_stats}
 
@@ -771,7 +773,9 @@ def detect_trees_deepforest(
                             df_model.shadow_lookup = {None: sv_np}
                         else:
                             df_model.shadow_lookup = {}
-                        df_model._current_shadow_enc = df_model._compute_shadow_enc_batch([image_tensor[0, :3, :, :]], [None])
+                        tile_img = [image_tensor[0, :3, :, :]]
+                        df_model._current_shadow_map = df_model._compute_shadow_map_batch(tile_img, [None])
+                        df_model._current_shadow_dir = df_model._compute_shadow_dir_batch(tile_img, [None])
 
                     prediction = df_model.model(image_tensor)
 

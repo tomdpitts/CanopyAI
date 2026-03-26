@@ -48,7 +48,7 @@ _SM_D_LONG_MIN   = 35
 _SM_D_LONG_MAX   = 150
 _SM_BLUR_LONG    = 4.0
 _SM_SHORT_WEIGHT = 0.5
-_SM_ABS_LUMA_MAX = 71
+_SM_ABS_LUMA_MAX = 71    # default; WON needs higher (~140) — sandy soil shadows are brighter
 _SM_OTSU_CTR     = 0.35
 _SM_SIGMOID_K    = 12.0
 _SM_ACT_FLOOR    = 0.2
@@ -152,12 +152,41 @@ def compute_shadow_normalization_stats(
     return norm_dg, None, None
 
 
+def generate_luma_darkness_map(
+    img_rgb: np.ndarray,
+    abs_luma_max: float | None = None,
+) -> np.ndarray:
+    """
+    Direction-free darkness map for ablation study.
+
+    Produces a shadow-like map using luminance only — no shadow angle, no
+    directional gradient, no lateral edge penalty.  Used to isolate the
+    contribution of the shadow vector: compare this (no direction) against
+    generate_shadow_map (with direction) to quantify how much the explicit
+    shadow angle adds beyond simple darkness detection.
+
+    Returns H×W float32 in [0, 1]: 1 = dark (likely shadow), 0 = bright.
+    """
+    import cv2 as _cv2
+    gray  = _cv2.cvtColor(img_rgb.astype(np.uint8), _cv2.COLOR_RGB2GRAY).astype(np.float32)
+    valid = _sm_valid_mask(gray)
+    _luma_max = float(abs_luma_max) if abs_luma_max is not None else 200.0
+    # Invert: dark pixels → high values, bright pixels → 0
+    dark = np.clip((_luma_max - gray) / _luma_max, 0.0, 1.0)
+    # Remove speckle to suppress isolated noise pixels
+    dark = _sm_remove_speckle(dark * valid, min_area=_SM_SPECKLE_MIN, threshold=0.1)
+    return dark.astype(np.float32)
+
+
 def generate_shadow_map(
     img_rgb: np.ndarray,
     shadow_angle_deg: float,
-    dg_scale: float | None = None,    # norm_dg from compute_shadow_normalization_stats()
-    dark_scale: float | None = None,  # unused — kept for API compatibility
-    otsu_ctr: float | None = None,    # if None uses Slot 2 default (0.35)
+    dg_scale: float | None = None,       # norm_dg from compute_shadow_normalization_stats()
+    dark_scale: float | None = None,     # unused — kept for API compatibility
+    otsu_ctr: float | None = None,       # sigmoid centre; None → _SM_OTSU_CTR (0.35)
+    abs_luma_max: float | None = None,   # luma ceiling; None → _SM_ABS_LUMA_MAX (71)
+    act_floor: float | None = None,      # activation floor; None → _SM_ACT_FLOOR (0.2)
+    speckle_min: int | None = None,      # min shadow blob area; None → _SM_SPECKLE_MIN (150)
 ) -> np.ndarray:
     """
     Generate a shadow probability map using the Slot 2 algorithm.
@@ -185,7 +214,8 @@ def generate_shadow_map(
     dg   = (_SM_SHORT_WEIGHT * dg_s + (1.0 - _SM_SHORT_WEIGHT) * dg_l) * valid
 
     # ── Absolute luma gate: pixels brighter than abs_luma_max cannot be shadows ─
-    luma_penalty = np.clip((_SM_ABS_LUMA_MAX - gray) / 20.0, 0.0, 1.0)
+    _luma_max = abs_luma_max if abs_luma_max is not None else _SM_ABS_LUMA_MAX
+    luma_penalty = np.clip((_luma_max - gray) / 20.0, 0.0, 1.0)
 
     # ── Lateral edge penalty: suppress edges running parallel to shadow dir ─────
     ang = np.radians(shadow_angle_deg)
@@ -205,10 +235,12 @@ def generate_shadow_map(
         return np.zeros(img_rgb.shape[:2], dtype=np.float32)
 
     # ── Sigmoid + activation floor ─────────────────────────────────────────────
-    ctr = float(otsu_ctr) if otsu_ctr is not None else _SM_OTSU_CTR
+    ctr       = float(otsu_ctr)  if otsu_ctr   is not None else _SM_OTSU_CTR
+    _floor    = float(act_floor) if act_floor  is not None else _SM_ACT_FLOOR
+    _speckle  = int(speckle_min) if speckle_min is not None else _SM_SPECKLE_MIN
     sig = 1.0 / (1.0 + np.exp(-_SM_SIGMOID_K * (base - ctr)))
-    sig[sig < _SM_ACT_FLOOR] = 0.0
-    sig = _sm_remove_speckle(sig * valid, min_area=_SM_SPECKLE_MIN, threshold=_SM_ACT_FLOOR)
+    sig[sig < _floor] = 0.0
+    sig = _sm_remove_speckle(sig * valid, min_area=_speckle, threshold=_floor)
     return sig.astype(np.float32)
 
 def is_australia(x):

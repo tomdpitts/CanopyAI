@@ -2,58 +2,107 @@
 Modal deployment for DeepForest fine-tuning
 ============================================
 
-## Phase 8 — Shadow Cross-Attention Ablation Study
+## Phase 14 — ShadowAnticipation + WON bbox normalisation (all stages use wrapper)
+
+Key changes from phase 11:
+  - ShadowCrossAttention (dir_scale scalar) replaced by ShadowAnticipation:
+    deterministic geometric warp that brings shadow evidence to crown positions.
+    For each backbone position p, warps shadow map at p + d*shadow_dir for
+    offsets d ∈ {24, 42, 67, 100, 126, 150}px. Zero-init 1×1 convs mix
+    evidence into both layer2 (H/8, 512ch) and layer3 (H/16, 1024ch).
+  - WON bbox shrink: WON annotations include the cast shadow (large boxes);
+    BRU annotations are tight to the crown. Applied 50% area shrink (×√0.5
+    per side) to WON targets in code only at train/val time — CSVs unchanged.
+  - Per-domain mAP: map_won / map_bru logged each epoch.
+
+NOTE: --shadow-cross-attention flag now activates ShadowAnticipation
+(legacy flag name kept for CLI compatibility).
+
+Training strategy — 3 stages from weecology pretrained weights:
+
+  Stage A  Full fine-tune, no shadow. Domain-adapts backbone + head to
+           BRU/WON imagery with normalised WON boxes. Best mAP = baseline.
+
+  Stage B  Load stage A. Freeze ResNet body only (FPN/head stay live).
+           Train ShadowAnticipation from zero-init. Gates start at 0.01 so
+           perturbation is tiny; gradient chain: loss → FPN → gate × conv(evidence).
+
+  Stage C  Unfreeze everything. Joint fine-tune at low LR. Backbone adapts
+           to leverage shadow context; gates continue to grow.
 
 Phase 5 training data is already in Modal storage:
-    phase5_train_aug.csv  (152 KiB)
-    phase5_val_aug.csv    (38.5 KiB)
+    phase5_train_aug.csv
+    phase5_val_aug.csv
     phase5_images.tar.gz
 
-### Run A — Baseline (no shadow)
+Checkpoint notes:
+  - Each stage saves two files:
+      deepforest-{epoch:02d}-{map:.2f}.ckpt   best Lightning checkpoint (auto-resume)
+      deepforest_final.pth                     end-of-training state dict (cross-stage handoff)
+  - Stage A saves backbone-only state dict (no ShadowAnticipation keys).
+  - Stage B/C save full ShadowConditionedDeepForest state dict.
+  - The loader in train_deepforest.py detects format automatically via has_model_prefix.
 
-    source venv310/bin/activate && cd deepforest_custom && modal run --detach modal_deepforest.py \\
-        --train-csv /data/phase5_train_aug.csv \\
-        --val-csv /data/phase5_val_aug.csv \\
-        --run-name phase8_A_baseline \\
+─────────────────────────────────────────────────────────────
+Stage A / Run A — domain adaptation from weecology weights, no shadow
+─────────────────────────────────────────────────────────────
+Clean run with WON bbox shrink applied from epoch 0. Result = baseline for ablation.
+
+    source venv310/bin/activate && \
+    modal run --detach deepforest_custom/modal_deepforest.py \
+        --train-csv /data/phase5_train_aug.csv \
+        --val-csv /data/phase5_val_aug.csv \
+        --run-name phase14_A_baseline \
         --epochs 50 --patience 10 --lr 0.001 --batch-size 16
 
-### Run B — Shadow 4th input channel
+─────────────────────────────────────────────────────────────
+Stage B — freeze ResNet body, train ShadowAnticipation only
+─────────────────────────────────────────────────────────────
+Backbone is domain-adapted → FPN features are calibrated.
+ShadowAnticipation trains from zero-init against a stable backbone.
+gates and 1×1 conv weights receive gradient signal because the frozen
+backbone cannot improve detection loss — only ShadowAnticipation can.
 
-    source venv310/bin/activate && cd deepforest_custom && modal run --detach modal_deepforest.py \\
-        --train-csv /data/phase5_train_aug.csv \\
-        --val-csv /data/phase5_val_aug.csv \\
-        --run-name phase8_B_shadow_channel \\
-        --epochs 50 --patience 10 --lr 0.001 --batch-size 16 \\
-        --shadow-channel
+    source venv310/bin/activate && \
+    modal run --detach deepforest_custom/modal_deepforest.py \
+        --train-csv /data/phase5_train_aug.csv \
+        --val-csv /data/phase5_val_aug.csv \
+        --run-name phase14_B_shadow_freeze \
+        --epochs 30 --patience 15 --lr 0.001 --batch-size 16 \
+        --shadow-cross-attention --freeze-backbone \
+        --checkpoint /checkpoints/phase14_A_baseline/deepforest_final.pth
 
-### Run C — Shadow cross-attention only (no 4th channel)
+─────────────────────────────────────────────────────────────
+Stage C / Run C — joint fine-tune, ShadowAnticipation + backbone (final)
+─────────────────────────────────────────────────────────────
+Unfreeze everything. Backbone adapts to exploit shadow evidence.
+Lower LR preserves stage B shadow weights.
 
-    source venv310/bin/activate && cd deepforest_custom && modal run --detach modal_deepforest.py \\
-        --train-csv /data/phase5_train_aug.csv \\
-        --val-csv /data/phase5_val_aug.csv \\
-        --run-name phase8_C_shadow_crossattn \\
-        --epochs 50 --patience 10 --lr 0.001 --batch-size 16 \\
-        --shadow-cross-attention
+    source venv310/bin/activate && \
+    modal run --detach deepforest_custom/modal_deepforest.py \
+        --train-csv /data/phase5_train_aug.csv \
+        --val-csv /data/phase5_val_aug.csv \
+        --run-name phase14_C_joint \
+        --epochs 30 --patience 10 --lr 0.0001 --batch-size 16 \
+        --shadow-cross-attention \
+        --checkpoint /checkpoints/phase14_B_shadow_freeze/deepforest_final.pth
 
-### Run D — Both (channel + cross-attention)
-
-    source venv310/bin/activate && cd deepforest_custom && modal run --detach modal_deepforest.py \\
-        --train-csv /data/phase5_train_aug.csv \\
-        --val-csv /data/phase5_val_aug.csv \\
-        --run-name phase8_D_full \\
-        --epochs 50 --patience 10 --lr 0.001 --batch-size 16 \\
-        --shadow-channel --shadow-cross-attention
-
-## Utility commands
+─────────────────────────────────────────────────────────────
+Utility
+─────────────────────────────────────────────────────────────
 
     modal run modal_deepforest.py::list_checkpoints
     modal run modal_deepforest.py::list_data
 
-## Download checkpoint after run
+Download final checkpoints for comparison:
 
-    modal volume get canopyai-deepforest-checkpoints \\
-        /phase8_A_baseline/deepforest_final.pth \\
-        ./phase8_A_baseline.pth
+    modal volume get canopyai-deepforest-checkpoints \
+        /phase14_A_baseline/deepforest_final.pth \
+        ./phase14_A_baseline.pth
+
+    modal volume get canopyai-deepforest-checkpoints \
+        /phase14_C_joint/deepforest_final.pth \
+        ./phase14_C_joint.pth
 """
 
 import modal
@@ -134,7 +183,8 @@ def train_deepforest_modal(
     run_name: str = "default",
     # ── Shadow mechanisms ───────────────────────────────────────
     shadow_channel: bool = False,         # Run B/D: 4th input channel
-    shadow_cross_attention: bool = False,  # Run C/D: cross-attn after layer4
+    shadow_cross_attention: bool = False,  # Run C/D: cross-attn after layer3 (H/16) with dir_scale
+    shadow_luma_only: bool = False,        # Ablation E: luma darkness map (no shadow vector)
     shadow_angle_deg: float = None,
     # ── Misc ───────────────────────────────────────────────────
     wandb_project: str = None,
@@ -461,7 +511,9 @@ def train_deepforest_modal(
         checkpoint=checkpoint,
         accelerator="gpu",
         freeze_backbone=freeze_backbone,
+        won_bbox_shrink=True,   # always on — ensures stage A/B/C use identical WON annotation scheme
         shadow_channel=shadow_channel,
+        shadow_luma_only=shadow_luma_only,
         shadow_cross_attention=shadow_cross_attention,
     )
 

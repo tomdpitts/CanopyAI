@@ -207,6 +207,8 @@ def train_deepforest(
     freeze_backbone=False,
     shadow_channel=False,        # Run B/D: shadow as 4th input channel
     shadow_cross_attention=False, # Run C/D: shadow cross-attention after layer4
+    shadow_luma_only=False,       # Ablation: replace directional shadow map with luma darkness map
+    won_bbox_shrink=True,         # Always apply WON bbox normalisation for consistent evaluation
 ):
     """
     Train a DeepForest model using DeepForest 2.0 config-based API.
@@ -244,8 +246,13 @@ def train_deepforest(
 
     # ── Model initialisation ──────────────────────────────────────────────
     use_shadow = shadow_channel or shadow_cross_attention
+    # Always use ShadowConditionedDeepForest when won_bbox_shrink=True so that
+    # _maybe_shrink_won_targets is applied consistently across all stages (A/B/C).
+    # Using plain deepforest for stage A would train on large WON boxes, then
+    # stage B would evaluate against shrunk boxes → mAP collapse at stage B start.
+    use_wrapper = use_shadow or won_bbox_shrink
 
-    if use_shadow:
+    if use_wrapper:
         # Auto-derive base shadow angle from CSV if not explicitly provided
         if shadow_angle_deg is None:
             _df = pd.read_csv(train_csv)
@@ -255,7 +262,7 @@ def train_deepforest(
             else:
                 shadow_angle_deg = 215.0
                 print(f"   Shadow angle defaulted to {shadow_angle_deg} deg (no shadow_angle column)")
-        print(f"   shadow_channel={shadow_channel}  shadow_cross_attention={shadow_cross_attention}")
+        print(f"   shadow_channel={shadow_channel}  shadow_cross_attention={shadow_cross_attention}  won_bbox_shrink={won_bbox_shrink}")
         model = ShadowConditionedDeepForest(
             shadow_angle_deg=shadow_angle_deg,
             train_csv=train_csv,
@@ -263,9 +270,10 @@ def train_deepforest(
             freeze_backbone=freeze_backbone,
             shadow_channel=shadow_channel,
             shadow_cross_attention=shadow_cross_attention,
+            shadow_luma_only=shadow_luma_only,
         )
     else:
-        print("   Shadow: DISABLED (baseline)")
+        print("   Shadow: DISABLED, WON shrink: DISABLED (raw baseline)")
         model = deepforest_main.deepforest()
 
     # Load weights
@@ -277,6 +285,13 @@ def train_deepforest(
             state_dict = torch.load(checkpoint, map_location="cpu")
             ck_keys    = list(state_dict.keys())
             has_model_prefix = any(k.startswith("model.") for k in ck_keys)
+
+            # If the checkpoint has a 4-channel conv1, widen the model BEFORE loading
+            # so the shapes match (strict=False skips missing/extra keys but not size mismatches).
+            _conv1_key = "model.backbone.body.conv1.weight"
+            if shadow_channel and _conv1_key in state_dict and state_dict[_conv1_key].shape[1] == 4:
+                print("   Checkpoint has 4-ch conv1 — widening model before loading...")
+                widen_first_conv_for_shadow_channel(model)
 
             if has_model_prefix and use_shadow:
                 # Full ShadowConditionedDeepForest state dict
@@ -308,10 +323,15 @@ def train_deepforest(
             traceback.print_exc()
             raise RuntimeError("Cannot continue without pretrained weights") from e
 
-    # Widen first conv to 4 channels AFTER weights are loaded (shadow_channel mode)
+    # Widen first conv to 4 channels AFTER weights are loaded (shadow_channel mode).
+    # Skip if already widened (e.g. when loading a 4-ch checkpoint above).
     if shadow_channel:
-        print("\n🔑 Shadow channel mode: widening first conv to 4 channels...")
-        widen_first_conv_for_shadow_channel(model)
+        _inner = model.model if hasattr(model, "model") else model
+        if _inner.backbone.body.conv1.weight.shape[1] != 4:
+            print("\n🔑 Shadow channel mode: widening first conv to 4 channels...")
+            widen_first_conv_for_shadow_channel(model)
+        else:
+            print("\n🔑 Shadow channel mode: conv1 already 4-channel (loaded from checkpoint)")
 
     # Auto-detect and resume from checkpoint if it exists
     # This handles Modal auto-restarts gracefully
@@ -357,13 +377,13 @@ def train_deepforest(
     model.config.train.lr = lr
     model.config.batch_size = batch_size
 
-    # Disable default augmentations when any shadow mode is active
-    # (to avoid shadow vector misalignment when images are flipped/rotated)
-    if use_shadow:
+    # Disable default augmentations when using the wrapper (shadow modes or WON shrink).
+    # Flips/rotations would misalign the shadow vector stored in the CSV.
+    if use_wrapper:
         model.config.train.augmentations = []
-        print("   🔄 Default augmentations disabled (shadow modes active)")
+        print("   🔄 Default augmentations disabled (wrapper model active)")
     else:
-        print("   🔄 Default augmentations: active (baseline mode)")
+        print("   🔄 Default augmentations: active (raw baseline mode)")
 
     if val_csv:
         model.config.validation.csv_file = val_csv
@@ -472,7 +492,7 @@ def train_deepforest(
     final_model_path = Path(run_output_dir) / "deepforest_final.pth"
     print(f"💾 Saved final model to {final_model_path}")
 
-    if use_shadow:
+    if use_wrapper:
         torch.save(model.state_dict(), str(final_model_path))
     else:
         torch.save(model.model.state_dict(), str(final_model_path))
