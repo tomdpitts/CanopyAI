@@ -185,6 +185,7 @@ def train_deepforest_modal(
     shadow_channel: bool = False,         # Run B/D: 4th input channel
     shadow_cross_attention: bool = False,  # Run C/D: cross-attn after layer3 (H/16) with dir_scale
     shadow_luma_only: bool = False,        # Ablation E: luma darkness map (no shadow vector)
+    shadow_input_only: bool = False,       # Ablation F: replace RGB entirely with shadow map
     shadow_angle_deg: float = None,
     # ── Misc ───────────────────────────────────────────────────
     wandb_project: str = None,
@@ -514,6 +515,7 @@ def train_deepforest_modal(
         won_bbox_shrink=True,   # always on — ensures stage A/B/C use identical WON annotation scheme
         shadow_channel=shadow_channel,
         shadow_luma_only=shadow_luma_only,
+        shadow_input_only=shadow_input_only,
         shadow_cross_attention=shadow_cross_attention,
     )
 
@@ -549,6 +551,8 @@ def main(
     # ── Shadow mechanisms ───────────────────────────────────────
     shadow_channel: bool = False,
     shadow_cross_attention: bool = False,
+    shadow_luma_only: bool = False,
+    shadow_input_only: bool = False,
     shadow_angle_deg: float = None,
     # ── Misc ───────────────────────────────────────────────────
     wandb_project: str = None,
@@ -630,6 +634,8 @@ Phase 5 training data is already in Modal storage:
         run_name=run_name,
         shadow_channel=shadow_channel,
         shadow_cross_attention=shadow_cross_attention,
+        shadow_luma_only=shadow_luma_only,
+        shadow_input_only=shadow_input_only,
         shadow_angle_deg=shadow_angle_deg,
         wandb_project=wandb_project,
         checkpoint=checkpoint,

@@ -161,12 +161,14 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
         shadow_channel=False,
         shadow_cross_attention=False,
         shadow_luma_only=False,   # ablation: replace directional shadow map with luma darkness map
+        shadow_input_only=False,  # ablation F: replace RGB entirely with shadow map (tiled ×3)
         config=None,
         **kwargs,
     ):
         self.shadow_channel = shadow_channel
         self.shadow_cross_attention = shadow_cross_attention
         self.shadow_luma_only = shadow_luma_only
+        self.shadow_input_only = shadow_input_only
 
         # Initialize DeepForest (LightningModule)
         deepforest_main.deepforest.__init__(self, config=config, **kwargs)
@@ -338,6 +340,26 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
                 shadow_t = self._compute_shadow_map(img_t, sv, norm_stats=norm_stats, domain=domain)
                 shadow_t = shadow_t.to(img_t.device, dtype=img_t.dtype)
             result.append(torch.cat([img_t, shadow_t], dim=0))  # [4, H, W]
+        return result
+
+    def _replace_with_shadow_input(self, images, image_paths):
+        """
+        Ablation F: discard RGB entirely, replace each image with the shadow map
+        tiled 3× across channels.  Input to backbone is still (3, H, W) so no
+        architecture change is needed.
+        """
+        result = []
+        for img_t, path in zip(images, image_paths):
+            sv = self.shadow_lookup.get(path)
+            if sv is None:
+                shadow_t = torch.zeros(1, img_t.shape[1], img_t.shape[2],
+                                       dtype=img_t.dtype, device=img_t.device)
+            else:
+                norm_stats = self.norm_stats_lookup.get(path) or self.norm_stats_lookup.get(None)
+                domain = self.domain_lookup.get(path)
+                shadow_t = self._compute_shadow_map(img_t, sv, norm_stats=norm_stats, domain=domain)
+                shadow_t = shadow_t.to(img_t.device, dtype=img_t.dtype)
+            result.append(shadow_t.repeat(3, 1, 1))  # [3, H, W]
         return result
 
     def _compute_shadow_dir_batch(self, images, image_paths):
@@ -546,8 +568,10 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
             self._current_shadow_map = None
             self._current_shadow_dir = None
 
-        # Prepend shadow as 4th input channel if enabled
-        if self.shadow_channel:
+        # Replace RGB with shadow map (ablation F) or prepend as 4th channel
+        if self.shadow_input_only:
+            images = self._replace_with_shadow_input(images, image_paths)
+        elif self.shadow_channel:
             images = self._prepend_shadow_channel(images, image_paths)
 
         batch = (images, targets, *batch[2:])
@@ -568,7 +592,9 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
             self._current_shadow_map = None
             self._current_shadow_dir = None
 
-        if self.shadow_channel:
+        if self.shadow_input_only:
+            images = self._replace_with_shadow_input(images, image_paths)
+        elif self.shadow_channel:
             images = self._prepend_shadow_channel(images, image_paths)
 
         batch  = (images, targets, *batch[2:])

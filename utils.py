@@ -155,27 +155,60 @@ def compute_shadow_normalization_stats(
 def generate_luma_darkness_map(
     img_rgb: np.ndarray,
     abs_luma_max: float | None = None,
+    dg_scale: float | None = None,
+    otsu_ctr: float | None = None,
+    act_floor: float | None = None,
+    speckle_min: int | None = None,
 ) -> np.ndarray:
     """
-    Direction-free darkness map for ablation study.
+    Isotropic (direction-free) shadow map for ablation study.
 
-    Produces a shadow-like map using luminance only — no shadow angle, no
-    directional gradient, no lateral edge penalty.  Used to isolate the
-    contribution of the shadow vector: compare this (no direction) against
-    generate_shadow_map (with direction) to quantify how much the explicit
-    shadow angle adds beyond simple darkness detection.
+    Identical pipeline to generate_shadow_map — same luma_penalty, sigmoid,
+    activation floor, and speckle removal — but the directional gradient is
+    averaged over 8 equally-spaced angles rather than computed for a single
+    sun direction.  The lateral edge penalty is omitted (it is inherently
+    directional).
 
-    Returns H×W float32 in [0, 1]: 1 = dark (likely shadow), 0 = bright.
+    This makes the comparison apples-to-apples: the only difference between
+    this map and generate_shadow_map is the presence or absence of the shadow
+    direction vector.
+
+    Returns H×W float32 in [0, 1].
     """
-    import cv2 as _cv2
-    gray  = _cv2.cvtColor(img_rgb.astype(np.uint8), _cv2.COLOR_RGB2GRAY).astype(np.float32)
+    gray  = cv2.cvtColor(img_rgb.astype(np.uint8), cv2.COLOR_RGB2GRAY).astype(np.float32)
     valid = _sm_valid_mask(gray)
-    _luma_max = float(abs_luma_max) if abs_luma_max is not None else 200.0
-    # Invert: dark pixels → high values, bright pixels → 0
-    dark = np.clip((_luma_max - gray) / _luma_max, 0.0, 1.0)
-    # Remove speckle to suppress isolated noise pixels
-    dark = _sm_remove_speckle(dark * valid, min_area=_SM_SPECKLE_MIN, threshold=0.1)
-    return dark.astype(np.float32)
+
+    # Average directional gradient over 8 evenly-spaced angles → isotropic
+    dg_sum = np.zeros_like(gray)
+    for a in np.linspace(0, 360, 8, endpoint=False):
+        adx, ady, sdx, sdy = _sm_vectors(a)
+        dg_s = _sm_dg(gray, valid, adx, ady, sdx, sdy,
+                      _SM_D_SHORT_MIN, _SM_D_SHORT_MAX, 8,  _SM_BLUR_SHORT)
+        dg_l = _sm_dg(gray, valid, adx, ady, sdx, sdy,
+                      _SM_D_LONG_MIN,  _SM_D_LONG_MAX,  12, _SM_BLUR_LONG)
+        dg_sum += (_SM_SHORT_WEIGHT * dg_s + (1.0 - _SM_SHORT_WEIGHT) * dg_l) * valid
+    dg = dg_sum / 8.0
+
+    # Same luma gate as generate_shadow_map (no lateral penalty — direction-dependent)
+    _luma_max = abs_luma_max if abs_luma_max is not None else _SM_ABS_LUMA_MAX
+    luma_penalty = np.clip((_luma_max - gray) / 20.0, 0.0, 1.0)
+
+    # Same normalisation
+    norm_dg = max(float(dg_scale), 1.0) if dg_scale is not None else max(float(dg.max()), 30.0)
+    dg_n    = np.clip(dg / norm_dg, 0.0, 1.0)
+    base    = dg_n * luma_penalty
+
+    if base.max() <= 0:
+        return np.zeros(img_rgb.shape[:2], dtype=np.float32)
+
+    # Same sigmoid + activation floor + speckle removal
+    ctr      = float(otsu_ctr)   if otsu_ctr   is not None else _SM_OTSU_CTR
+    _floor   = float(act_floor)  if act_floor  is not None else _SM_ACT_FLOOR
+    _speckle = int(speckle_min)  if speckle_min is not None else _SM_SPECKLE_MIN
+    sig = 1.0 / (1.0 + np.exp(-_SM_SIGMOID_K * (base - ctr)))
+    sig[sig < _floor] = 0.0
+    sig = _sm_remove_speckle(sig * valid, min_area=_speckle, threshold=_floor)
+    return sig.astype(np.float32)
 
 
 def generate_shadow_map(
@@ -374,7 +407,7 @@ def is_rangeland(x):
     return x["biome_name"] in arid_rangeland
 
 
-def download_tcd_tiles_streaming(save_dir: Path, max_images: int = 3):
+def download_tcd_tiles_streaming(save_dir: Path, max_images: int = 3, start_index: int = 0, skip_existing: bool = True):
     """
     Download up to `max_images` TCD tiles (filtered by is_rangeland),
     save each as a GeoTIFF plus a sidecar *_meta.json file containing
@@ -399,20 +432,33 @@ def download_tcd_tiles_streaming(save_dir: Path, max_images: int = 3):
 
     save_dir.mkdir(parents=True, exist_ok=True)
 
-    count = 0
+    stream_idx = 0   # position in the rangeland-filtered stream
+    saved = 0        # number of new tiles saved this run
 
     for image_info in ds:
         if not is_rangeland(image_info):
             continue
 
-        if count >= max_images:
+        tile_idx = stream_idx
+        stream_idx += 1
+
+        if tile_idx < start_index:
+            continue
+
+        if saved >= max_images:
             break
 
-        image_id = image_info["image_id"]
-        print(f"📸 Downloading Rangeland tile {count}: {image_id}")
+        img_path_check  = save_dir / f"tcd_tile_{tile_idx}.tif"
+        meta_path_check = save_dir / f"tcd_tile_{tile_idx}_meta.json"
+        if skip_existing and img_path_check.exists() and meta_path_check.exists():
+            print(f"  ⏭️  tcd_tile_{tile_idx} already exists, skipping")
+            continue
 
-        img_path = save_dir / f"tcd_tile_{count}.tif"
-        meta_path = save_dir / f"tcd_tile_{count}_meta.json"
+        image_id = image_info["image_id"]
+        print(f"📸 Downloading Rangeland tile {tile_idx}: {image_id}")
+
+        img_path  = save_dir / f"tcd_tile_{tile_idx}.tif"
+        meta_path = save_dir / f"tcd_tile_{tile_idx}_meta.json"
 
         # ------------------
         # Decode image manually to avoid Pillow TIFF/JPEG issues
@@ -487,9 +533,9 @@ def download_tcd_tiles_streaming(save_dir: Path, max_images: int = 3):
         print(f"✅ Saved tile → {img_path}")
         print(f"📄 Saved metadata → {meta_path}")
 
-        count += 1
+        saved += 1
 
-    print(f"🎯 Finished downloading {count} TCD tiles.")
+    print(f"🎯 Finished downloading {saved} new TCD tiles.")
 
 
 def has_geodata(tif_path: str | Path) -> bool:
@@ -1059,7 +1105,17 @@ def load_tcd_meta_for_tile(tile_path: Path):
 
     try:
         with open(meta_path, "r") as f:
-            return json.load(f)
+            meta = json.load(f)
+        # Backfill width/height from the TIF if the metadata predates that field
+        if "width" not in meta or "height" not in meta:
+            try:
+                import rasterio as _rio
+                with _rio.open(tile_path) as src:
+                    meta["width"] = src.width
+                    meta["height"] = src.height
+            except Exception:
+                pass
+        return meta
     except Exception as e:
         print(f"⚠️ Failed to load metadata {meta_path}: {e}")
         return {"image_id": "unknown", "biome_name": "Unknown", "coco_annotations": []}

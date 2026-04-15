@@ -113,9 +113,11 @@ def main():
         model_path = Path("230103_randresize_full.pth")
 
     # === 1. Define key paths ===
-    home = Path.home()
-    site_name = "tcd"
-    site_path = home / "dphil" / "canopyAI" / "data" / site_name
+    if args.output_root:
+        site_path = Path(args.output_root)
+    else:
+        home = Path.home()
+        site_path = home / "dphil" / "canopyAI" / "data" / "tcd"
     raw_dir = site_path / "raw"
 
     # === 2. Create output/working directories ===
@@ -164,6 +166,10 @@ def main():
         raw_dir = img_path.parent
         files_to_process = [img_path]
         print(f"\n🎯 Processing single image: {img_path}")
+    elif args.test_data_dir:
+        raw_dir = Path(args.test_data_dir)
+        print(f"\n🧪 Using TEST data from {raw_dir}/")
+        files_to_process = sorted(raw_dir.glob("tcd_tile_*.tif"))
     elif args.use_test_data:
         raw_dir = Path("data/tcd/raw_test")
         print("\n🧪 Using TEST data from data/tcd/raw_test/")
@@ -228,7 +234,7 @@ def main():
         # 6. Run Detectron2 inference on chips
         # ------------------------------------------------------------
         print("\n🔮 Running model inference on tiled chips ...")
-        predict_on_data(chip_dir, predictor=predictor, save=True)
+        predict_on_data(chip_dir, out_folder=chip_dir / "predictions", predictor=predictor, save=True)
         print("✅ Inference complete.")
 
         # ------------------------------------------------------------
@@ -362,9 +368,9 @@ def parse_args():
     ap.add_argument(
         "--weights",
         type=str,
-        default="baseline",
-        choices=["baseline", "finetuned"],
-        help="Which model weights to use: baseline or finetuned",
+        default="detectree2",
+        choices=["detectree2", "finetuned"],
+        help="Which model weights to use: detectree2 (pretrained baseline) or finetuned",
     )
     ap.add_argument(
         "--use_test_data",
@@ -387,6 +393,19 @@ def parse_args():
         type=str,
         default=None,
         help="Path to a single image file to run inference on (overrides --use_test_data)",
+    )
+    ap.add_argument(
+        "--test_data_dir",
+        type=str,
+        default=None,
+        help="Directory containing tcd_tile_*.tif files to benchmark (overrides --use_test_data)",
+    )
+    ap.add_argument(
+        "--output_root",
+        type=str,
+        default=None,
+        help="Root directory for all outputs (tiles_pred/, overlays_validation/). "
+             "Defaults to ~/dphil/canopyAI/data/tcd/",
     )
 
     return ap.parse_args()

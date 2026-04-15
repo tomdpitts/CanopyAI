@@ -208,6 +208,7 @@ def train_deepforest(
     shadow_channel=False,        # Run B/D: shadow as 4th input channel
     shadow_cross_attention=False, # Run C/D: shadow cross-attention after layer4
     shadow_luma_only=False,       # Ablation: replace directional shadow map with luma darkness map
+    shadow_input_only=False,      # Ablation F: replace RGB entirely with shadow map (tiled ×3)
     won_bbox_shrink=True,         # Always apply WON bbox normalisation for consistent evaluation
 ):
     """
@@ -271,6 +272,7 @@ def train_deepforest(
             shadow_channel=shadow_channel,
             shadow_cross_attention=shadow_cross_attention,
             shadow_luma_only=shadow_luma_only,
+            shadow_input_only=shadow_input_only,
         )
     else:
         print("   Shadow: DISABLED, WON shrink: DISABLED (raw baseline)")

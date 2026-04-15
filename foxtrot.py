@@ -412,6 +412,8 @@ def detect_trees_deepforest(
     debug_tile_dir=None,
     shadow_map_path=None,      # If set, write full-image shadow map as GeoTIFF here
     geo_meta=None,             # (crs, transform) tuple for shadow map GeoTIFF
+    shadow_input_only=False,   # Ablation F: replace RGB with shadow map × 3 channels
+    abs_luma_max=None,         # Shadow map luma ceiling; None → default (71)
 ):
     """
     Pass 1: Run DeepForest detection on 400px tiles.
@@ -464,14 +466,18 @@ def detect_trees_deepforest(
 
             if has_film_blocks:
                 print("   ⚠️  Detected legacy FiLM-conditioned model")
-                
+
             # Detect shadow_channel by inspecting the saved conv1 weight shape directly.
             saved_conv1 = state_dict.get("model.backbone.body.conv1.weight", state_dict.get("backbone.body.conv1.weight"))
             use_shadow_channel = (saved_conv1 is not None and saved_conv1.shape[1] == 4)
 
-            use_film = use_shadow_channel or use_sca or has_film_blocks
+            # shadow_input_only (ablation F) has a standard 3-channel conv1 — can't be
+            # auto-detected from keys; caller must pass shadow_input_only=True explicitly.
+            use_film = use_shadow_channel or use_sca or has_film_blocks or shadow_input_only
 
-            if use_shadow_channel and use_sca:
+            if shadow_input_only:
+                print("   ✨ Shadow-input-only model (ablation F: RGB replaced by shadow × 3)")
+            elif use_shadow_channel and use_sca:
                 print("   ✨ Detected ShadowChannel + ShadowCrossAttention model")
             elif use_shadow_channel:
                 print("   ✨ Detected ShadowChannel model")
@@ -510,7 +516,8 @@ def detect_trees_deepforest(
         df_model = ShadowConditionedDeepForest(
             shadow_angle_deg=0.0,
             shadow_channel=use_shadow_channel,
-            shadow_cross_attention=use_sca
+            shadow_cross_attention=use_sca,
+            shadow_input_only=shadow_input_only
         )
 
         # Load weights
@@ -575,6 +582,8 @@ def detect_trees_deepforest(
     else:
         print("   🌲 Using Standard DeepForest")
         df_model = deepforest_main.deepforest()
+        shadow_angle = None
+        shadow_norm_stats = None
 
         if model_path and Path(model_path).exists():
             print(f"   Loading custom weights: {model_path}")
@@ -637,11 +646,20 @@ def detect_trees_deepforest(
         if use_sca:
             df_model.norm_stats_lookup = {None: shadow_norm_stats}
 
-    # Process tiles
-    y_starts = range(0, h, stride) if h > tile_size else [0]
-    x_starts = range(0, w, stride) if w > tile_size else [0]
+    # Process tiles — ensure full coverage by clamping a final tile to the image edge
+    # if the strided range leaves a gap smaller than tile_size at the boundary.
+    def _make_starts(dim):
+        starts = list(range(0, dim, stride)) if dim > tile_size else [0]
+        if dim > tile_size:
+            clamped = dim - tile_size
+            if clamped not in starts:
+                starts.append(clamped)
+        return sorted(starts)
 
-    for y_start in tqdm(list(y_starts), desc="   DF tiles"):
+    y_starts = _make_starts(h)
+    x_starts = _make_starts(w)
+
+    for y_start in tqdm(y_starts, desc="   DF tiles"):
         for x_start in x_starts:
             y_end = min(y_start + tile_size, h)
             x_end = min(x_start + tile_size, w)
@@ -660,10 +678,10 @@ def detect_trees_deepforest(
                 # Prepare input tensor
                 image_tensor = torch.tensor(tile).permute(2, 0, 1).float() / 255.0
 
-                # Prepend shadow map as 4th channel if model was trained with it.
-                # Bug 3 fix: always append the 4th channel when use_shadow_channel is True,
-                # using a zero map as a safe fallback if no shadow angle is available.
-                if use_shadow_channel:
+                # Ablation F: replace RGB entirely with shadow map × 3 channels.
+                # Isolated from all other shadow logic — shadow_input_only and
+                # use_shadow_channel are mutually exclusive.
+                if shadow_input_only:
                     try:
                         from utils import generate_shadow_map
                     except ImportError:
@@ -675,7 +693,36 @@ def detect_trees_deepforest(
                         shadow_np = generate_shadow_map(tile_u8, shadow_angle,
                                                         dg_scale=dg_s,
                                                         dark_scale=dark_s,
-                                                        otsu_ctr=otsu_s)
+                                                        otsu_ctr=otsu_s,
+                                                        abs_luma_max=abs_luma_max)
+                    else:
+                        shadow_np = np.zeros(tile.shape[:2], dtype=np.float32)
+                    shadow_t = torch.from_numpy(shadow_np).unsqueeze(0).float()
+                    image_tensor = shadow_t.repeat(3, 1, 1)  # [3, H, W], RGB discarded
+
+                    # Accumulate into full-image shadow canvas
+                    if shadow_map_path is not None:
+                        th, tw = shadow_np.shape
+                        shadow_canvas[y_start:y_start+th, x_start:x_start+tw] += shadow_np
+                        shadow_weight[y_start:y_start+th, x_start:x_start+tw] += 1.0
+
+                # Prepend shadow map as 4th channel if model was trained with it.
+                # Bug 3 fix: always append the 4th channel when use_shadow_channel is True,
+                # using a zero map as a safe fallback if no shadow angle is available.
+                elif use_shadow_channel:
+                    try:
+                        from utils import generate_shadow_map
+                    except ImportError:
+                        from deepforest_custom.utils import generate_shadow_map  # type: ignore
+
+                    tile_u8 = tile.astype(np.uint8) if tile.dtype != np.uint8 else tile
+                    if shadow_angle is not None:
+                        dg_s, dark_s, otsu_s = shadow_norm_stats
+                        shadow_np = generate_shadow_map(tile_u8, shadow_angle,
+                                                        dg_scale=dg_s,
+                                                        dark_scale=dark_s,
+                                                        otsu_ctr=otsu_s,
+                                                        abs_luma_max=abs_luma_max)
                     else:
                         # No shadow vector predicted — zero map keeps tensor shape correct
                         shadow_np = np.zeros(tile.shape[:2], dtype=np.float32)
@@ -698,7 +745,7 @@ def detect_trees_deepforest(
                 _is_content_tile = _tile_std > 5.0
                 if (
                     debug_tile_dir is not None
-                    and use_shadow_channel
+                    and (use_shadow_channel or shadow_input_only)
                     and debug_tiles_saved < 3
                     and _is_content_tile
                 ):
@@ -934,8 +981,14 @@ def segment_trees_sam(
 
     # Process tiles with overlap to prevent edge clipping
     # Overlap ensures trees near edges get full context
-    y_starts = range(0, h, stride) if h > tile_size else [0]
-    x_starts = range(0, w, stride) if w > tile_size else [0]
+    def _make_starts(dim):
+        starts = list(range(0, dim, stride)) if dim > tile_size else [0]
+        if dim > tile_size and starts[-1] + tile_size < dim:
+            starts.append(dim - tile_size)
+        return starts
+
+    y_starts = _make_starts(h)
+    x_starts = _make_starts(w)
 
     overlap_pct = tile_overlap * 100
     print(f"   Tile overlap: {overlap_pct:.0f}% (prevents edge clipping)")
@@ -1228,19 +1281,20 @@ def load_masks_from_cache(cache_files):
         cache_files: List of cache file paths
 
     Yields:
-        mask: Full-size binary mask array
+        (mask, bbox): Full-size binary mask array and its paired bbox [x1,y1,x2,y2].
+                      Bbox is read from the cache file so it is always correctly
+                      aligned with the mask (they were sorted together during NMS).
     """
     for cache_file in cache_files:
-        # Load compressed numpy arrays
         with np.load(cache_file, allow_pickle=True) as data:
-            masks = data["masks"]
+            masks  = data["masks"]
             bounds = data["bounds"]
-            for local_mask, bound in zip(masks, bounds):
-                # Reconstruct full-size mask from sparse
+            bboxes = data["bboxes"]
+            for local_mask, bound, bbox in zip(masks, bounds, bboxes):
                 y_start, y_end, x_start, x_end, h, w = bound
                 full_mask = np.zeros((h, w), dtype=bool)
                 full_mask[y_start:y_end, x_start:x_end] = local_mask
-                yield full_mask
+                yield full_mask, bbox.tolist()
 
 
 def mask_to_polygon(mask, simplify_tolerance=1.0):
@@ -1310,11 +1364,13 @@ def save_results(
     # Convert masks to GeoJSON features
     features = []
 
-    # Load masks one at a time from cache
+    # Load masks one at a time from cache.
+    # Use the bbox stored alongside each mask in the cache (guaranteed aligned),
+    # not the external bboxes parameter (which can be in a different order).
     mask_generator = load_masks_from_cache(cache_files)
 
-    for i, (bbox, score) in enumerate(zip(bboxes, deepforest_scores)):
-        mask = next(mask_generator)
+    for i, score in enumerate(deepforest_scores):
+        mask, bbox = next(mask_generator)
         polygon = mask_to_polygon(mask)
 
         if polygon is None:
@@ -1610,6 +1666,8 @@ def main(args):
             if args.save_shadow_map else None
         ),
         geo_meta=(crs, transform) if args.save_shadow_map else None,
+        shadow_input_only=args.shadow_input_only,
+        abs_luma_max=args.abs_luma_max,
     )
     timings["DeepForest"] = time.time() - df_start
 
@@ -1811,12 +1869,28 @@ def parse_args():
     )
 
     ap.add_argument(
+        "--abs_luma_max",
+        type=float,
+        default=None,
+        help="Shadow map luma ceiling: pixels brighter than this cannot be shadows. "
+        "None → default (71). Higher values (e.g. 130-150) for sandy/bright soils.",
+    )
+
+    ap.add_argument(
         "--deepforest_model",
         type=str,
         default=None,
         help="Path to custom DeepForest model (.pth file). "
         "Can be either a standard DeepForest model or a FiLM-conditioned model "
         "(auto-detected). If not provided, uses default pretrained model.",
+    )
+
+    ap.add_argument(
+        "--shadow_input_only",
+        action="store_true",
+        default=False,
+        help="Ablation F: model was trained with RGB replaced by shadow map × 3 channels. "
+        "Cannot be auto-detected from checkpoint; must be passed explicitly.",
     )
 
     ap.add_argument(
