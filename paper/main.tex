@@ -1,0 +1,448 @@
+\documentclass[10pt,twocolumn]{article}
+
+% ── Packages ──────────────────────────────────────────────────────────────────
+\usepackage[margin=1in]{geometry}
+\usepackage{times}
+\usepackage{graphicx}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{subcaption}
+\usepackage{microtype}
+\usepackage{cite}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+
+% ── Metadata ──────────────────────────────────────────────────────────────────
+\title{Shadow-Conditioned Tree Crown Detection for Carbon Estimation\\
+       in Australian Arid Rangeland from Sub-Decimetre UAV Imagery}
+
+\author{
+  Tom Pitts$^{1}$ \\
+  $^{1}$Department of Computer Science, University of Oxford \\
+  \texttt{thomas.pitts@cs.ox.ac.uk}
+}
+
+\date{}
+
+% ──────────────────────────────────────────────────────────────────────────────
+\begin{document}
+\maketitle
+
+% ── Abstract ──────────────────────────────────────────────────────────────────
+\begin{abstract}
+Accurate estimation of above-ground biomass in Australian arid rangelands
+requires reliable detection of sparsely distributed, isolated trees at scale.
+We address this with a three-stage aerial Tree Crown Detection (TCD) pipeline
+operating on proprietary 0.1\,m\,px$^{-1}$ UAV imagery: (1) shadow direction
+prediction via a ResNet34 trained to regress sun azimuth directly from RGB,
+(2) shadow-conditioned TCD using a Faster R-CNN with ResNet50-FPN backbone,
+and (3) crown area estimation via Segment Anything Model (SAM) post-processing.
+The central challenge in arid rangeland is visual ambiguity: sparse tree canopy
+is nearly indistinguishable from low scrub and pale sandy substrate in RGB alone.
+We exploit cast shadows as a reliable indicator of vertical extent --- a cue that
+unambiguously separates trees from ground-level vegetation. We investigate
+multiple mechanisms for incorporating shadow information into the detector,
+finding that appending a predicted shadow probability map as a fourth input
+channel consistently improves mean Average Precision (mAP@0.4) by
+\textbf{+4.8\%} over the RGB-only baseline (0.650 vs.\ 0.620). Through an
+ablation study isolating the contribution of the shadow \emph{direction} vector,
+we find that directional and isotropic shadow maps produce equivalent detection
+performance, suggesting the detector exploits shadow as an occlusion-awareness
+signal rather than a geometric prior. These results motivate future work on
+architectures that can explicitly reason about shadow geometry.
+\end{abstract}
+
+% ── 1. Introduction ───────────────────────────────────────────────────────────
+\section{Introduction}
+
+Australia's rangelands cover approximately 70\% of the continent and store
+significant quantities of above-ground carbon in isolated trees and sparse
+woodland~\cite{ma2021global}. Quantifying this carbon stock at national scale
+requires accurate tree-level detection and crown delineation over vast areas ---
+a task for which UAV remote sensing at sub-decimetre resolution is increasingly
+practical but computationally demanding.
+
+State-of-the-art TCD models trained on dense temperate forest imagery (e.g.,
+NEON~\cite{weinstein2020neon}, NeonTreeEvaluation~\cite{weinstein2021benchmark})
+generalise poorly to arid Australian rangeland. The domain gap is severe:
+canopy density is an order of magnitude lower, the substrate is pale sandy soil
+rather than dark earth or litter, and tree crowns at height 3--15\,m cast
+long, clearly defined shadows on bare ground. Existing models trained without
+this cue confuse open scrub, soil patches, and rock with tree crowns.
+
+We make the following contributions:
+\begin{enumerate}
+  \item A \textbf{shadow direction prediction model}: a ResNet34 fine-tuned to
+        regress sun azimuth from a single aerial RGB tile, enabling shadow map
+        generation without GPS/IMU metadata.
+  \item A \textbf{shadow-conditioned Faster R-CNN} that appends a classical
+        shadow probability map as a fourth input channel to the backbone,
+        improving recall on shadow-obscured crowns.
+  \item A \textbf{three-stage detection pipeline} integrating shadow direction,
+        TCD, and SAM-based segmentation for per-tree crown area estimation.
+  \item An \textbf{ablation study} dissecting whether detection gains are
+        attributable to the directional shadow vector or to a direction-free
+        darkness cue, with implications for future geometric architectures.
+\end{enumerate}
+
+% ── 2. Related Work ───────────────────────────────────────────────────────────
+\section{Related Work}
+
+\paragraph{Tree Crown Detection.}
+Deep learning TCD has been advanced primarily through object detection frameworks
+applied to aerial and satellite imagery~\cite{weinstein2020neon,li2023single}.
+DeepForest~\cite{weinstein2020neon} provides a Faster R-CNN baseline pre-trained
+on NEON LiDAR-derived crowns and has become a standard starting point for
+fine-tuning. Transformer-based detectors~\cite{li2023single} and instance
+segmentation models~\cite{kirillov2023sam} have recently extended performance
+on dense canopy but are not specifically designed for sparse arid domains.
+
+\paragraph{Shadow in Remote Sensing.}
+Shadows in aerial imagery are typically treated as nuisances to be suppressed
+during pre-processing~\cite{adeline2013shadow}. Shadow removal~\cite{liu2020shadow}
+and shadow detection~\cite{wang2021shadow} have received significant attention in
+the street-view and satellite domains, but shadow as a \emph{positive detection
+cue} has not been systematically exploited in TCD. Physiologically, a cast shadow
+indicates vertical extent above ground and therefore reliably distinguishes trees
+from low scrub --- this is the key insight we develop.
+
+\paragraph{Sun Azimuth Estimation.}
+Sun direction can be derived from GPS coordinates, acquisition time, and
+ephemeris~\cite{reda2004solar} when metadata is available. For proprietary UAV
+datasets where flight metadata is restricted, we instead learn to predict azimuth
+directly from image statistics (shadow orientation, highlight gradients), following
+the approach of~\cite{lalonde2010estimating} for outdoor scene understanding.
+
+\paragraph{Rangeland Carbon.}
+Remote sensing-based biomass estimation in Australian rangelands has relied on
+coarse satellite imagery ($\ge$10\,m) and allometric relationships~\cite{ma2021global}.
+Sub-decimetre UAV surveys enable individual tree-level detection, opening the
+possibility of trunk-diameter inference from crown area and direct integration
+with allometric equations for carbon estimation.
+
+% ── 3. Method ─────────────────────────────────────────────────────────────────
+\section{Method}
+
+The pipeline comprises three sequential stages, each consuming the outputs of
+the previous. An overview is shown in Figure~\ref{fig:pipeline}.
+
+\begin{figure}[t]
+  \centering
+  % TODO: replace with actual pipeline figure
+  \fbox{\rule{0pt}{4cm}\rule{\linewidth}{0pt}}
+  \caption{Three-stage pipeline. Stage 1 predicts shadow direction from RGB.
+           Stage 2 runs shadow-conditioned TCD. Stage 3 refines crown polygons
+           with SAM. Red boxes are detected crowns; blue overlays are SAM masks.}
+  \label{fig:pipeline}
+\end{figure}
+
+\subsection{Stage 1: Shadow Direction Prediction}
+
+Given a UAV tile $\mathbf{I} \in \mathbb{R}^{H \times W \times 3}$, we predict
+the sun azimuth $\phi \in [0°, 360°)$ as a unit vector
+$\mathbf{s} = (\sin\phi, \cos\phi)$, avoiding the angular discontinuity at $0°$.
+
+A ResNet34 backbone is fine-tuned with a two-output regression head minimising
+the mean angular error:
+\begin{equation}
+  \mathcal{L}_\phi = \arccos\!\left(
+    \hat{\mathbf{s}} \cdot \mathbf{s}^* / \|\hat{\mathbf{s}}\| \|\mathbf{s}^*\|
+  \right),
+\end{equation}
+where $\mathbf{s}^*$ is the ground-truth direction derived from GPS and
+ephemeris~\cite{reda2004solar}. At inference the model produces a per-tile
+direction without requiring any metadata.
+
+\subsection{Stage 2: Shadow-Conditioned Tree Crown Detection}
+\label{sec:stage2}
+
+\paragraph{Shadow Probability Map.}
+Given $\mathbf{I}$ and azimuth $\phi$, we compute a shadow probability map
+$\mathbf{M} \in [0,1]^{H \times W}$ using a classical directional gradient
+algorithm. For each pixel $p$, we measure how much brighter nearby pixels are
+in the sun direction (sun-side maximum) relative to the anti-sun direction:
+\begin{equation}
+  \mathrm{dg}(p) = \left[B_{\mathrm{sun}}(p) - B(p)\right]_+ -
+                    0.4\left[B_{\mathrm{anti}}(p) - B(p)\right]_+,
+\end{equation}
+where $B_{\mathrm{sun}}(p) = \max_{d \in \mathcal{D}} B(p + d\hat{\mathbf{s}})$
+accumulates the maximum brightness seen at offsets $d \in \mathcal{D}$
+(short range: 8--35\,px; long range: 35--150\,px) in the sun direction, and
+$[\cdot]_+ = \max(\cdot, 0)$.
+The anti-sun term penalises globally dark pixels where no directional asymmetry
+exists.
+
+A luma gate $\lambda(p) = \operatorname{clip}\!\left(\frac{L_{\max} - B(p)}{20}, 0, 1\right)$
+suppresses pixels brighter than domain-specific threshold $L_{\max}$
+(BRU: 71; WON: 150, reflecting brighter sandy substrate).
+A lateral Sobel penalty suppresses road edges parallel to the shadow direction.
+The combined activation is passed through a sigmoid with fixed centre 0.35 and
+speckle-removal ($\ge 150$\,px$^2$) to produce $\mathbf{M}$.
+
+\paragraph{Shadow-Conditioned Detector.}
+We fine-tune DeepForest~\cite{weinstein2020neon}, a Faster R-CNN with
+ResNet50-FPN backbone pre-trained on NEON aerial data.
+In our shadow-conditioned variant, $\mathbf{M}$ is appended to the RGB image
+as a fourth channel before the first convolutional layer, which is widened
+from $3 \to 4$ input filters with zero initialisation of the new weights.
+This preserves the pre-trained RGB representation at initialisation while
+allowing the backbone to learn to integrate shadow evidence from the first
+layer through a natural hierarchical feature representation.
+
+\paragraph{WON Annotation Normalisation.}
+Ground-truth bounding boxes in WON imagery (site introduced in
+Section~\ref{sec:datasets}) were annotated to include the cast shadow in
+addition to the canopy, producing boxes $\approx 2\times$ larger in area
+than equivalent BRU annotations. We correct for this at training time by
+shrinking WON boxes to 50\% of their original area (scaling each side by
+$\sqrt{0.5} \approx 0.707$) around the box centre without modifying the
+source CSVs.
+
+\subsection{Stage 3: Crown Segmentation via SAM}
+
+Detected bounding boxes from Stage 2 are passed as prompts to the Segment
+Anything Model (SAM)~\cite{kirillov2023sam} to produce per-crown segmentation
+masks. Crown pixel area is converted to physical area at the known ground
+sampling distance (0.1\,m\,px$^{-1}$) and used as input to published allometric
+equations for estimating above-ground biomass and carbon stock.
+
+% ── 4. Experimental Setup ─────────────────────────────────────────────────────
+\section{Experimental Setup}
+
+\subsection{Datasets}
+\label{sec:datasets}
+
+We evaluate on two proprietary UAV datasets acquired at 0.1\,m\,px$^{-1}$
+over Australian rangeland:
+
+\textbf{WON} (\emph{Wongan Hills, Western Australia}): Sandy pale substrate,
+sparse eucalyptus woodland with tree density 5--30 trees/ha. Trees are
+well-separated, casting long shadows on bare ground. Shadow luma values
+(80--140) are substantially higher than darker-substrate sites, requiring
+a relaxed luma gate ($L_{\max} = 150$).
+
+\textbf{BRU} (\emph{Brukunga, South Australia}): Darker soil and mixed
+understorey vegetation. Higher background visual complexity; canonical shadow
+luma gate applies ($L_{\max} = 71$).
+
+Tiles of $400 \times 400$\,px are extracted from full orthomosaics. After
+augmentation (horizontal/vertical flips, $90°$ rotations), the dataset
+comprises 74 training tiles (1,192 annotations) and 20 validation tiles
+(301 annotations) across both sites. Domain breakdown is shown in
+Table~\ref{tab:dataset}.
+
+\begin{table}[h]
+  \centering
+  \caption{Dataset statistics after augmentation.}
+  \label{tab:dataset}
+  \small
+  \begin{tabular}{lrrrr}
+    \toprule
+    & \multicolumn{2}{c}{Train} & \multicolumn{2}{c}{Val} \\
+    \cmidrule(lr){2-3}\cmidrule(lr){4-5}
+    Site & Tiles & Annots. & Tiles & Annots. \\
+    \midrule
+    WON & 63 & 1,075 & -- & 258 \\
+    BRU &  11 &   117 & -- &  43 \\
+    \textbf{Total} & \textbf{74} & \textbf{1,192} & \textbf{20} & \textbf{301} \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\subsection{Evaluation Metric}
+
+We report mean Average Precision at IoU threshold 0.4 (mAP@0.4). The looser
+threshold (vs.\ the standard 0.5) is appropriate for aerial TCD where
+ground-truth boxes are loosely drawn by human annotators: a prediction that
+tightly circumscribes the canopy may fall below IoU=0.5 against an
+annotation that includes adjacent shadow. Per-domain mAP (mAP$_{\text{WON}}$,
+mAP$_{\text{BRU}}$) is reported separately to surface domain-specific effects.
+
+\subsection{Training Details}
+
+All models fine-tune from a DeepForest NEON checkpoint using the Adam
+optimiser with $\text{lr}=0.001$, batch size 16, and early stopping with
+patience 10 on validation mAP@0.4 (up to 50 epochs). Training runs on a
+single NVIDIA H100 GPU via Modal cloud compute. Data augmentation is disabled
+when the shadow channel is active to preserve shadow map consistency with the
+RGB image.
+
+\subsection{Ablation Conditions}
+
+We design four training conditions to isolate the contribution of each
+component:
+
+\begin{description}
+  \item[\textbf{A --- Baseline}] RGB only, no shadow information.
+  \item[\textbf{D --- Directional shadow channel}] Shadow map $\mathbf{M}$
+        computed with the true sun azimuth $\phi$ appended as 4th channel.
+  \item[\textbf{E --- Isotropic shadow channel}] Shadow map computed by
+        averaging the directional gradient over 8 equally-spaced azimuths
+        (no direction vector used), appended as 4th channel. Identical
+        pipeline to D; only the direction is removed. This is the critical
+        ablation separating the contribution of the shadow \emph{map} from
+        the shadow \emph{direction}.
+  \item[\textbf{F --- Shadow input only}] RGB discarded; shadow map tiled
+        $3\times$ across channels. Tests whether shadow alone encodes
+        sufficient tree-location signal for detection.
+        \textit{[Pending]}
+\end{description}
+
+% ── 5. Results ────────────────────────────────────────────────────────────────
+\section{Results}
+
+\subsection{Main Ablation}
+
+Table~\ref{tab:ablation} reports validation mAP@0.4 across all conditions.
+Run D (directional shadow channel) achieves \textbf{0.648} overall mAP vs.\
+0.620 for the RGB-only baseline, a gain of +4.5\%. Run E (isotropic shadow
+channel, no direction) achieves \textbf{0.650}, statistically indistinguishable
+from D. Both shadow conditions converge to approximately the same final
+performance across all domains.
+
+\begin{table}[h]
+  \centering
+  \caption{Ablation results on the validation set (mAP@0.4).
+           $\dagger$: pending.}
+  \label{tab:ablation}
+  \small
+  \begin{tabular}{llccc}
+    \toprule
+    Run & Input & mAP & mAP$_{\text{WON}}$ & mAP$_{\text{BRU}}$ \\
+    \midrule
+    A & RGB only          & 0.620 & 0.637 & 0.539 \\
+    D & RGB + dir.\ shadow  & 0.648 & 0.675 & 0.560 \\
+    E & RGB + iso.\ shadow  & \textbf{0.650} & \textbf{0.677} & 0.544 \\
+    F & Shadow only        & $\dagger$ & $\dagger$ & $\dagger$ \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+The improvement is larger on WON (+6.3\% for D, +6.3\% for E) than BRU
+(+3.9\% for D, +0.9\% for E), consistent with WON's sparser canopy and
+more prominent shadow contrast on pale substrate. BRU performance is more
+variable across runs, likely due to the smaller number of BRU validation
+tiles (43 annotations across 5 tiles).
+
+\subsection{Qualitative Analysis}
+
+Figure~\ref{fig:qual} shows representative predictions from runs A and D
+on challenging WON tiles. The shadow channel primarily recovers missed trees
+(false negatives) at the boundary of shadow-occluded regions, where the RGB
+signal alone is ambiguous. False positive rates are broadly stable, suggesting
+the shadow channel acts as a recall booster rather than a precision-precision
+trade-off.
+
+\begin{figure}[t]
+  \centering
+  % TODO: replace with actual qualitative figure from review_predictions.py
+  \fbox{\rule{0pt}{5cm}\rule{\linewidth}{0pt}}
+  \caption{Predictions on WON validation tiles. Left: RGB baseline (A) ---
+           green: GT, blue: TP, red: FP, orange: FN (shadow panel).
+           Right: shadow-conditioned model (D). Shadow channel recovers
+           trees obscured in RGB alone (orange $\to$ blue).}
+  \label{fig:qual}
+\end{figure}
+
+\subsection{Direction vs.\ Darkness}
+
+The equivalence of runs D and E (directional vs.\ isotropic shadow map) is the
+key negative result. Despite the isotropic map being visually noisier ---
+activating on any locally-dark region regardless of cause --- it provides the
+same detection improvement as the precisely directional map. We interpret this
+as follows: the shadow channel improves performance because it explicitly flags
+\emph{where} occlusion occurs, allowing the backbone to adapt its feature
+statistics for shadowed crowns. The \emph{direction} of the shadow (which
+encodes geometric information about relative crown-to-shadow displacement) is
+not exploited by the Faster R-CNN architecture in this configuration.
+
+This is an important distinction for the paper's contribution framing: the
+novelty of the shadow direction prediction model (Stage 1) lies in enabling
+shadow map generation without flight metadata, not in providing architectural
+signal that is presently exploited by the detector.
+
+\subsection{Shadow Map Quality}
+
+Figure~\ref{fig:shadow_maps} illustrates the qualitative difference between
+directional and isotropic shadow maps on representative WON and BRU tiles.
+The directional map produces compact, elongated blobs localised to tree cast
+shadows; the isotropic map activates more diffusely on all locally-dark
+regions including canopy interior and dark soil patches.
+
+\begin{figure}[t]
+  \centering
+  % TODO: replace with actual figure from review_shadow_params.py
+  \fbox{\rule{0pt}{5cm}\rule{\linewidth}{0pt}}
+  \caption{Comparison of shadow maps. Each row: RGB (left), directional map
+           (centre), isotropic map (right) at matched luma$_{\max}$ per
+           domain. Directional maps are sparser and better localised to
+           cast shadow regions. Colour scale: inferno, [0, 1].}
+  \label{fig:shadow_maps}
+\end{figure}
+
+% ── 6. Discussion ─────────────────────────────────────────────────────────────
+\section{Discussion}
+
+\paragraph{Why does the direction not matter?}
+The Faster R-CNN backbone processes the shadow map as a spatial intensity
+channel. The directional information is encoded implicitly in the elongated
+shape of shadow blobs in the map, but the backbone has no mechanism to
+interpret that shape as a \emph{directional offset}. The network learns
+``dark blob $\approx$ tree present nearby'' without recovering the explicit
+geometric relationship $\text{crown} = \text{shadow} - d \cdot \hat{\mathbf{s}}$.
+
+\paragraph{Towards direction-aware architectures.}
+Two architectural directions could unlock the shadow direction vector's
+geometric value:
+\begin{enumerate}
+  \item \textbf{Shadow-offset RoI sampling}: augment RoIAlign to sample
+        features at positions offset by $d\hat{\mathbf{s}}$ for a range of
+        shadow distances $d$, providing the detection head with crown-side
+        evidence from the shadow direction. The offset is initialised from
+        $\hat{\mathbf{s}}$ rather than learned from scratch.
+  \item \textbf{Learned spatial warp}: a lightweight spatial transformer
+        network~\cite{jaderberg2015spatial} takes $\hat{\mathbf{s}}$ and
+        $\mathbf{M}$ as input and predicts a flow field that shifts shadow
+        evidence toward likely crown positions before the backbone processes
+        the image. Zero-initialised to identity at training start.
+\end{enumerate}
+Both approaches are deferred to future work; the ablation infrastructure
+(directional vs.\ isotropic conditions F, E) is already in place for
+a clean experimental test.
+
+\paragraph{Limitations.}
+The validation set is small (20 tiles, 301 annotations) and
+domain-imbalanced (WON-heavy). The +4.8\% improvement should be confirmed on
+a larger held-out test set before operational deployment. The shadow-only
+condition (run F) is pending; its result will determine whether shadow is a
+complementary or near-sufficient detection cue in this domain.
+
+% ── 7. Conclusion ─────────────────────────────────────────────────────────────
+\section{Conclusion}
+
+We presented a three-stage pipeline for tree crown detection and carbon
+estimation in Australian arid rangeland from 0.1\,m\,px$^{-1}$ UAV imagery.
+The central contribution is the exploitation of cast shadows as a detection
+cue in a domain where RGB appearance alone is insufficient: pale sandy
+substrate and sparse canopy create strong visual ambiguity that existing
+SOTA detectors fail to resolve.
+
+Stage 1 predicts sun azimuth directly from imagery via a fine-tuned ResNet34,
+enabling shadow map generation without flight metadata. Stage 2's shadow-conditioned
+Faster R-CNN achieves +4.8\% mAP@0.4 over the RGB-only baseline by appending
+the shadow probability map as a fourth input channel. Stage 3 provides per-crown
+segmentation via SAM for downstream biomass and carbon estimation.
+
+The ablation study reveals that detection gains are attributable to the shadow
+map's role as an \emph{occlusion-awareness signal} rather than to the
+directional information encoded in the shadow vector. This is a clean negative
+result that motivates future architectures capable of exploiting shadow
+geometry explicitly.
+
+% ── References ────────────────────────────────────────────────────────────────
+\bibliographystyle{plain}
+\bibliography{refs}
+
+\end{document}

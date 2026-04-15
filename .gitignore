@@ -66,3 +66,8 @@ debug_vis*
 *.geojson
 
 shadow_tuner/
+
+scratch/
+
+# Detectree2 prediction JSON outputs
+Prediction_*.json

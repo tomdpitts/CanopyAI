@@ -1,0 +1,65 @@
+\relax 
+\providecommand\hyper@newdestlabel[2]{}
+\providecommand\HyField@AuxAddToFields[1]{}
+\providecommand\HyField@AuxAddToCoFields[2]{}
+\citation{ma2021global}
+\citation{weinstein2020neon}
+\citation{weinstein2021benchmark}
+\citation{weinstein2020neon,li2023single}
+\citation{weinstein2020neon}
+\citation{li2023single}
+\citation{kirillov2023sam}
+\citation{adeline2013shadow}
+\citation{liu2020shadow}
+\citation{wang2021shadow}
+\@writefile{toc}{\contentsline {section}{\numberline {1}Introduction}{1}{section.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {2}Related Work}{1}{section.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Tree Crown Detection.}{1}{section*.2}\protected@file@percent }
+\citation{reda2004solar}
+\citation{lalonde2010estimating}
+\citation{ma2021global}
+\citation{reda2004solar}
+\citation{weinstein2020neon}
+\citation{kirillov2023sam}
+\@writefile{lof}{\contentsline {figure}{\numberline {1}{\ignorespaces Three-stage pipeline. Stage 1 predicts shadow direction from RGB. Stage 2 runs shadow-conditioned TCD. Stage 3 refines crown polygons with SAM. Red boxes are detected crowns; blue overlays are SAM masks.}}{2}{figure.caption.6}\protected@file@percent }
+\providecommand*\caption@xref[2]{\@setref\relax\@undefined{#1}}
+\newlabel{fig:pipeline}{{1}{2}{Three-stage pipeline. Stage 1 predicts shadow direction from RGB. Stage 2 runs shadow-conditioned TCD. Stage 3 refines crown polygons with SAM. Red boxes are detected crowns; blue overlays are SAM masks}{figure.caption.6}{}}
+\@writefile{toc}{\contentsline {paragraph}{Shadow in Remote Sensing.}{2}{section*.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Sun Azimuth Estimation.}{2}{section*.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Rangeland Carbon.}{2}{section*.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {3}Method}{2}{section.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.1}Stage 1: Shadow Direction Prediction}{2}{subsection.3.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.2}Stage 2: Shadow-Conditioned Tree Crown Detection}{2}{subsection.3.2}\protected@file@percent }
+\newlabel{sec:stage2}{{3.2}{2}{Stage 2: Shadow-Conditioned Tree Crown Detection}{subsection.3.2}{}}
+\@writefile{toc}{\contentsline {paragraph}{Shadow Probability Map.}{2}{section*.7}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Shadow-Conditioned Detector.}{2}{section*.8}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{WON Annotation Normalisation.}{2}{section*.9}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.3}Stage 3: Crown Segmentation via SAM}{3}{subsection.3.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {4}Experimental Setup}{3}{section.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.1}Datasets}{3}{subsection.4.1}\protected@file@percent }
+\newlabel{sec:datasets}{{4.1}{3}{Datasets}{subsection.4.1}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {1}{\ignorespaces Dataset statistics after augmentation.}}{3}{table.caption.10}\protected@file@percent }
+\newlabel{tab:dataset}{{1}{3}{Dataset statistics after augmentation}{table.caption.10}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.2}Evaluation Metric}{3}{subsection.4.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.3}Training Details}{3}{subsection.4.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.4}Ablation Conditions}{3}{subsection.4.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {5}Results}{3}{section.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.1}Main Ablation}{3}{subsection.5.1}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {2}{\ignorespaces Ablation results on the validation set (mAP@0.4). $\dagger $: pending.}}{3}{table.caption.11}\protected@file@percent }
+\newlabel{tab:ablation}{{2}{3}{Ablation results on the validation set (mAP@0.4). $\dagger $: pending}{table.caption.11}{}}
+\citation{jaderberg2015spatial}
+\@writefile{lof}{\contentsline {figure}{\numberline {2}{\ignorespaces Predictions on WON validation tiles. Left: RGB baseline (A) --- green: GT, blue: TP, red: FP, orange: FN (shadow panel). Right: shadow-conditioned model (D). Shadow channel recovers trees obscured in RGB alone (orange $\to $ blue).}}{4}{figure.caption.12}\protected@file@percent }
+\newlabel{fig:qual}{{2}{4}{Predictions on WON validation tiles. Left: RGB baseline (A) --- green: GT, blue: TP, red: FP, orange: FN (shadow panel). Right: shadow-conditioned model (D). Shadow channel recovers trees obscured in RGB alone (orange $\to $ blue)}{figure.caption.12}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.2}Qualitative Analysis}{4}{subsection.5.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.3}Direction vs.\ Darkness}{4}{subsection.5.3}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {3}{\ignorespaces Comparison of shadow maps. Each row: RGB (left), directional map (centre), isotropic map (right) at matched luma$_{\max }$ per domain. Directional maps are sparser and better localised to cast shadow regions. Colour scale: inferno, [0, 1].}}{4}{figure.caption.13}\protected@file@percent }
+\newlabel{fig:shadow_maps}{{3}{4}{Comparison of shadow maps. Each row: RGB (left), directional map (centre), isotropic map (right) at matched luma$_{\max }$ per domain. Directional maps are sparser and better localised to cast shadow regions. Colour scale: inferno, [0, 1]}{figure.caption.13}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.4}Shadow Map Quality}{4}{subsection.5.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {6}Discussion}{4}{section.6}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Why does the direction not matter?}{4}{section*.14}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Towards direction-aware architectures.}{4}{section*.15}\protected@file@percent }
+\bibstyle{plain}
+\bibdata{refs}
+\@writefile{toc}{\contentsline {paragraph}{Limitations.}{5}{section*.16}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {7}Conclusion}{5}{section.7}\protected@file@percent }
+\gdef \@abspage@last{5}

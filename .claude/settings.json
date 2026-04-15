@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \":*)",
+      "Bash(find /Users/tompitts/dphil/CanopyAI -name phase16_A* -o -name phase16_D*)",
+      "Bash(python sweep_tcd.py --skip-inference --luma-values 71 --score-threshes 0.35 0.50 0.65)",
+      "Bash(ls /Users/tompitts/dphil/CanopyAI/data/tcd/images/data/tcd/raw/*.json)",
+      "Bash(grep -rn \"huggingface\\\\|hf_hub\\\\|tcd\\\\|TreeCover\\\\|tree_cover\" /Users/tompitts/dphil/CanopyAI/*.py /Users/tompitts/dphil/CanopyAI/*.sh)",
+      "Bash(source /Users/tompitts/dphil/CanopyAI/venv310/bin/activate)",
+      "Bash(python fetch_metadata.py --data_dir data/tcd/images/data/tcd/raw)",
+      "Bash(grep -v \"^$\")",
+      "Bash(ls -lt /Users/tompitts/dphil/CanopyAI/benchmark_results/phase16_D_luma70/*_canopyai.geojson)",
+      "Bash(ls /Users/tompitts/dphil/CanopyAI/benchmark_results/phase16_D_luma70/*_canopyai.geojson)",
+      "Bash(ls /Users/tompitts/dphil/CanopyAI/benchmark_results/phase16_A_full/*_canopyai.geojson)",
+      "Bash(python foxtrot.py --image_path data/tcd/images/data/tcd/raw/tcd_tile_1.tif --output_dir /tmp/shadow_test --deepforest_model phase16_D_shadow_channel.pth --shadow_model solar/shadow_regression/output/shadow_model_combined_best.pth --no_viz)"
+    ]
+  }
+}
