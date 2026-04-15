@@ -12,7 +12,9 @@
       "Bash(ls -lt /Users/tompitts/dphil/CanopyAI/benchmark_results/phase16_D_luma70/*_canopyai.geojson)",
       "Bash(ls /Users/tompitts/dphil/CanopyAI/benchmark_results/phase16_D_luma70/*_canopyai.geojson)",
       "Bash(ls /Users/tompitts/dphil/CanopyAI/benchmark_results/phase16_A_full/*_canopyai.geojson)",
-      "Bash(python foxtrot.py --image_path data/tcd/images/data/tcd/raw/tcd_tile_1.tif --output_dir /tmp/shadow_test --deepforest_model phase16_D_shadow_channel.pth --shadow_model solar/shadow_regression/output/shadow_model_combined_best.pth --no_viz)"
+      "Bash(python foxtrot.py --image_path data/tcd/images/data/tcd/raw/tcd_tile_1.tif --output_dir /tmp/shadow_test --deepforest_model phase16_D_shadow_channel.pth --shadow_model solar/shadow_regression/output/shadow_model_combined_best.pth --no_viz)",
+      "WebSearch",
+      "Bash(python3 -c ' *)"
     ]
   }
 }

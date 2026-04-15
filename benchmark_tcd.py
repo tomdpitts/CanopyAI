@@ -3,9 +3,8 @@
 benchmark_tcd.py — Evaluate multiple TCD models on the Restor public dataset.
 
 Computes proper AP (greedy matching, sorted by confidence) and plots PR curves.
-Evaluates separately for:
-  individual trees  — polygon IoU ≥ iou_thresh  (category_id == 2)
-  grouped canopy    — polygon IoP ≥ iop_thresh  (category_id == 1)
+Single unified metric: all GT annotations (individual trees cat=2 + canopy blobs cat=1)
+are pooled together. A prediction is TP if IoP ≥ iop_thresh against any GT polygon.
 
 Supported model specifiers:
   weecology          → weecology/deepforest NEON pretrained   (foxtrot.py → SAM polygon)
@@ -21,7 +20,6 @@ Usage:
     python benchmark_tcd.py \\
         --models weecology detectree2 phase16_A_baseline.pth phase16_D_shadow_channel.pth \\
         --names  weecology detectree2 phase16_A phase16_D \\
-        --tcd-dir data/tcd/images/data/tcd/raw_test \\
         --shadow-model solar/shadow_regression/output/shadow_model_combined_best.pth \\
         --output-root benchmark_results
 
@@ -142,8 +140,8 @@ def parse_args():
     p.add_argument("--shadow-model",
                    default="solar/shadow_regression/output/shadow_model_combined_best.pth")
     p.add_argument("--output-root", default="benchmark_results")
-    p.add_argument("--iou-thresh-tree",  type=float, default=0.4)
-    p.add_argument("--iop-thresh-canopy", type=float, default=0.7)
+    p.add_argument("--iop-thresh", type=float, default=0.4,
+                   help="IoP threshold for TP: pred area inside any GT polygon (default 0.4)")
     p.add_argument("--skip-inference", action="store_true")
     p.add_argument("--skip-existing", action="store_true",
                    help="Skip tiles that already have a geojson in the output dir")
@@ -160,6 +158,8 @@ def model_type(spec):
         return "weecology"
     if s == "detectree2":
         return "detectree2"
+    if s == "segformer":
+        return "segformer"
     return "checkpoint"
 
 
@@ -178,6 +178,17 @@ def run_foxtrot(model_spec, mtype, image_path, out_dir, shadow_model, abs_luma_m
     r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if r.returncode != 0:
         print(f"      ⚠  foxtrot failed: {r.stderr[-300:]}")
+        return False
+    return True
+
+
+def run_segformer(image_path, out_dir):
+    cmd = [sys.executable, "infer_segformer.py",
+           "--image_path", str(image_path),
+           "--output_dir", str(out_dir)]
+    r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if r.returncode != 0:
+        print(f"      ⚠  infer_segformer failed: {r.stderr[-300:]}")
         return False
     return True
 
@@ -216,6 +227,8 @@ def run_inference(model_spec, mtype, tcd_dir, out_dir, shadow_model, abs_luma_ma
         print(f"    {tif.name} ... ", end="", flush=True)
         if mtype == "detectree2":
             success = run_detectree2(tif, out_dir)
+        elif mtype == "segformer":
+            success = run_segformer(tif, out_dir)
         else:
             success = run_foxtrot(model_spec, mtype, tif, out_dir, shadow_model, abs_luma_max)
         print("✓" if success else "✗")
@@ -344,42 +357,32 @@ def _iop(a, b):
 
 def compute_ap(
     all_pred_polys,   # list of (shapely geom, confidence, tile_id)
-    gt_by_tile,       # {tile_id: [(geom, cat)]}
-    match_fn,         # 'iou' or 'iop'
-    match_cat,        # 2 = tree, 1 = canopy
-    thresh,
+    gt_by_tile,       # {tile_id: [geom, ...]}  — all GT regardless of category
+    thresh,           # IoP threshold for TP
 ):
     """
-    Proper greedy AP computation.
-    Sorts all predictions by confidence descending, greedily assigns each
-    to the best unmatched GT in its tile.
+    Proper greedy AP computation using IoP against all GT polygons (trees + canopy pooled).
+    Sorts all predictions by confidence descending, greedily assigns each to the best
+    unmatched GT in its tile.
 
     Returns (ap, precisions, recalls, confidences)
     """
-    n_gt_total = sum(
-        sum(1 for _, c in gts if c == match_cat)
-        for gts in gt_by_tile.values()
-    )
+    n_gt_total = sum(len(gts) for gts in gt_by_tile.values())
     if n_gt_total == 0:
         return 0.0, np.array([]), np.array([]), np.array([])
 
     # Build per-tile spatial index and matched-GT tracking
-    tile_trees  = {}   # tile_id -> STRtree over GT polygons of match_cat
-    tile_gt     = {}   # tile_id -> list of (geom, matched_flag_list)
-    for tid, gts in gt_by_tile.items():
-        filtered = [(g, c) for g, c in gts if c == match_cat]
-        if not filtered:
+    tile_trees = {}
+    tile_gt    = {}
+    for tid, geoms in gt_by_tile.items():
+        if not geoms:
             continue
-        geoms = [g for g, _ in filtered]
         tile_trees[tid] = STRtree(geoms)
         tile_gt[tid]    = {"geoms": geoms, "matched": [False] * len(geoms)}
 
-    # Sort all predictions by confidence descending
     sorted_preds = sorted(all_pred_polys, key=lambda x: -x[1])
 
-    tp_list = []
-    fp_list = []
-    conf_list = []
+    tp_list, fp_list, conf_list = [], [], []
 
     for pred_geom, conf, tid in sorted_preds:
         if pred_geom is None or pred_geom.is_empty:
@@ -388,36 +391,30 @@ def compute_ap(
 
         gt_info = tile_gt.get(tid)
         if gt_info is None:
-            # No GT of this category in this tile → FP
-            tp_list.append(0)
-            fp_list.append(1)
+            tp_list.append(0); fp_list.append(1)
             continue
 
-        # Find candidates via spatial index
         try:
             cand_idx = tile_trees[tid].query(pred_geom, predicate="intersects")
         except TypeError:
             cand_idx = [j for j, g in enumerate(gt_info["geoms"])
                         if pred_geom.intersects(g)]
 
-        best_score = 0.0
-        best_j     = -1
+        best_iop = 0.0
+        best_j   = -1
         for j in cand_idx:
             if gt_info["matched"][j]:
                 continue
-            g = gt_info["geoms"][j]
-            s = _iou(pred_geom, g) if match_fn == "iou" else _iop(pred_geom, g)
-            if s > best_score:
-                best_score = s
-                best_j     = j
+            iop = _iop(pred_geom, gt_info["geoms"][j])
+            if iop > best_iop:
+                best_iop = iop
+                best_j   = j
 
-        if best_score >= thresh and best_j >= 0:
+        if best_iop >= thresh and best_j >= 0:
             gt_info["matched"][best_j] = True
-            tp_list.append(1)
-            fp_list.append(0)
+            tp_list.append(1); fp_list.append(0)
         else:
-            tp_list.append(0)
-            fp_list.append(1)
+            tp_list.append(0); fp_list.append(1)
 
     if not tp_list:
         return 0.0, np.array([]), np.array([]), np.array([])
@@ -428,15 +425,11 @@ def compute_ap(
     rec    = cum_tp / n_gt_total
     conf   = np.array(conf_list)
 
-    # Monotone precision envelope (standard VOC)
     prec_env = prec.copy()
     for i in range(len(prec_env) - 2, -1, -1):
         prec_env[i] = max(prec_env[i], prec_env[i + 1])
 
-    ap = float(np.trapz(prec_env, rec)) if len(rec) > 1 else 0.0
-    # Clip negative area (can happen with constant recall)
-    ap = max(ap, 0.0)
-
+    ap = max(float(np.trapz(prec_env, rec)) if len(rec) > 1 else 0.0, 0.0)
     return ap, prec_env, rec, conf
 
 
@@ -451,14 +444,15 @@ def f1_optimal_point(prec, rec, conf):
 
 # ── Evaluation orchestration ───────────────────────────────────────────────────
 
-def evaluate_model(name, out_dir, tcd_dir, iou_thresh, iop_thresh):
+def evaluate_model(name, out_dir, tcd_dir, iop_thresh):
     """
-    Loads all predictions + GT for a model, builds the data structures needed
-    for compute_ap.
+    Loads all predictions + GT for a model.
+    GT pools all annotations (cat=1 canopy + cat=2 trees) into one flat list per tile.
+
     Returns (all_preds, gt_by_tile, tile_biomes) where:
       all_preds   — [(geom, score, tile_id)]
-      gt_by_tile  — {tile_id: [(geom, cat)]}
-      tile_biomes — {tile_id: biome_name}  (raw biome_name from meta)
+      gt_by_tile  — {tile_id: [geom, ...]}   (all GT, no category split)
+      tile_biomes — {tile_id: biome_name}
     """
     tcd_dir = Path(tcd_dir)
     pred_files = sorted(Path(out_dir).glob("*_canopyai.geojson"))
@@ -489,8 +483,8 @@ def evaluate_model(name, out_dir, tcd_dir, iou_thresh, iop_thresh):
 
         tile_biomes[i] = meta.get("biome_name", "unknown")
 
-        gt_polys, gt_cats = load_gt(meta, tif_path)
-        gt_by_tile[i] = list(zip(gt_polys, gt_cats))
+        gt_polys, _ = load_gt(meta, tif_path)   # pool all categories
+        gt_by_tile[i] = gt_polys
 
         polys, scores, _ = load_predictions(pred_path, meta)
         for geom, score in zip(polys, scores):
@@ -501,38 +495,34 @@ def evaluate_model(name, out_dir, tcd_dir, iou_thresh, iop_thresh):
 
 # ── PR curve plotting ──────────────────────────────────────────────────────────
 
-def plot_pr_curves(model_results, iou_thresh, iop_thresh, save_path):
+def plot_pr_curves(model_results, iop_thresh, save_path):
     """
-    model_results: {name: {"trees": (ap, prec, rec, conf), "canopy": (ap, prec, rec, conf)}}
+    model_results: {name: (ap, prec, rec, conf)}
+    Single unified metric: IoP ≥ iop_thresh against all GT (trees + canopy).
     """
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    fig, ax = plt.subplots(figsize=(8, 6))
     colours = ["#e41a1c", "#377eb8", "#4daf4a", "#984ea3", "#ff7f00"]
 
-    for ax, key, label, thresh in [
-        (axes[0], "trees",  f"Individual Trees (IoU ≥ {iou_thresh})",   iou_thresh),
-        (axes[1], "canopy", f"Grouped Canopy   (IoP ≥ {iop_thresh})", iop_thresh),
-    ]:
-        for ci, (name, res) in enumerate(model_results.items()):
-            if res is None or key not in res:
-                continue
-            ap, prec, rec, conf = res[key]
-            if len(rec) == 0:
-                continue
-            colour = colours[ci % len(colours)]
-            ax.plot(rec, prec, label=f"{name}  AP={ap:.3f}", color=colour, lw=1.8)
-            # Mark F1-optimal point
-            p_opt, r_opt, f1_opt, c_opt = f1_optimal_point(prec, rec, conf)
-            ax.scatter([r_opt], [p_opt], color=colour, s=60, zorder=5)
-            ax.annotate(f"F1={f1_opt:.2f}@{c_opt:.2f}",
-                        xy=(r_opt, p_opt), xytext=(r_opt + 0.02, p_opt - 0.05),
-                        fontsize=7, color=colour)
+    for ci, (name, res) in enumerate(model_results.items()):
+        if res is None:
+            continue
+        ap, prec, rec, conf = res
+        if len(rec) == 0:
+            continue
+        colour = colours[ci % len(colours)]
+        ax.plot(rec, prec, label=f"{name}  AP={ap:.3f}", color=colour, lw=1.8)
+        p_opt, r_opt, f1_opt, c_opt = f1_optimal_point(prec, rec, conf)
+        ax.scatter([r_opt], [p_opt], color=colour, s=60, zorder=5)
+        ax.annotate(f"F1={f1_opt:.2f}@{c_opt:.2f}",
+                    xy=(r_opt, p_opt), xytext=(r_opt + 0.02, p_opt - 0.05),
+                    fontsize=7, color=colour)
 
-        ax.set_xlabel("Recall",    fontsize=10)
-        ax.set_ylabel("Precision", fontsize=10)
-        ax.set_title(label,        fontsize=10)
-        ax.set_xlim(0, 1); ax.set_ylim(0, 1.05)
-        ax.legend(fontsize=8, loc="upper right")
-        ax.grid(True, alpha=0.3)
+    ax.set_xlabel("Recall",    fontsize=10)
+    ax.set_ylabel("Precision", fontsize=10)
+    ax.set_title(f"All GT (trees + canopy)  IoP ≥ {iop_thresh}", fontsize=10)
+    ax.set_xlim(0, 1); ax.set_ylim(0, 1.05)
+    ax.legend(fontsize=8, loc="upper right")
+    ax.grid(True, alpha=0.3)
 
     fig.suptitle("Restor TCD Benchmark — Precision-Recall Curves", fontsize=12)
     plt.tight_layout()
@@ -543,97 +533,75 @@ def plot_pr_curves(model_results, iou_thresh, iop_thresh, save_path):
 
 # ── Results table ──────────────────────────────────────────────────────────────
 
-def print_table(model_results, iou_thresh, iop_thresh):
-    print("\n" + "═" * 72)
+def print_table(model_results, iop_thresh):
+    print("\n" + "═" * 65)
     print("  BENCHMARK — Restor TCD  |  AP + F1-optimal operating point")
-    print("═" * 72)
+    print(f"  All GT (trees + canopy pooled)  |  IoP ≥ {iop_thresh:.2f}  (* = F1-optimal)")
+    print("═" * 65)
 
     hdr = f"  {'Model':<18}  {'AP':>6}  {'Prec*':>6}  {'Rec*':>6}  {'F1*':>6}  {'Thr*':>6}"
     sep = "  " + "-"*18 + "  " + "  ".join(["-"*6]*5)
     row = "  {:<18}  {:6.3f}  {:6.3f}  {:6.3f}  {:6.3f}  {:6.3f}"
-    row_na = "  {:<18}  {'—':>6}  {'—':>6}  {'—':>6}  {'—':>6}  {'—':>6}"
+    print(hdr); print(sep)
 
-    for key, label, thresh in [
-        ("trees",  f"INDIVIDUAL TREES  polygon-IoU ≥ {iou_thresh:.2f}  (* = F1-optimal threshold)", iou_thresh),
-        ("canopy", f"GROUPED CANOPY    polygon-IoP ≥ {iop_thresh:.2f}  (* = F1-optimal threshold)", iop_thresh),
-    ]:
-        print(f"\n  {label}")
-        print(hdr); print(sep)
-        for name, res in model_results.items():
-            if res is None or key not in res:
-                print(f"  {name:<18}  {'—':>6}  {'—':>6}  {'—':>6}  {'—':>6}  {'—':>6}")
-                continue
-            ap, prec, rec, conf = res[key]
-            p_opt, r_opt, f1_opt, c_opt = f1_optimal_point(prec, rec, conf)
-            print(row.format(name, ap, p_opt, r_opt, f1_opt, c_opt))
+    for name, res in model_results.items():
+        if res is None:
+            print(f"  {name:<18}  {'—':>6}  {'—':>6}  {'—':>6}  {'—':>6}  {'—':>6}")
+            continue
+        ap, prec, rec, conf = res
+        p_opt, r_opt, f1_opt, c_opt = f1_optimal_point(prec, rec, conf)
+        print(row.format(name, ap, p_opt, r_opt, f1_opt, c_opt))
 
-    print("\n" + "═" * 72)
-    print("  All predictions use SAM polygon output (foxtrot pipeline).")
-    print("  Weecology uses the same SAM step as our models — polygon-to-polygon IoU/IoP.")
-    print("  Detectree2 uses its own Mask R-CNN polygon output.")
-    print("═" * 72 + "\n")
+    print("═" * 65 + "\n")
 
 
 # ── Per-biome results table ────────────────────────────────────────────────────
 
-def compute_biome_results(all_preds, gt_by_tile, tile_biomes, iou_thresh, iop_thresh, use_groups=False):
+def compute_biome_results(all_preds, gt_by_tile, tile_biomes, iop_thresh, use_groups=False):
     """
     Splits preds/GT by biome (or biome group) and computes AP+F1 per slice.
-    Returns {biome_label: {"trees": (ap, p, r, c), "canopy": (ap, p, r, c), "n_tiles": int}}
+    Returns {biome_label: {"result": (ap, p, r, c), "n_tiles": int}}
     """
     from collections import defaultdict
 
     label_fn = biome_group if use_groups else (lambda b: b)
 
-    # Group tile_ids by label
     label_to_tiles = defaultdict(set)
     for tid, bname in tile_biomes.items():
         label_to_tiles[label_fn(bname)].add(tid)
 
     results = {}
     for label, tile_ids in sorted(label_to_tiles.items()):
-        sub_preds  = [(g, s, t) for g, s, t in all_preds   if t in tile_ids]
-        sub_gt     = {t: v      for t, v      in gt_by_tile.items() if t in tile_ids}
-        n_tiles    = len(tile_ids)
-
+        sub_preds = [(g, s, t) for g, s, t in all_preds   if t in tile_ids]
+        sub_gt    = {t: v      for t, v      in gt_by_tile.items() if t in tile_ids}
         if not sub_gt:
             continue
-
-        ap_t, p_t, r_t, c_t = compute_ap(sub_preds, sub_gt, "iou", match_cat=2, thresh=iou_thresh)
-        ap_c, p_c, r_c, c_c = compute_ap(sub_preds, sub_gt, "iop", match_cat=1, thresh=iop_thresh)
-        results[label] = {
-            "trees":   (ap_t, p_t, r_t, c_t),
-            "canopy":  (ap_c, p_c, r_c, c_c),
-            "n_tiles": n_tiles,
-        }
+        ap, p, r, c = compute_ap(sub_preds, sub_gt, iop_thresh)
+        results[label] = {"result": (ap, p, r, c), "n_tiles": len(tile_ids)}
     return results
 
 
-def print_biome_table(model_biome_results, iou_thresh, iop_thresh, use_groups=False):
+def print_biome_table(model_biome_results, iop_thresh, use_groups=False):
     level = "Group" if use_groups else "Biome"
-    print("\n" + "═" * 90)
-    print(f"  PER-{level.upper()} BREAKDOWN  |  F1-optimal operating point")
-    print("═" * 90)
+    print("\n" + "═" * 75)
+    print(f"  PER-{level.upper()} BREAKDOWN  |  IoP ≥ {iop_thresh:.2f}  (trees + canopy pooled)")
+    print("═" * 75)
 
-    hdr = f"  {'Model':<18}  {level:<28}  {'N':>4}  {'TreeAP':>7}  {'TreeF1':>7}  {'CanAP':>7}  {'CanF1':>7}"
-    sep = "  " + "-"*18 + "  " + "-"*28 + "  " + "  ".join(["-"*4, "-"*7, "-"*7, "-"*7, "-"*7])
+    hdr = f"  {'Model':<18}  {level:<30}  {'N':>4}  {'AP':>7}  {'F1*':>7}"
+    sep = "  " + "-"*18 + "  " + "-"*30 + "  " + "  ".join(["-"*4, "-"*7, "-"*7])
     print(hdr); print(sep)
 
     for name, biome_results in model_biome_results.items():
         if biome_results is None:
             continue
         for label, res in sorted(biome_results.items()):
-            _, p_t, r_t, c_t = res["trees"]
-            _, p_c, r_c, c_c = res["canopy"]
-            _, _, f1_t, _ = f1_optimal_point(p_t, r_t, c_t)
-            _, _, f1_c, _ = f1_optimal_point(p_c, r_c, c_c)
-            ap_t = res["trees"][0]
-            ap_c = res["canopy"][0]
-            n    = res["n_tiles"]
-            print(f"  {name:<18}  {label:<28}  {n:>4}  {ap_t:>7.3f}  {f1_t:>7.3f}  {ap_c:>7.3f}  {f1_c:>7.3f}")
+            ap, p, r, c = res["result"]
+            _, _, f1, _ = f1_optimal_point(p, r, c)
+            n = res["n_tiles"]
+            print(f"  {name:<18}  {label:<30}  {n:>4}  {ap:>7.3f}  {f1:>7.3f}")
         print(sep)
 
-    print("═" * 90 + "\n")
+    print("═" * 75 + "\n")
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
@@ -670,8 +638,7 @@ def main():
         out_dir = output_root / name
         print(f"\n  Evaluating {name} ...")
 
-        data = evaluate_model(name, out_dir, args.tcd_dir,
-                              args.iou_thresh_tree, args.iop_thresh_canopy)
+        data = evaluate_model(name, out_dir, args.tcd_dir, args.iop_thresh)
         if data is None:
             model_results[name] = None
             model_biome_results[name] = None
@@ -679,30 +646,18 @@ def main():
 
         all_preds, gt_by_tile, tile_biomes = data
 
-        ap_tree, prec_tree, rec_tree, conf_tree = compute_ap(
-            all_preds, gt_by_tile, "iou", match_cat=2, thresh=args.iou_thresh_tree)
-
-        ap_can, prec_can, rec_can, conf_can = compute_ap(
-            all_preds, gt_by_tile, "iop", match_cat=1, thresh=args.iop_thresh_canopy)
-
-        model_results[name] = {
-            "trees":  (ap_tree, prec_tree, rec_tree, conf_tree),
-            "canopy": (ap_can,  prec_can,  rec_can,  conf_can),
-        }
+        ap, prec, rec, conf = compute_ap(all_preds, gt_by_tile, args.iop_thresh)
+        model_results[name] = (ap, prec, rec, conf)
         model_biome_results[name] = compute_biome_results(
-            all_preds, gt_by_tile, tile_biomes,
-            args.iou_thresh_tree, args.iop_thresh_canopy)
+            all_preds, gt_by_tile, tile_biomes, args.iop_thresh)
 
-        print(f"    trees  AP={ap_tree:.3f}   canopy AP={ap_can:.3f}")
+        print(f"    AP={ap:.3f}")
 
     # ── Step 3: Output ────────────────────────────────────────────────────────
-    print_table(model_results, args.iou_thresh_tree, args.iop_thresh_canopy)
-    print_biome_table(model_biome_results, args.iou_thresh_tree, args.iop_thresh_canopy,
-                      use_groups=False)
-    print_biome_table(model_biome_results, args.iou_thresh_tree, args.iop_thresh_canopy,
-                      use_groups=True)
-    plot_pr_curves(model_results, args.iou_thresh_tree, args.iop_thresh_canopy,
-                   args.pr_save)
+    print_table(model_results, args.iop_thresh)
+    print_biome_table(model_biome_results, args.iop_thresh, use_groups=False)
+    print_biome_table(model_biome_results, args.iop_thresh, use_groups=True)
+    plot_pr_curves(model_results, args.iop_thresh, args.pr_save)
 
     # Save raw AP values
     summary = {}
@@ -710,11 +665,11 @@ def main():
         if res is None:
             summary[name] = None
             continue
+        ap, prec, rec, conf = res
         summary[name] = {
-            k: {"ap": float(v[0]),
-                "f1_optimal": dict(zip(["precision","recall","f1","threshold"],
-                                       f1_optimal_point(*v[1:])))}
-            for k, v in res.items()
+            "ap": float(ap),
+            "f1_optimal": dict(zip(["precision", "recall", "f1", "threshold"],
+                                   f1_optimal_point(prec, rec, conf))),
         }
     with open(output_root / "benchmark_summary.json", "w") as f:
         json.dump(summary, f, indent=2)
