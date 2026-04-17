@@ -162,6 +162,10 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
         shadow_cross_attention=False,
         shadow_luma_only=False,   # ablation: replace directional shadow map with luma darkness map
         shadow_input_only=False,  # ablation F: replace RGB entirely with shadow map (tiled ×3)
+        shadow_proposals=False,   # inject shadow-derived proposals alongside RPN output
+        shadow_proposals_iso=False,  # ablation: scramble shadow direction (random angle per image)
+        shadow_loss_reweight=False,  # phase17: upweight focal loss for shadow-casting GT boxes
+        shadow_loss_weight=2.0,      # multiplier applied to positive anchors of shadow-casting GTs
         config=None,
         **kwargs,
     ):
@@ -169,6 +173,10 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
         self.shadow_cross_attention = shadow_cross_attention
         self.shadow_luma_only = shadow_luma_only
         self.shadow_input_only = shadow_input_only
+        self.shadow_proposals = shadow_proposals
+        self.shadow_proposals_iso = shadow_proposals_iso
+        self.shadow_loss_reweight = shadow_loss_reweight
+        self.shadow_loss_weight = shadow_loss_weight
 
         # Initialize DeepForest (LightningModule)
         deepforest_main.deepforest.__init__(self, config=config, **kwargs)
@@ -274,6 +282,25 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
         self._sca_hook_injected = False
         self._current_shadow_map = None  # (B, 1, H, W) raw shadow maps, set per forward pass
         self._current_shadow_dir = None  # (B, 2) shadow direction vectors, set per forward pass
+
+        # Shadow proposal injection state
+        self._shadow_proposal_hook_injected = False
+        self._current_shadow_proposals = None  # list of (N_i, 4) tensors, set per forward pass
+
+        # Shadow loss reweighting state
+        self._cls_loss_patched = False
+        self._current_shadow_gt_weights = None  # list of (N_gt_i,) tensors, set per training step
+
+        if self.shadow_loss_reweight:
+            print(f"   ✅ Shadow Loss Reweight: ENABLED  weight={self.shadow_loss_weight}x for shadow-casting GT boxes")
+        else:
+            print("   Shadow Loss Reweight: DISABLED")
+
+        if self.shadow_proposals:
+            iso_note = "  [ISO ablation — direction scrambled]" if shadow_proposals_iso else ""
+            print(f"   ✅ Shadow Proposals: ENABLED  box={self._SP_CROWN_BOX}px  step_back={self._SP_STEP_BACK}px{iso_note}")
+        else:
+            print("   Shadow Proposals: DISABLED")
 
         # Shadow channel flag is serialised in checkpoint for inference detection
         self.shadow_channel = shadow_channel
@@ -461,18 +488,26 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
     def on_train_start(self):
         if self.shadow_cross_attention and not self._sca_hook_injected:
             self._inject_sca_hook()
+        if self.shadow_proposals and not self._shadow_proposal_hook_injected:
+            self._inject_shadow_proposal_hook()
+        if self.shadow_loss_reweight and not self._cls_loss_patched:
+            self._patch_retinanet_cls_loss()
         if hasattr(super(), "on_train_start"):
             super().on_train_start()
 
     def on_validation_start(self):
         if self.shadow_cross_attention and not self._sca_hook_injected:
             self._inject_sca_hook()
+        if self.shadow_proposals and not self._shadow_proposal_hook_injected:
+            self._inject_shadow_proposal_hook()
         if hasattr(super(), "on_validation_start"):
             super().on_validation_start()
 
     def on_predict_start(self):
         if self.shadow_cross_attention and not self._sca_hook_injected:
             self._inject_sca_hook()
+        if self.shadow_proposals and not self._shadow_proposal_hook_injected:
+            self._inject_shadow_proposal_hook()
         if hasattr(super(), "on_predict_start"):
             super().on_predict_start()
 
@@ -498,6 +533,15 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
 
         if hasattr(super(), "on_train_epoch_end"):
             super().on_train_epoch_end()
+
+    # ------------------------------------------------------------------
+    # Shadow proposal injection constants (at 0.1 m/px)
+    # ------------------------------------------------------------------
+    _SP_BLOB_THRESH = 0.35   # shadow_map binarisation threshold
+    _SP_SPECKLE_MIN = 200    # min blob area in px² — filters noise
+    _SP_NEAR_PCT    = 0.10   # bottom-10% projection = near-end pixels
+    _SP_CROWN_BOX   = 90     # fixed proposal box side length (px = 9 m)
+    _SP_STEP_BACK   = 12     # step from near-end centroid against shadow dir (px)
 
     # ------------------------------------------------------------------
     # WON bbox normalisation
@@ -549,6 +593,285 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
         return result
 
     # ------------------------------------------------------------------
+    # Shadow proposal injection
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _shadow_blobs_to_proposals(shadow_map_np, shadow_angle_deg, img_h, img_w):
+        """
+        Threshold shadow_map → connected components → one proposal box per blob.
+
+        The near end of each blob (closest to the crown, i.e. smallest projection
+        onto the shadow direction vector) is found via the bottom _SP_NEAR_PCT
+        percentile of per-pixel projections.  The proposal centre is placed
+        _SP_STEP_BACK pixels upstream of that near-end centroid.
+
+        Returns (N, 4) float32 numpy array of [x1, y1, x2, y2] boxes,
+        or an empty (0, 4) array when no blobs pass the area threshold.
+        """
+        ang = np.radians(shadow_angle_deg)
+        dx  =  np.sin(ang)   # shadow direction in image coords, rightward
+        dy  = -np.cos(ang)   # shadow direction in image coords, downward
+
+        cls = ShadowConditionedDeepForest
+        binary = (shadow_map_np >= cls._SP_BLOB_THRESH).astype(np.uint8)
+        n, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+
+        proposals = []
+        half = cls._SP_CROWN_BOX // 2
+
+        for lab in range(1, n):   # 0 = background
+            if stats[lab, cv2.CC_STAT_AREA] < cls._SP_SPECKLE_MIN:
+                continue
+
+            ys, xs = np.where(labels == lab)
+            projections = xs * dx + ys * dy
+            threshold   = np.percentile(projections, cls._SP_NEAR_PCT * 100)
+            near_mask   = projections <= threshold
+            near_cx = xs[near_mask].mean()
+            near_cy = ys[near_mask].mean()
+
+            crown_cx = near_cx - cls._SP_STEP_BACK * dx
+            crown_cy = near_cy - cls._SP_STEP_BACK * dy
+
+            x1 = max(0,     int(crown_cx - half))
+            y1 = max(0,     int(crown_cy - half))
+            x2 = min(img_w, int(crown_cx + half))
+            y2 = min(img_h, int(crown_cy + half))
+
+            if x2 > x1 and y2 > y1:
+                proposals.append([float(x1), float(y1), float(x2), float(y2)])
+
+        if proposals:
+            return np.array(proposals, dtype=np.float32)
+        return np.zeros((0, 4), dtype=np.float32)
+
+    def _compute_shadow_proposals_batch(self, images, image_paths, shadow_maps_batch=None):
+        """
+        Compute shadow-derived crown proposals for a batch.
+
+        Reuses shadow_maps_batch (B, 1, H, W) if already computed (e.g. for
+        shadow_cross_attention), avoiding a redundant shadow map computation.
+
+        Returns a list of (N_i, 4) float32 CPU tensors, one per image.
+        """
+        result = []
+        for i, (img_t, path) in enumerate(zip(images, image_paths)):
+            H, W = img_t.shape[1], img_t.shape[2]
+
+            # ── Shadow map ────────────────────────────────────────────────
+            if shadow_maps_batch is not None:
+                sm_np = shadow_maps_batch[i, 0].cpu().numpy()
+            else:
+                sv = self.shadow_lookup.get(path)
+                if sv is None:
+                    sv = np.array([np.sin(np.radians(self.shadow_angle_deg)),
+                                   np.cos(np.radians(self.shadow_angle_deg))], dtype=np.float32)
+                norm_stats = self.norm_stats_lookup.get(path)
+                domain     = self.domain_lookup.get(path)
+                sm_t = self._compute_shadow_map(img_t, sv, norm_stats=norm_stats, domain=domain)
+                sm_np = sm_t[0].cpu().numpy()
+
+            # ── Shadow angle (or scrambled for iso ablation) ───────────────
+            sv = self.shadow_lookup.get(path)
+            if sv is not None:
+                sv = np.array(sv, dtype=np.float32)
+                angle_deg = float(np.degrees(np.arctan2(sv[0], sv[1])))
+            else:
+                angle_deg = self.shadow_angle_deg
+
+            if self.shadow_proposals_iso:
+                angle_deg = np.random.uniform(0, 360)
+
+            proposals_np = self._shadow_blobs_to_proposals(sm_np, angle_deg, H, W)
+            result.append(torch.from_numpy(proposals_np))
+
+        return result
+
+    def _inject_shadow_proposal_hook(self):
+        """
+        Register a forward hook that appends shadow proposals to the RPN output.
+        Only applicable to two-stage detectors (Faster R-CNN).  RetinaNet and
+        other single-stage detectors have no RPN — the hook is skipped with a
+        warning and shadow_proposals is disabled for this run.
+        """
+        if self._shadow_proposal_hook_injected:
+            return
+
+        # Resolve the inner model (may be wrapped in a Hub object)
+        inner = self.model
+        if not hasattr(inner, "rpn") and hasattr(inner, "model"):
+            inner = inner.model
+
+        if not hasattr(inner, "rpn"):
+            print(
+                "   ⚠️  Shadow proposal injection requires a two-stage detector (Faster R-CNN). "
+                f"Current model ({type(self.model).__name__}) has no RPN — "
+                "shadow_proposals disabled for this run."
+            )
+            self.shadow_proposals = False
+            self._shadow_proposal_hook_injected = True
+            return
+
+        def rpn_hook(module, input, output):
+            if self._current_shadow_proposals is None:
+                return output
+            proposals, losses = output
+            augmented = []
+            for img_props, shadow_props in zip(proposals, self._current_shadow_proposals):
+                if shadow_props.shape[0] > 0:
+                    combined = torch.cat(
+                        [img_props, shadow_props.to(img_props.device, dtype=img_props.dtype)],
+                        dim=0,
+                    )
+                else:
+                    combined = img_props
+                augmented.append(combined)
+            return augmented, losses
+
+        inner.rpn.register_forward_hook(rpn_hook)
+        self._shadow_proposal_hook_injected = True
+        print("   ✅ Shadow proposal hook injected on RPN")
+
+    # ------------------------------------------------------------------
+    # Shadow loss reweighting
+    # ------------------------------------------------------------------
+
+    # Shadow probe distances (px): range covering ~1–15 m trees at 30–50° sun elevation
+    _SLR_PROBE_DISTANCES = (12, 20, 30, 42, 55, 75, 100)
+    _SLR_SHADOW_THRESH   = 0.35   # min shadow_map value to count as shadow evidence
+
+    def _compute_shadow_gt_weights(self, images, image_paths, targets):
+        """
+        For each GT box in each image, probe the shadow map at the expected
+        shadow location (GT_crown_centre + d * shadow_dir) for a range of
+        shadow lengths d.  If any probe exceeds _SLR_SHADOW_THRESH the GT box
+        is deemed shadow-casting and receives weight = shadow_loss_weight.
+        Non-shadow GT boxes receive weight = 1.0.
+
+        Returns a list (one per image) of float32 tensors of shape (N_gt,).
+        """
+        result = []
+        for img_t, path, target in zip(images, image_paths, targets):
+            boxes = target["boxes"]   # (N_gt, 4) [x1, y1, x2, y2]
+            N_gt  = boxes.shape[0]
+            weights = torch.ones(N_gt, dtype=torch.float32)
+
+            if N_gt == 0:
+                result.append(weights)
+                continue
+
+            # Shadow direction in image coords
+            sv = self.shadow_lookup.get(path)
+            if sv is None:
+                result.append(weights)
+                continue
+            sv   = np.array(sv, dtype=np.float32)
+            sv   = sv / (np.linalg.norm(sv) + 1e-8)
+            sdx  =  float(sv[0])   # sin_az → rightward
+            sdy  = -float(sv[1])   # -cos_az → downward  (image y convention)
+
+            angle_deg   = float(np.degrees(np.arctan2(sv[0], sv[1])))
+            norm_stats  = self.norm_stats_lookup.get(path)
+            domain      = self.domain_lookup.get(path)
+            shadow_t    = self._compute_shadow_map(img_t, sv,
+                                                   norm_stats=norm_stats, domain=domain)
+            sm_np = shadow_t[0].cpu().numpy()   # (H, W)
+            H, W  = sm_np.shape
+
+            cx = ((boxes[:, 0] + boxes[:, 2]) / 2).cpu().numpy()
+            cy = ((boxes[:, 1] + boxes[:, 3]) / 2).cpu().numpy()
+
+            for i in range(N_gt):
+                for d in self._SLR_PROBE_DISTANCES:
+                    px = int(round(cx[i] + d * sdx))
+                    py = int(round(cy[i] + d * sdy))
+                    if 0 <= px < W and 0 <= py < H:
+                        if sm_np[py, px] >= self._SLR_SHADOW_THRESH:
+                            weights[i] = self.shadow_loss_weight
+                            break   # one hit is enough
+
+            result.append(weights)
+        return result
+
+    def _patch_retinanet_cls_loss(self):
+        """
+        Monkey-patch the RetinaNet classification head's compute_loss to apply
+        per-anchor weights derived from shadow GT evidence.
+
+        The patch switches focal loss from reduction='sum' to reduction='none',
+        multiplies per-anchor losses by the shadow weights, then sums.
+        Weights are read from self._current_shadow_gt_weights at call time,
+        so they are set fresh each training step before the forward pass.
+        """
+        if self._cls_loss_patched:
+            return
+
+        # Resolve classification head through possible Hub wrapper
+        inner = self.model
+        if hasattr(inner, "model"):
+            inner = inner.model
+        if not hasattr(inner, "head") or not hasattr(inner.head, "classification_head"):
+            print("   ⚠️  Cannot find RetinaNet classification_head — shadow loss reweight disabled")
+            self.shadow_loss_reweight = False
+            self._cls_loss_patched = True
+            return
+
+        cls_head      = inner.head.classification_head
+        original_loss = cls_head.compute_loss
+        model_ref     = self   # closure reference
+
+        def patched_compute_loss(targets, head_outputs, matched_idxs):
+            from torchvision.ops import sigmoid_focal_loss
+
+            losses     = []
+            cls_logits = head_outputs["cls_logits"]  # list of (total_anchors, C) per image
+            gt_weights = model_ref._current_shadow_gt_weights  # list of (N_gt,) per image, or None
+
+            for img_idx, (targets_per_image, cls_logits_per_image, matched_idxs_per_image) in enumerate(
+                zip(targets, cls_logits, matched_idxs)
+            ):
+                foreground_idxs = matched_idxs_per_image >= 0
+                num_foreground  = foreground_idxs.sum()
+                # Exclude anchors in the between-thresholds ignore band (identical to original)
+                valid_idxs = matched_idxs_per_image != cls_head.BETWEEN_THRESHOLDS
+
+                gt_classes_target = torch.zeros_like(cls_logits_per_image)
+                gt_classes_target[
+                    foreground_idxs,
+                    targets_per_image["labels"][matched_idxs_per_image[foreground_idxs]],
+                ] = 1.0
+
+                # Per-anchor focal loss (reduction="none" so we can apply weights)
+                per_anchor_loss = sigmoid_focal_loss(
+                    cls_logits_per_image[valid_idxs],
+                    gt_classes_target[valid_idxs],
+                    reduction="none",
+                ).sum(dim=-1)   # (num_valid_anchors,)
+
+                # Per-anchor weight: 1.0 everywhere, shadow_loss_weight for shadow-casting GT anchors
+                anchor_weights = torch.ones(
+                    valid_idxs.sum(), dtype=per_anchor_loss.dtype, device=per_anchor_loss.device
+                )
+                if gt_weights is not None and img_idx < len(gt_weights):
+                    w               = gt_weights[img_idx].to(per_anchor_loss.device)  # (N_gt,)
+                    fg_in_valid     = foreground_idxs[valid_idxs]   # bool mask within valid anchors
+                    matched_gt      = matched_idxs_per_image[valid_idxs][fg_in_valid]
+                    valid_match     = matched_gt < len(w)
+                    fg_valid_pos    = fg_in_valid.nonzero(as_tuple=True)[0]
+                    anchor_weights[fg_valid_pos[valid_match]] = w[matched_gt[valid_match]]
+
+                losses.append(
+                    (per_anchor_loss * anchor_weights).sum() / max(1, num_foreground)
+                )
+
+            return sum(losses) / len(targets)
+
+        cls_head.compute_loss = patched_compute_loss
+        self._cls_loss_patched = True
+        print(f"   ✅ RetinaNet cls loss patched — shadow GT weight={self.shadow_loss_weight}x")
+
+    # ------------------------------------------------------------------
     # Training / Validation steps
     # ------------------------------------------------------------------
 
@@ -567,6 +890,23 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
         else:
             self._current_shadow_map = None
             self._current_shadow_dir = None
+
+        # Shadow proposal injection — reuse shadow maps if already computed
+        if self.shadow_proposals:
+            self._current_shadow_proposals = self._compute_shadow_proposals_batch(
+                images, image_paths, shadow_maps_batch=self._current_shadow_map
+            )
+        else:
+            self._current_shadow_proposals = None
+
+        # Shadow loss reweighting — compute per-GT weights before forward pass
+        # (the patched cls head reads self._current_shadow_gt_weights during forward)
+        if self.shadow_loss_reweight:
+            self._current_shadow_gt_weights = self._compute_shadow_gt_weights(
+                images, image_paths, targets
+            )
+        else:
+            self._current_shadow_gt_weights = None
 
         # Replace RGB with shadow map (ablation F) or prepend as 4th channel
         if self.shadow_input_only:
@@ -591,6 +931,13 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
         else:
             self._current_shadow_map = None
             self._current_shadow_dir = None
+
+        if self.shadow_proposals:
+            self._current_shadow_proposals = self._compute_shadow_proposals_batch(
+                images, image_paths, shadow_maps_batch=self._current_shadow_map
+            )
+        else:
+            self._current_shadow_proposals = None
 
         if self.shadow_input_only:
             images = self._replace_with_shadow_input(images, image_paths)
@@ -673,6 +1020,13 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
         else:
             self._current_shadow_map = None
             self._current_shadow_dir = None
+
+        if self.shadow_proposals:
+            self._current_shadow_proposals = self._compute_shadow_proposals_batch(
+                images, image_paths, shadow_maps_batch=self._current_shadow_map
+            )
+        else:
+            self._current_shadow_proposals = None
 
         if self.shadow_channel:
             prepended = self._prepend_shadow_channel(images, image_paths)

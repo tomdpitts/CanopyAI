@@ -209,6 +209,10 @@ def train_deepforest(
     shadow_cross_attention=False, # Run C/D: shadow cross-attention after layer4
     shadow_luma_only=False,       # Ablation: replace directional shadow map with luma darkness map
     shadow_input_only=False,      # Ablation F: replace RGB entirely with shadow map (tiled ×3)
+    shadow_proposals=False,       # Run F_dir: inject shadow-derived proposals alongside RPN
+    shadow_proposals_iso=False,   # Ablation F_iso: scramble shadow direction in proposal generation
+    shadow_loss_reweight=False,   # Phase 17: upweight focal loss for shadow-casting GT boxes
+    shadow_loss_weight=2.0,       # Multiplier for shadow-casting GT positive anchors
     won_bbox_shrink=True,         # Always apply WON bbox normalisation for consistent evaluation
 ):
     """
@@ -246,7 +250,7 @@ def train_deepforest(
     print("\n⚙️  Initializing model...")
 
     # ── Model initialisation ──────────────────────────────────────────────
-    use_shadow = shadow_channel or shadow_cross_attention
+    use_shadow = shadow_channel or shadow_cross_attention or shadow_proposals or shadow_loss_reweight
     # Always use ShadowConditionedDeepForest when won_bbox_shrink=True so that
     # _maybe_shrink_won_targets is applied consistently across all stages (A/B/C).
     # Using plain deepforest for stage A would train on large WON boxes, then
@@ -263,7 +267,9 @@ def train_deepforest(
             else:
                 shadow_angle_deg = 215.0
                 print(f"   Shadow angle defaulted to {shadow_angle_deg} deg (no shadow_angle column)")
-        print(f"   shadow_channel={shadow_channel}  shadow_cross_attention={shadow_cross_attention}  won_bbox_shrink={won_bbox_shrink}")
+        print(f"   shadow_channel={shadow_channel}  shadow_cross_attention={shadow_cross_attention}  "
+              f"shadow_proposals={shadow_proposals}  shadow_proposals_iso={shadow_proposals_iso}  "
+              f"won_bbox_shrink={won_bbox_shrink}")
         model = ShadowConditionedDeepForest(
             shadow_angle_deg=shadow_angle_deg,
             train_csv=train_csv,
@@ -273,6 +279,10 @@ def train_deepforest(
             shadow_cross_attention=shadow_cross_attention,
             shadow_luma_only=shadow_luma_only,
             shadow_input_only=shadow_input_only,
+            shadow_proposals=shadow_proposals,
+            shadow_proposals_iso=shadow_proposals_iso,
+            shadow_loss_reweight=shadow_loss_reweight,
+            shadow_loss_weight=shadow_loss_weight,
         )
     else:
         print("   Shadow: DISABLED, WON shrink: DISABLED (raw baseline)")
@@ -531,6 +541,27 @@ def main():
         help="Run C/D: shadow cross-attention module after layer4",
     )
     parser.add_argument(
+        "--shadow-proposals",
+        action="store_true",
+        help="Run F_dir: inject shadow-blob-derived proposals alongside RPN output",
+    )
+    parser.add_argument(
+        "--shadow-proposals-iso",
+        action="store_true",
+        help="Ablation F_iso: use scrambled shadow direction in proposal generation",
+    )
+    parser.add_argument(
+        "--shadow-loss-reweight",
+        action="store_true",
+        help="Phase 17: upweight focal loss for positive anchors of shadow-casting GT boxes",
+    )
+    parser.add_argument(
+        "--shadow-loss-weight",
+        type=float,
+        default=2.0,
+        help="Focal loss multiplier for shadow-casting GT anchors (default 2.0)",
+    )
+    parser.add_argument(
         "--shadow-angle-deg",
         type=float,
         default=None,
@@ -555,6 +586,10 @@ def main():
         freeze_backbone=args.freeze_backbone,
         shadow_channel=args.shadow_channel,
         shadow_cross_attention=args.shadow_cross_attention,
+        shadow_proposals=args.shadow_proposals,
+        shadow_proposals_iso=args.shadow_proposals_iso,
+        shadow_loss_reweight=args.shadow_loss_reweight,
+        shadow_loss_weight=args.shadow_loss_weight,
     )
 
 

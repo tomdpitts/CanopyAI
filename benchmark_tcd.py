@@ -136,6 +136,9 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--models", nargs="+", required=True)
     p.add_argument("--names",  nargs="+", required=True)
+    p.add_argument("--tiles",  nargs="+", default=None,
+                   help="Restrict to these tile stems (e.g. tcd_tile_3 tcd_tile_7). "
+                        "Applied to both inference and evaluation so comparisons are fair.")
     p.add_argument("--tcd-dir", default="data/tcd/images/data/tcd/raw")
     p.add_argument("--shadow-model",
                    default="solar/shadow_regression/output/shadow_model_combined_best.pth")
@@ -214,8 +217,10 @@ def run_detectree2(image_path, out_dir):
 
 
 def run_inference(model_spec, mtype, tcd_dir, out_dir, shadow_model, abs_luma_max=None,
-                  skip_existing=False):
+                  skip_existing=False, tile_filter=None):
     tifs = sorted(Path(tcd_dir).glob("*.tif"))
+    if tile_filter is not None:
+        tifs = [t for t in tifs if t.stem in tile_filter]
     ok = 0
     skipped = 0
     for tif in tifs:
@@ -280,7 +285,8 @@ def load_gt(meta, tif_path=None):
                 pass
         elif isinstance(segs, dict) and "counts" in segs and mask_utils:
             try:
-                mask = mask_utils.decode(segs)
+                rle = mask_utils.frPyObjects(segs, segs["size"][0], segs["size"][1])
+                mask = mask_utils.decode(rle)
                 raw = [shape(g) for g, v in rasterio.features.shapes(
                     mask.astype(np.uint8), mask > 0) if v == 1]
             except Exception:
@@ -317,7 +323,12 @@ def load_predictions(pred_path, meta):
     tf = from_bounds(*bounds, width=width, height=height)
     coeffs = [tf.a, tf.b, tf.d, tf.e, tf.c, tf.f]
 
-    if gdf.crs is None:
+    # Detect pixel-space coords: foxtrot writes the world CRS label but pixel coordinates.
+    # Check the centroid of the first geometry — if it falls within pixel bounds it needs
+    # transforming regardless of what CRS is declared.
+    first_centroid = gdf.geometry.iloc[0].centroid
+    in_pixel_space = (0 <= first_centroid.x <= width) and (0 <= first_centroid.y <= height)
+    if gdf.crs is None or in_pixel_space:
         # Pixel-space output (foxtrot/weecology) — transform to world coords
         gdf["geometry"] = gdf.geometry.apply(lambda g: affine_transform(g, coeffs))
     gdf = gdf.set_crs(meta["crs"], allow_override=True)
@@ -444,7 +455,7 @@ def f1_optimal_point(prec, rec, conf):
 
 # ── Evaluation orchestration ───────────────────────────────────────────────────
 
-def evaluate_model(name, out_dir, tcd_dir, iop_thresh):
+def evaluate_model(name, out_dir, tcd_dir, iop_thresh, tile_filter=None):
     """
     Loads all predictions + GT for a model.
     GT pools all annotations (cat=1 canopy + cat=2 trees) into one flat list per tile.
@@ -456,6 +467,8 @@ def evaluate_model(name, out_dir, tcd_dir, iop_thresh):
     """
     tcd_dir = Path(tcd_dir)
     pred_files = sorted(Path(out_dir).glob("*_canopyai.geojson"))
+    if tile_filter is not None:
+        pred_files = [p for p in pred_files if p.stem.replace("_canopyai", "") in tile_filter]
     if not pred_files:
         print(f"  ⚠  No predictions in {out_dir}")
         return None
@@ -628,7 +641,8 @@ def main():
         print(f"{'─'*60}")
         run_inference(model_spec, mtype, args.tcd_dir, out_dir, args.shadow_model,
                       abs_luma_max=args.abs_luma_max,
-                      skip_existing=args.skip_existing)
+                      skip_existing=args.skip_existing,
+                      tile_filter=set(args.tiles) if args.tiles else None)
 
     # ── Step 2: AP computation ────────────────────────────────────────────────
     model_results       = {}
@@ -638,7 +652,8 @@ def main():
         out_dir = output_root / name
         print(f"\n  Evaluating {name} ...")
 
-        data = evaluate_model(name, out_dir, args.tcd_dir, args.iop_thresh)
+        data = evaluate_model(name, out_dir, args.tcd_dir, args.iop_thresh,
+                              tile_filter=set(args.tiles) if args.tiles else None)
         if data is None:
             model_results[name] = None
             model_biome_results[name] = None

@@ -186,6 +186,10 @@ def train_deepforest_modal(
     shadow_cross_attention: bool = False,  # Run C/D: cross-attn after layer3 (H/16) with dir_scale
     shadow_luma_only: bool = False,        # Ablation E: luma darkness map (no shadow vector)
     shadow_input_only: bool = False,       # Ablation F: replace RGB entirely with shadow map
+    shadow_proposals: bool = False,        # Run F_dir: shadow-blob proposals injected after RPN
+    shadow_proposals_iso: bool = False,    # Ablation F_iso: scramble direction in proposals
+    shadow_loss_reweight: bool = False,    # Phase 17: upweight focal loss for shadow-casting GTs
+    shadow_loss_weight: float = 2.0,       # Multiplier for shadow-casting GT positive anchors
     shadow_angle_deg: float = None,
     # ── Misc ───────────────────────────────────────────────────
     wandb_project: str = None,
@@ -517,6 +521,10 @@ def train_deepforest_modal(
         shadow_luma_only=shadow_luma_only,
         shadow_input_only=shadow_input_only,
         shadow_cross_attention=shadow_cross_attention,
+        shadow_proposals=shadow_proposals,
+        shadow_proposals_iso=shadow_proposals_iso,
+        shadow_loss_reweight=shadow_loss_reweight,
+        shadow_loss_weight=shadow_loss_weight,
     )
 
     # Persist checkpoints
@@ -553,6 +561,10 @@ def main(
     shadow_cross_attention: bool = False,
     shadow_luma_only: bool = False,
     shadow_input_only: bool = False,
+    shadow_proposals: bool = False,
+    shadow_proposals_iso: bool = False,
+    shadow_loss_reweight: bool = False,
+    shadow_loss_weight: float = 2.0,
     shadow_angle_deg: float = None,
     # ── Misc ───────────────────────────────────────────────────
     wandb_project: str = None,
@@ -636,6 +648,10 @@ Phase 5 training data is already in Modal storage:
         shadow_cross_attention=shadow_cross_attention,
         shadow_luma_only=shadow_luma_only,
         shadow_input_only=shadow_input_only,
+        shadow_proposals=shadow_proposals,
+        shadow_proposals_iso=shadow_proposals_iso,
+        shadow_loss_reweight=shadow_loss_reweight,
+        shadow_loss_weight=shadow_loss_weight,
         shadow_angle_deg=shadow_angle_deg,
         wandb_project=wandb_project,
         checkpoint=checkpoint,
