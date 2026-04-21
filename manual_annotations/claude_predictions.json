@@ -1,0 +1,658 @@
+{
+  "NOGP_2019_NOGP_3_352000_5183000_image_y4000_x400.png": [],
+  "DCFS_2019_WOOD_3_494000_5220000_image_y3200_x9600.png": [],
+  "OAES_2021_OAES_5_496000_3906000_image_y5600_x8400.png": [],
+  "WOOD_2021_WOOD_5_483000_5224000_image_y400_x2000.png": [],
+  "CPER_2020_CPER_5_520000_4520000_image_y7600_x800.png": [],
+  "DCFS_2019_WOOD_3_492000_5222000_image_y5200_x2400.png": [
+    {
+      "xmin": 172,
+      "ymin": 182,
+      "xmax": 212,
+      "ymax": 220
+    },
+    {
+      "xmin": 336,
+      "ymin": 352,
+      "xmax": 372,
+      "ymax": 386
+    }
+  ],
+  "TOOL_2019_TOOL_3_404000_7607000_image_y6400_x4000.png": [],
+  "DCFS_2019_WOOD_3_492000_5222000_image_y6400_x6400.png": [],
+  "OAES_2021_OAES_5_494000_3905000_image_y4400_x7600.png": [
+    {
+      "xmin": 5,
+      "ymin": 5,
+      "xmax": 90,
+      "ymax": 85
+    },
+    {
+      "xmin": 5,
+      "ymin": 155,
+      "xmax": 72,
+      "ymax": 270
+    },
+    {
+      "xmin": 265,
+      "ymin": 65,
+      "xmax": 355,
+      "ymax": 148
+    },
+    {
+      "xmin": 300,
+      "ymin": 138,
+      "xmax": 395,
+      "ymax": 235
+    },
+    {
+      "xmin": 268,
+      "ymin": 228,
+      "xmax": 395,
+      "ymax": 338
+    },
+    {
+      "xmin": 245,
+      "ymin": 328,
+      "xmax": 395,
+      "ymax": 395
+    }
+  ],
+  "TOOL_2019_TOOL_3_404000_7619000_image_y3600_x8800.png": [],
+  "DCFS_2019_WOOD_3_492000_5222000_image_y0_x800.png": [],
+  "STER_2021_STER_3_664000_4485000_image_y5600_x6000.png": [],
+  "JORN_2019_JORN_3_318000_3617000_image_y9200_x4000.png": [
+    {
+      "xmin": 12,
+      "ymin": 12,
+      "xmax": 52,
+      "ymax": 52
+    },
+    {
+      "xmin": 82,
+      "ymin": 8,
+      "xmax": 122,
+      "ymax": 48
+    },
+    {
+      "xmin": 172,
+      "ymin": 5,
+      "xmax": 215,
+      "ymax": 45
+    },
+    {
+      "xmin": 282,
+      "ymin": 22,
+      "xmax": 325,
+      "ymax": 62
+    },
+    {
+      "xmin": 348,
+      "ymin": 38,
+      "xmax": 390,
+      "ymax": 78
+    },
+    {
+      "xmin": 12,
+      "ymin": 88,
+      "xmax": 55,
+      "ymax": 130
+    },
+    {
+      "xmin": 118,
+      "ymin": 75,
+      "xmax": 160,
+      "ymax": 115
+    },
+    {
+      "xmin": 202,
+      "ymin": 85,
+      "xmax": 245,
+      "ymax": 125
+    },
+    {
+      "xmin": 312,
+      "ymin": 92,
+      "xmax": 355,
+      "ymax": 132
+    },
+    {
+      "xmin": 45,
+      "ymin": 155,
+      "xmax": 90,
+      "ymax": 198
+    },
+    {
+      "xmin": 148,
+      "ymin": 162,
+      "xmax": 192,
+      "ymax": 205
+    },
+    {
+      "xmin": 238,
+      "ymin": 155,
+      "xmax": 282,
+      "ymax": 198
+    },
+    {
+      "xmin": 348,
+      "ymin": 168,
+      "xmax": 392,
+      "ymax": 212
+    },
+    {
+      "xmin": 18,
+      "ymin": 252,
+      "xmax": 62,
+      "ymax": 296
+    },
+    {
+      "xmin": 108,
+      "ymin": 262,
+      "xmax": 152,
+      "ymax": 306
+    },
+    {
+      "xmin": 215,
+      "ymin": 248,
+      "xmax": 260,
+      "ymax": 292
+    },
+    {
+      "xmin": 308,
+      "ymin": 258,
+      "xmax": 352,
+      "ymax": 302
+    },
+    {
+      "xmin": 58,
+      "ymin": 338,
+      "xmax": 102,
+      "ymax": 382
+    },
+    {
+      "xmin": 188,
+      "ymin": 348,
+      "xmax": 232,
+      "ymax": 390
+    },
+    {
+      "xmin": 292,
+      "ymin": 335,
+      "xmax": 336,
+      "ymax": 378
+    }
+  ],
+  "CPER_2020_CPER_5_520000_4520000_image_y400_x8800.png": [],
+  "DCFS_2019_WOOD_3_492000_5222000_image_y6000_x5600.png": [],
+  "ONAQ_2021_ONAQ_3_374000_4446000_image_y4800_x8800.png": [
+    {
+      "xmin": 28,
+      "ymin": 22,
+      "xmax": 72,
+      "ymax": 65
+    },
+    {
+      "xmin": 138,
+      "ymin": 8,
+      "xmax": 180,
+      "ymax": 50
+    },
+    {
+      "xmin": 252,
+      "ymin": 28,
+      "xmax": 295,
+      "ymax": 70
+    },
+    {
+      "xmin": 330,
+      "ymin": 48,
+      "xmax": 375,
+      "ymax": 90
+    },
+    {
+      "xmin": 8,
+      "ymin": 108,
+      "xmax": 52,
+      "ymax": 150
+    },
+    {
+      "xmin": 95,
+      "ymin": 102,
+      "xmax": 140,
+      "ymax": 146
+    },
+    {
+      "xmin": 192,
+      "ymin": 112,
+      "xmax": 238,
+      "ymax": 156
+    },
+    {
+      "xmin": 290,
+      "ymin": 98,
+      "xmax": 338,
+      "ymax": 143
+    },
+    {
+      "xmin": 358,
+      "ymin": 112,
+      "xmax": 398,
+      "ymax": 156
+    },
+    {
+      "xmin": 42,
+      "ymin": 192,
+      "xmax": 88,
+      "ymax": 235
+    },
+    {
+      "xmin": 152,
+      "ymin": 182,
+      "xmax": 198,
+      "ymax": 228
+    },
+    {
+      "xmin": 262,
+      "ymin": 198,
+      "xmax": 308,
+      "ymax": 242
+    },
+    {
+      "xmin": 352,
+      "ymin": 188,
+      "xmax": 395,
+      "ymax": 232
+    },
+    {
+      "xmin": 12,
+      "ymin": 275,
+      "xmax": 58,
+      "ymax": 318
+    },
+    {
+      "xmin": 115,
+      "ymin": 268,
+      "xmax": 160,
+      "ymax": 312
+    },
+    {
+      "xmin": 228,
+      "ymin": 278,
+      "xmax": 272,
+      "ymax": 320
+    },
+    {
+      "xmin": 325,
+      "ymin": 265,
+      "xmax": 370,
+      "ymax": 308
+    },
+    {
+      "xmin": 52,
+      "ymin": 348,
+      "xmax": 98,
+      "ymax": 390
+    },
+    {
+      "xmin": 172,
+      "ymin": 355,
+      "xmax": 218,
+      "ymax": 395
+    },
+    {
+      "xmin": 292,
+      "ymin": 342,
+      "xmax": 338,
+      "ymax": 385
+    }
+  ],
+  "ONAQ_2021_ONAQ_3_374000_4446000_image_y4800_x2800.png": [
+    {
+      "xmin": 8,
+      "ymin": 8,
+      "xmax": 42,
+      "ymax": 42
+    },
+    {
+      "xmin": 52,
+      "ymin": 5,
+      "xmax": 88,
+      "ymax": 40
+    },
+    {
+      "xmin": 105,
+      "ymin": 8,
+      "xmax": 142,
+      "ymax": 45
+    },
+    {
+      "xmin": 162,
+      "ymin": 5,
+      "xmax": 198,
+      "ymax": 42
+    },
+    {
+      "xmin": 218,
+      "ymin": 8,
+      "xmax": 255,
+      "ymax": 45
+    },
+    {
+      "xmin": 268,
+      "ymin": 5,
+      "xmax": 308,
+      "ymax": 42
+    },
+    {
+      "xmin": 328,
+      "ymin": 8,
+      "xmax": 365,
+      "ymax": 45
+    },
+    {
+      "xmin": 372,
+      "ymin": 5,
+      "xmax": 398,
+      "ymax": 40
+    },
+    {
+      "xmin": 5,
+      "ymin": 55,
+      "xmax": 40,
+      "ymax": 90
+    },
+    {
+      "xmin": 62,
+      "ymin": 58,
+      "xmax": 98,
+      "ymax": 94
+    },
+    {
+      "xmin": 118,
+      "ymin": 52,
+      "xmax": 155,
+      "ymax": 88
+    },
+    {
+      "xmin": 182,
+      "ymin": 56,
+      "xmax": 218,
+      "ymax": 92
+    },
+    {
+      "xmin": 238,
+      "ymin": 52,
+      "xmax": 275,
+      "ymax": 88
+    },
+    {
+      "xmin": 298,
+      "ymin": 58,
+      "xmax": 335,
+      "ymax": 95
+    },
+    {
+      "xmin": 355,
+      "ymin": 52,
+      "xmax": 392,
+      "ymax": 88
+    },
+    {
+      "xmin": 12,
+      "ymin": 108,
+      "xmax": 50,
+      "ymax": 145
+    },
+    {
+      "xmin": 72,
+      "ymin": 112,
+      "xmax": 110,
+      "ymax": 150
+    },
+    {
+      "xmin": 135,
+      "ymin": 105,
+      "xmax": 172,
+      "ymax": 142
+    },
+    {
+      "xmin": 195,
+      "ymin": 110,
+      "xmax": 232,
+      "ymax": 148
+    },
+    {
+      "xmin": 255,
+      "ymin": 108,
+      "xmax": 292,
+      "ymax": 145
+    },
+    {
+      "xmin": 312,
+      "ymin": 112,
+      "xmax": 350,
+      "ymax": 150
+    },
+    {
+      "xmin": 365,
+      "ymin": 105,
+      "xmax": 398,
+      "ymax": 142
+    },
+    {
+      "xmin": 5,
+      "ymin": 162,
+      "xmax": 42,
+      "ymax": 198
+    },
+    {
+      "xmin": 58,
+      "ymin": 158,
+      "xmax": 96,
+      "ymax": 195
+    },
+    {
+      "xmin": 118,
+      "ymin": 165,
+      "xmax": 155,
+      "ymax": 202
+    },
+    {
+      "xmin": 178,
+      "ymin": 160,
+      "xmax": 215,
+      "ymax": 198
+    },
+    {
+      "xmin": 235,
+      "ymin": 162,
+      "xmax": 272,
+      "ymax": 200
+    },
+    {
+      "xmin": 292,
+      "ymin": 158,
+      "xmax": 330,
+      "ymax": 196
+    },
+    {
+      "xmin": 350,
+      "ymin": 165,
+      "xmax": 388,
+      "ymax": 202
+    },
+    {
+      "xmin": 18,
+      "ymin": 218,
+      "xmax": 55,
+      "ymax": 255
+    },
+    {
+      "xmin": 78,
+      "ymin": 218,
+      "xmax": 115,
+      "ymax": 255
+    },
+    {
+      "xmin": 138,
+      "ymin": 215,
+      "xmax": 175,
+      "ymax": 252
+    },
+    {
+      "xmin": 198,
+      "ymin": 218,
+      "xmax": 235,
+      "ymax": 255
+    },
+    {
+      "xmin": 258,
+      "ymin": 218,
+      "xmax": 295,
+      "ymax": 255
+    },
+    {
+      "xmin": 315,
+      "ymin": 212,
+      "xmax": 352,
+      "ymax": 250
+    },
+    {
+      "xmin": 368,
+      "ymin": 218,
+      "xmax": 398,
+      "ymax": 255
+    },
+    {
+      "xmin": 5,
+      "ymin": 268,
+      "xmax": 42,
+      "ymax": 305
+    },
+    {
+      "xmin": 55,
+      "ymin": 262,
+      "xmax": 92,
+      "ymax": 300
+    },
+    {
+      "xmin": 115,
+      "ymin": 268,
+      "xmax": 152,
+      "ymax": 306
+    },
+    {
+      "xmin": 172,
+      "ymin": 262,
+      "xmax": 210,
+      "ymax": 300
+    },
+    {
+      "xmin": 232,
+      "ymin": 268,
+      "xmax": 270,
+      "ymax": 306
+    },
+    {
+      "xmin": 292,
+      "ymin": 262,
+      "xmax": 330,
+      "ymax": 300
+    },
+    {
+      "xmin": 352,
+      "ymin": 268,
+      "xmax": 390,
+      "ymax": 306
+    },
+    {
+      "xmin": 12,
+      "ymin": 318,
+      "xmax": 50,
+      "ymax": 356
+    },
+    {
+      "xmin": 68,
+      "ymin": 315,
+      "xmax": 106,
+      "ymax": 353
+    },
+    {
+      "xmin": 128,
+      "ymin": 320,
+      "xmax": 165,
+      "ymax": 358
+    },
+    {
+      "xmin": 188,
+      "ymin": 315,
+      "xmax": 225,
+      "ymax": 353
+    },
+    {
+      "xmin": 248,
+      "ymin": 320,
+      "xmax": 285,
+      "ymax": 358
+    },
+    {
+      "xmin": 308,
+      "ymin": 315,
+      "xmax": 345,
+      "ymax": 352
+    },
+    {
+      "xmin": 365,
+      "ymin": 318,
+      "xmax": 398,
+      "ymax": 356
+    }
+  ],
+  "DCFS_2019_WOOD_3_492000_5222000_image_y1600_x1600.png": [],
+  "JORN_2019_JORN_3_323000_3620000_image_y6400_x4000.png": [
+    {
+      "xmin": 15,
+      "ymin": 85,
+      "xmax": 118,
+      "ymax": 188
+    },
+    {
+      "xmin": 148,
+      "ymin": 145,
+      "xmax": 228,
+      "ymax": 212
+    },
+    {
+      "xmin": 52,
+      "ymin": 198,
+      "xmax": 118,
+      "ymax": 258
+    },
+    {
+      "xmin": 270,
+      "ymin": 28,
+      "xmax": 382,
+      "ymax": 118
+    },
+    {
+      "xmin": 308,
+      "ymin": 175,
+      "xmax": 390,
+      "ymax": 248
+    },
+    {
+      "xmin": 145,
+      "ymin": 265,
+      "xmax": 268,
+      "ymax": 365
+    },
+    {
+      "xmin": 292,
+      "ymin": 298,
+      "xmax": 392,
+      "ymax": 378
+    }
+  ],
+  "TOOL_2019_TOOL_3_404000_7607000_image_y8800_x4800.png": []
+}

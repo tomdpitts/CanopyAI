@@ -405,17 +405,91 @@ def train_deepforest(
         model.config.validation.csv_file = None
         print("   No validation file provided")
 
-    # Load training data info
+    # ------------------------------------------------------------------
+    # Hard-negative support: rows with blank/NaN xmin are confirmed-empty
+    # images (no trees). DeepForest's utilities.read_file calls shapely on
+    # every row, so we must strip them out before the CSV reaches BoxDataset.
+    # We then inject the empty image paths back into image_names after the
+    # dataset is built — BoxDataset already handles the zero-box case at
+    # __getitem__ line 162 (np.sum(boxes)==0 → torch.zeros).
+    # ------------------------------------------------------------------
     train_df = pd.read_csv(train_csv)
+    _empty_mask = train_df["xmin"].isna() | (train_df["xmin"].astype(str).str.strip() == "")
+    _empty_image_paths = train_df.loc[_empty_mask, "image_path"].unique().tolist()
+    if _empty_image_paths:
+        print(f"\n🔲 Found {len(_empty_image_paths)} confirmed-empty (hard-negative) images — "
+              f"will be injected into dataset after CSV loading")
+        _clean_train_csv = "/tmp/_clean_train.csv"
+        train_df[~_empty_mask].to_csv(_clean_train_csv, index=False)
+        model.config.train.csv_file = _clean_train_csv
+
+        # Build a wrapped train_dataloader that extends image_names with empties
+        import types
+        from deepforest.datasets.training import BoxDataset
+        from torch.utils.data import DataLoader
+
+        _orig_train_dataloader = model.train_dataloader.__func__  # unbound method
+
+        def _train_dataloader_with_empties(self_model):
+            dl = _orig_train_dataloader(self_model)
+            ds = dl.dataset
+            ds.image_names = np.append(ds.image_names, _empty_image_paths)
+            print(f"   ✅ Injected {len(_empty_image_paths)} empty images into training dataset "
+                  f"(total: {len(ds.image_names)} images)")
+            return DataLoader(
+                ds,
+                batch_size=dl.batch_size,
+                shuffle=True,
+                collate_fn=ds.collate_fn,
+                num_workers=dl.num_workers,
+            )
+
+        model.train_dataloader = types.MethodType(_train_dataloader_with_empties, model)
+    else:
+        _clean_train_csv = train_csv
+
     print(f"\n📊 Loading training data from {train_csv}...")
-    print(f"   Training samples: {len(train_df)} bounding boxes")
-    print(f"   Unique images: {train_df['image_path'].nunique()}")
+    print(f"   Training samples: {len(train_df[~_empty_mask])} bounding boxes")
+    print(f"   Annotated images: {train_df[~_empty_mask]['image_path'].nunique()}")
+    print(f"   Empty images    : {len(_empty_image_paths)}")
+    print(f"   Total images    : {train_df[~_empty_mask]['image_path'].nunique() + len(_empty_image_paths)}")
 
     if val_csv:
         val_df = pd.read_csv(val_csv)
+        _val_empty_mask  = val_df["xmin"].isna() | (val_df["xmin"].astype(str).str.strip() == "")
+        _val_empty_paths = val_df.loc[_val_empty_mask, "image_path"].unique().tolist()
+        if _val_empty_paths:
+            _clean_val_csv = "/tmp/_clean_val.csv"
+            val_df[~_val_empty_mask].to_csv(_clean_val_csv, index=False)
+            model.config.validation.csv_file = _clean_val_csv
+
+            import types
+            from deepforest.datasets.training import BoxDataset
+            from torch.utils.data import DataLoader
+
+            _orig_val_dataloader = model.val_dataloader.__func__
+
+            def _val_dataloader_with_empties(self_model):
+                dl = _orig_val_dataloader(self_model)
+                ds = dl.dataset
+                ds.image_names = np.append(ds.image_names, _val_empty_paths)
+                return DataLoader(
+                    ds,
+                    batch_size=dl.batch_size,
+                    shuffle=False,
+                    collate_fn=ds.collate_fn,
+                    num_workers=dl.num_workers,
+                )
+
+            model.val_dataloader = types.MethodType(_val_dataloader_with_empties, model)
+
         print(f"\n📊 Loading validation data from {val_csv}...")
-        print(f"   Validation samples: {len(val_df)} bounding boxes")
-        print(f"   Unique images: {val_df['image_path'].nunique()}")
+        print(f"   Validation samples: {len(val_df[~_val_empty_mask])} bounding boxes")
+        print(f"   Annotated images  : {val_df[~_val_empty_mask]['image_path'].nunique()}")
+        print(f"   Empty images      : {len(_val_empty_paths)}")
+    else:
+        _val_empty_mask  = pd.Series([], dtype=bool)
+        _val_empty_paths = []
 
     # Print configuration
     print(f"\n⚙️  Training configuration:")

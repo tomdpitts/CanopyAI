@@ -30,6 +30,94 @@ Training strategy — 3 stages from weecology pretrained weights:
   Stage C  Unfreeze everything. Joint fine-tune at low LR. Backbone adapts
            to leverage shadow context; gates continue to grow.
 
+─────────────────────────────────────────────────────────────
+Phase 21 — WON + BRU + manually annotated NEON, shadow λ4
+─────────────────────────────────────────────────────────────
+Replaces phase19 sparse auto-annotations with 72 manually annotated NEON crops:
+  - 52 images with tree boxes (334 boxes total)
+  - 20 confirmed-empty hard negatives
+Crops span DCFS, NOGP, OAES, WOOD, STER, JORN, TOOL + new LAJA (tropical),
+LENO (wetland), CLBJ (savanna) sites. 80/20 train/val split by image.
+
+Upload before running:
+    # Tar up manual annotation crops
+    tar -czf phase21_manual.tar.gz -C /Users/tompitts/dphil/CanopyAI manual_annotations/images
+    modal volume put canopyai-deepforest-data phase21_manual.tar.gz phase21/phase21_manual.tar.gz
+    modal volume put canopyai-deepforest-data phase21/phase21_train.csv phase21_train.csv
+    modal volume put canopyai-deepforest-data phase21/phase21_val.csv phase21_val.csv
+
+    source venv310/bin/activate && \
+    modal run --detach deepforest_custom/modal_deepforest.py \
+        --train-csv /data/phase21_train.csv \
+        --val-csv /data/phase21_val.csv \
+        --run-name phase21_B_λ4 \
+        --shadow-loss-reweight --shadow-loss-weight 4.0 \
+        --epochs 50 --patience 10 --lr 0.001 --batch-size 16
+
+─────────────────────────────────────────────────────────────
+Phase 20 — BRU + NEON sparse only (no WON), shadow λ4
+─────────────────────────────────────────────────────────────
+Removes WON training data entirely. Trains on BRU (42 images, 117 boxes)
++ 50 NEON sparse-tree crops (89 boxes). Hypothesis: WON imagery is
+biasing the model toward salient-object detection in open landscapes;
+removing it may improve arid/dryland precision without harming forest biomes.
+Shadow loss reweight λ4 applied (same as phase17_B_λ4).
+
+Upload before running:
+    modal volume put canopyai-deepforest-data phase20/phase20_train.csv phase20_train.csv
+    modal volume put canopyai-deepforest-data phase20/phase20_val.csv phase20_val.csv
+    (neon_sparse_annotations/crops already on volume from phase19)
+
+    source venv310/bin/activate && \
+    modal run --detach deepforest_custom/modal_deepforest.py \
+        --train-csv /data/phase20_train.csv \
+        --val-csv /data/phase20_val.csv \
+        --run-name phase20_B_λ4 \
+        --shadow-loss-reweight --shadow-loss-weight 4.0 \
+        --epochs 50 --patience 10 --lr 0.001 --batch-size 16
+
+─────────────────────────────────────────────────────────────
+Phase 19 — Sparse-tree NEON crops (precision fix v2)
+─────────────────────────────────────────────────────────────
+Replaces phase18 empty-image approach with ~50 weecology-annotated
+400×400px crops from DCFS/OAES/NOGP tiles containing 1–5 trees.
+Teaches selective prediction without the global-suppression collapse
+of phase18. Trains from weecology pretrained weights.
+
+Upload before running:
+    tar -czf phase19_sparse.tar.gz -C /Users/tompitts/dphil/CanopyAI neon_sparse_annotations/crops
+    modal volume put canopyai-deepforest-data phase19_sparse.tar.gz phase19/phase19_sparse.tar.gz
+    modal volume put canopyai-deepforest-data phase19/phase19_train.csv phase19_train.csv
+    modal volume put canopyai-deepforest-data phase19/phase19_val.csv phase19_val.csv
+
+    source venv310/bin/activate && \
+    modal run --detach deepforest_custom/modal_deepforest.py \
+        --train-csv /data/phase19_train.csv \
+        --val-csv /data/phase19_val.csv \
+        --run-name phase19_baseline \
+        --epochs 50 --patience 10 --lr 0.001 --batch-size 16
+
+─────────────────────────────────────────────────────────────
+Phase 18 — Hard-negative NEON empty images (precision fix)
+─────────────────────────────────────────────────────────────
+Adds 16 empty 500×500 NEON patches (no tree annotations) to training
+so the model learns to suppress false positives in open non-forest
+landscapes. Trains from weecology pretrained weights (no phase17 inherit).
+
+Data already in Modal storage after upload:
+    phase18_train.csv             (phase5_train_aug + 16 NEON empty rows)
+    phase18_val.csv               (6 NEON empty val patches)
+    phase18/neon_images.tar.gz    (16 training patches)
+    phase18/neon_val_images.tar.gz (6 val patches)
+
+    source venv310/bin/activate && \
+    modal run --detach deepforest_custom/modal_deepforest.py \
+        --train-csv /data/phase18_train.csv \
+        --val-csv /data/phase18_val.csv \
+        --run-name phase18_baseline \
+        --epochs 50 --patience 10 --lr 0.001 --batch-size 16
+
+─────────────────────────────────────────────────────────────
 Phase 5 training data is already in Modal storage:
     phase5_train_aug.csv
     phase5_val_aug.csv
@@ -162,7 +250,7 @@ data_volume = modal.Volume.from_name("canopyai-deepforest-data", create_if_missi
 # ---------------------------------------------------------------------------
 @app.function(
     image=image,
-    gpu="A100",       # A100-40GB; swap to "A10G" if quota / cost is a concern
+    gpu="H100",
     volumes={
         "/checkpoints": checkpoint_volume,
         "/data": data_volume,
@@ -283,17 +371,26 @@ def train_deepforest_modal(
         # e.g.  /Users/tompitts/dphil/CanopyAI/deepforest_custom/won/raw/x.tif
         #   ->  /data/images/won/raw/x.tif
         import pandas as pd
-        _local_prefix = "/Users/tompitts/dphil/CanopyAI/deepforest_custom/"
-        _modal_prefix = "/data/images/"
+        _path_rewrites = [
+            # deepforest_custom tiles (phase5, bru, won, etc.)
+            ("/Users/tompitts/dphil/CanopyAI/deepforest_custom/", "/data/images/"),
+            # NEON hard-negative patches (phase18)
+            ("/Users/tompitts/dphil/CanopyAI/phase18/", "/data/images/phase18/"),
+            # NEON sparse-tree crops (phase19)
+            ("/Users/tompitts/dphil/CanopyAI/neon_sparse_annotations/", "/data/images/neon_sparse_annotations/"),
+            # Manually annotated NEON crops (phase21)
+            ("/Users/tompitts/dphil/CanopyAI/manual_annotations/", "/data/images/manual_annotations/"),
+        ]
 
         def _rewrite_csv(csv_path):
             if not os.path.exists(csv_path):
                 return
             df = pd.read_csv(csv_path)
             if "image_path" in df.columns:
-                df["image_path"] = df["image_path"].str.replace(
-                    _local_prefix, _modal_prefix, regex=False
-                )
+                for local_pfx, modal_pfx in _path_rewrites:
+                    df["image_path"] = df["image_path"].str.replace(
+                        local_pfx, modal_pfx, regex=False
+                    )
                 df.to_csv(csv_path, index=False)
                 print(f"   ✅ Rewrote paths in {csv_path}")
 

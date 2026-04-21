@@ -124,46 +124,67 @@ def compute_iou(box1, box2):
     return iou, coverage1, coverage2
 
 
-def apply_nms(bboxes, scores, iou_threshold=0.5, coverage_threshold=0.5):
+def apply_nms(bboxes, scores, iou_threshold=0.5, coverage_threshold=0.5,
+              area_weight=0.5):
     """
     Apply Non-Maximum Suppression to remove overlapping detections.
     Suppresses if IoU > iou_threshold OR if one box is >coverage_threshold
     covered by another (handles small boxes inside larger ones).
 
-    Args:
-        bboxes: List of bounding boxes [xmin, ymin, xmax, ymax]
-        scores: List of confidence scores
-        iou_threshold: IoU threshold for suppression (default 0.5)
-        coverage_threshold: Coverage threshold - suppress if box is this
-                           fraction covered by another (default 0.5)
-
-    Returns:
-        keep_indices: List of indices to keep
+    Sort key: bbox area (largest survives). area_weight is kept for
+    backward compatibility but ignored — pure area ordering is used.
     """
     if len(bboxes) == 0:
         return []
 
-    # Sort by score (descending)
-    indices = np.argsort(scores)[::-1].tolist()
+    areas = np.array([(b[2]-b[0])*(b[3]-b[1]) for b in bboxes], dtype=float)
+    indices = np.argsort(areas)[::-1].tolist()
     keep = []
 
     while indices:
-        # Keep the highest scoring box
         current = indices.pop(0)
         keep.append(current)
 
-        # Remove boxes with high IoU overlap OR high coverage
         remaining = []
         for idx in indices:
             iou, coverage_current, coverage_idx = compute_iou(
                 bboxes[current], bboxes[idx]
             )
-            # Suppress if: high IoU OR the candidate box is mostly covered
             if iou < iou_threshold and coverage_idx < coverage_threshold:
                 remaining.append(idx)
         indices = remaining
 
     return keep
+
+
+def apply_containment_suppression(bboxes, containment_threshold=0.8):
+    """
+    Second-pass suppression: remove any box that is ≥containment_threshold
+    contained within a larger box, regardless of score order.
+
+    This catches cases where high-scoring small detections slip through NMS
+    because their IoU with a larger enclosing box is low (dominated by the
+    large box's area).
+
+    Returns indices into bboxes to keep.
+    """
+    if len(bboxes) == 0:
+        return []
+    areas = [(b[2] - b[0]) * (b[3] - b[1]) for b in bboxes]
+    to_remove = set()
+    for i in range(len(bboxes)):
+        if i in to_remove:
+            continue
+        for j in range(len(bboxes)):
+            if i == j or j in to_remove:
+                continue
+            _, cov_i, _ = compute_iou(bboxes[i], bboxes[j])
+            # box i is mostly contained within box j, and j is larger → remove i
+            if cov_i >= containment_threshold and areas[j] > areas[i]:
+                to_remove.add(i)
+                break
+    return [i for i in range(len(bboxes)) if i not in to_remove]
+
 
 
 # =============================================================================
@@ -407,7 +428,7 @@ def detect_trees_deepforest(
     model_path=None,
     shadow_vector=None,
     tile_size=400,
-    tile_overlap=0.05,
+    tile_overlap=0.50,
     confidence_threshold=0.35,
     debug_tile_dir=None,
     shadow_map_path=None,      # If set, write full-image shadow map as GeoTIFF here
@@ -424,7 +445,7 @@ def detect_trees_deepforest(
                    Auto-detects whether it's standard or FiLM-conditioned
         shadow_vector: (1, 2) tensor representing shadow direction for FiLM-DeepForest
         tile_size: Size of each tile (default 400px - DeepForest's native)
-        tile_overlap: Overlap between tiles (default 0.05 = 5%)
+        tile_overlap: Overlap between tiles (default 0.30 = 30%)
         confidence_threshold: Minimum confidence score for detections
 
     Returns:
@@ -921,9 +942,13 @@ def segment_trees_sam(
     bboxes,
     scores,
     tile_size=1024,
-    tile_overlap=0.1,  # 10% overlap prevents edge clipping
+    tile_overlap=0.5,
     cache_dir=None,
     batch_size=500,
+    sam_mode="best_tile",
+    containment_threshold=0.8,
+    bbox_pad=0.0,
+    skip_nms=False,
 ):
     """
     Pass 2: Run SAM segmentation on 1024px tiles with batched bboxes.
@@ -979,164 +1004,221 @@ def segment_trees_sam(
     total_boxes = len(bboxes)
     tiles_with_boxes = 0
 
-    # Process tiles with overlap to prevent edge clipping
-    # Overlap ensures trees near edges get full context
-    def _make_starts(dim):
-        starts = list(range(0, dim, stride)) if dim > tile_size else [0]
-        if dim > tile_size and starts[-1] + tile_size < dim:
-            starts.append(dim - tile_size)
-        return starts
+    if sam_mode == "per_box":
+        # Per-box mode: for each detection, crop a tile_size×tile_size region
+        # centered on the box so SAM always sees the full crown.
+        # Group boxes that share the same crop to batch set_image() calls.
+        from collections import defaultdict as _dd
+        crop_groups = _dd(list)
+        for i, (cx, cy) in enumerate(box_centers):
+            xs = max(0, min(int(cx - tile_size // 2), max(0, w - tile_size)))
+            ys = max(0, min(int(cy - tile_size // 2), max(0, h - tile_size)))
+            crop_groups[(xs, ys)].append(i)
+        print(f"   SAM mode: per_box  ({len(crop_groups)} unique crops for {total_boxes} boxes)")
+        tile_iter = [
+            (xs, ys, min(xs + tile_size, w), min(ys + tile_size, h), idxs)
+            for (xs, ys), idxs in sorted(crop_groups.items())
+        ]
+    else:
+        # Grid mode: regular tiled scan with overlap
+        def _make_starts(dim):
+            starts = list(range(0, dim, stride)) if dim > tile_size else [0]
+            if dim > tile_size and starts[-1] + tile_size < dim:
+                starts.append(dim - tile_size)
+            return starts
+        y_starts = _make_starts(h)
+        x_starts = _make_starts(w)
+        overlap_pct = tile_overlap * 100
 
-    y_starts = _make_starts(h)
-    x_starts = _make_starts(w)
+        all_tiles = [
+            (xs, ys, min(xs + tile_size, w), min(ys + tile_size, h))
+            for ys in y_starts for xs in x_starts
+        ]
 
-    overlap_pct = tile_overlap * 100
-    print(f"   Tile overlap: {overlap_pct:.0f}% (prevents edge clipping)")
-
-    for y_start in tqdm(list(y_starts), desc="   SAM tiles"):
-        for x_start in x_starts:
-            y_end = min(y_start + tile_size, h)
-            x_end = min(x_start + tile_size, w)
-
-            # Find boxes whose CENTER falls within this tile
-            tile_box_indices = []
-            for i, (cx, cy) in enumerate(box_centers):
-                if i not in processed_boxes:
-                    if x_start <= cx < x_end and y_start <= cy < y_end:
-                        tile_box_indices.append(i)
+        if sam_mode == "best_tile":
+            # Assign each box to the tile where the largest fraction of the box is contained
+            print(f"   SAM mode: best_tile  tile_overlap={overlap_pct:.0f}%")
+            from collections import defaultdict as _dd
+            tile_to_boxes = _dd(list)
+            for i, box in enumerate(bboxes):
+                bw = box[2] - box[0]; bh = box[3] - box[1]
+                box_area = bw * bh
+                best_tile, best_frac = None, -1.0
+                for tile in all_tiles:
+                    xs, ys, xe, ye = tile
+                    ix0 = max(box[0], xs); iy0 = max(box[1], ys)
+                    ix1 = min(box[2], xe); iy1 = min(box[3], ye)
+                    frac = (max(0, ix1-ix0) * max(0, iy1-iy0)) / box_area if box_area > 0 else 0
+                    if frac > best_frac:
+                        best_frac, best_tile = frac, tile
+                if best_tile is not None:
+                    tile_to_boxes[best_tile].append(i)
+                    processed_boxes.add(i)
+            tile_iter = [
+                (xs, ys, xe, ye, idxs)
+                for (xs, ys, xe, ye), idxs in tile_to_boxes.items()
+                if idxs
+            ]
+        else:
+            # Default grid: assign box to first tile whose region contains the box centre
+            print(f"   SAM mode: grid  tile_overlap={overlap_pct:.0f}%")
+            tile_iter = []
+            for xs, ys, xe, ye in all_tiles:
+                idxs = []
+                for i, (cx, cy) in enumerate(box_centers):
+                    if i not in processed_boxes and xs <= cx < xe and ys <= cy < ye:
+                        idxs.append(i)
                         processed_boxes.add(i)
+                if idxs:
+                    tile_iter.append((xs, ys, xe, ye, idxs))
 
-            if not tile_box_indices:
+    for x_start, y_start, x_end, y_end, tile_box_indices in tqdm(tile_iter, desc="   SAM tiles"):
+        # Re-add to processed_boxes for per_box mode (grid mode already populated it above)
+        if sam_mode == "per_box":
+            processed_boxes.update(tile_box_indices)
+
+        if not tile_box_indices:
+            continue
+
+        tiles_with_boxes += 1
+
+        # Extract tile at NATIVE 1024px (no padding/resizing)
+        tile_rgb = image[y_start:y_end, x_start:x_end]
+
+        # Progress logging
+        pct = len(processed_boxes) / total_boxes * 100
+        print(
+            f"   Tile ({x_start},{y_start}): {len(tile_box_indices)} boxes "
+            f"| {len(processed_boxes)}/{total_boxes} total ({pct:.0f}%)"
+        )
+
+        # Set SAM image (expensive - done once per tile)
+        sam_predictor.set_image(tile_rgb)
+
+        # Convert global boxes to tile-relative coordinates, with optional padding
+        local_boxes = []
+        padded_global_boxes = []
+        for i in tile_box_indices:
+            box = bboxes[i]
+            bw = box[2] - box[0]
+            bh = box[3] - box[1]
+            pad_x = bw * bbox_pad
+            pad_y = bh * bbox_pad
+            local_box = [
+                max(0, box[0] - x_start - pad_x),
+                max(0, box[1] - y_start - pad_y),
+                min(tile_rgb.shape[1], box[2] - x_start + pad_x),
+                min(tile_rgb.shape[0], box[3] - y_start + pad_y),
+            ]
+            local_boxes.append(local_box)
+            padded_global_boxes.append([
+                max(0, box[0] - pad_x),
+                max(0, box[1] - pad_y),
+                min(w, box[2] + pad_x),
+                min(h, box[3] + pad_y),
+            ])
+
+        # Transform boxes for SAM
+        transformed_boxes = sam_predictor.transform.apply_boxes_torch(
+            torch.as_tensor(
+                local_boxes, device=sam_predictor.device, dtype=torch.float32
+            ),
+            tile_rgb.shape[:2],
+        )
+
+        # Run SAM batch prediction with multiple mask options
+        try:
+            masks, iou_preds, _ = sam_predictor.predict_torch(
+                point_coords=None,
+                point_labels=None,
+                boxes=transformed_boxes,
+                multimask_output=True,  # Get 3 mask candidates per box
+            )
+            # masks: (N, 3, tile_H, tile_W)
+            all_masks_np = masks.cpu().numpy()
+        except Exception as e:
+            print(f"⚠️  SAM failed on tile ({x_start}, {y_start}): {e}")
+            continue
+
+        # For each box, select the mask with best overlap with bbox
+        tile_h, tile_w = tile_rgb.shape[:2]
+        mask_h, mask_w = all_masks_np.shape[2], all_masks_np.shape[3]
+        scale_x = mask_w / tile_w
+        scale_y = mask_h / tile_h
+
+        for mask_idx, (box_idx, local_box) in enumerate(
+            zip(tile_box_indices, local_boxes)
+        ):
+            x1 = int(local_box[0] * scale_x)
+            y1 = int(local_box[1] * scale_y)
+            x2 = int(local_box[2] * scale_x)
+            y2 = int(local_box[3] * scale_y)
+
+            # Clamp to mask bounds
+            y1_c, x1_c = max(0, y1), max(0, x1)
+            y2_c, x2_c = min(mask_h, y2), min(mask_w, x2)
+
+            # Select mask with highest overlap with bbox
+            best_mask = None
+            best_overlap = -1
+            for m_idx in range(all_masks_np.shape[1]):
+                candidate = all_masks_np[mask_idx, m_idx]
+                overlap = candidate[y1_c:y2_c, x1_c:x2_c].sum()
+                if overlap > best_overlap:
+                    best_overlap = overlap
+                    best_mask = candidate
+
+            if best_mask is None or best_overlap == 0:
                 continue
 
-            tiles_with_boxes += 1
+            # Isolate only the connected component that overlaps with bbox
+            # (finetuned model predicts multiple trees, we want just the one)
+            mask_uint8 = best_mask.astype(np.uint8)
+            num_labels, labels = cv2.connectedComponents(mask_uint8)
 
-            # Extract tile at NATIVE 1024px (no padding/resizing)
-            tile_rgb = image[y_start:y_end, x_start:x_end]
+            # Find which component overlaps with bbox
+            bbox_labels = labels[y1_c:y2_c, x1_c:x2_c]
+            overlapping_labels = set(bbox_labels.flatten()) - {0}
 
-            # Progress logging
-            pct = len(processed_boxes) / total_boxes * 100
-            print(
-                f"   Tile ({x_start},{y_start}): {len(tile_box_indices)} boxes "
-                f"| {len(processed_boxes)}/{total_boxes} total ({pct:.0f}%)"
-            )
-
-            # Set SAM image (expensive - done once per tile)
-            sam_predictor.set_image(tile_rgb)
-
-            # Convert global boxes to tile-relative coordinates
-            local_boxes = []
-            for i in tile_box_indices:
-                box = bboxes[i]
-                local_box = [
-                    max(0, box[0] - x_start),
-                    max(0, box[1] - y_start),
-                    min(tile_rgb.shape[1], box[2] - x_start),
-                    min(tile_rgb.shape[0], box[3] - y_start),
-                ]
-                local_boxes.append(local_box)
-
-            # Transform boxes for SAM
-            transformed_boxes = sam_predictor.transform.apply_boxes_torch(
-                torch.as_tensor(
-                    local_boxes, device=sam_predictor.device, dtype=torch.float32
-                ),
-                tile_rgb.shape[:2],
-            )
-
-            # Run SAM batch prediction with multiple mask options
-            try:
-                masks, iou_preds, _ = sam_predictor.predict_torch(
-                    point_coords=None,
-                    point_labels=None,
-                    boxes=transformed_boxes,
-                    multimask_output=True,  # Get 3 mask candidates per box
-                )
-                # masks: (N, 3, tile_H, tile_W)
-                all_masks_np = masks.cpu().numpy()
-            except Exception as e:
-                print(f"⚠️  SAM failed on tile ({x_start}, {y_start}): {e}")
+            if not overlapping_labels:
                 continue
 
-            # For each box, select the mask with best overlap with bbox
-            tile_h, tile_w = tile_rgb.shape[:2]
-            mask_h, mask_w = all_masks_np.shape[2], all_masks_np.shape[3]
-            scale_x = mask_w / tile_w
-            scale_y = mask_h / tile_h
+            # Keep only the largest overlapping component
+            best_label = None
+            best_size = 0
+            for lbl in overlapping_labels:
+                size = (labels == lbl).sum()
+                if size > best_size:
+                    best_size = size
+                    best_label = lbl
 
-            for mask_idx, (box_idx, local_box) in enumerate(
-                zip(tile_box_indices, local_boxes)
-            ):
-                x1 = int(local_box[0] * scale_x)
-                y1 = int(local_box[1] * scale_y)
-                x2 = int(local_box[2] * scale_x)
-                y2 = int(local_box[3] * scale_y)
+            # Create filtered mask with only the selected component
+            filtered_mask = labels == best_label
 
-                # Clamp to mask bounds
-                y1_c, x1_c = max(0, y1), max(0, x1)
-                y2_c, x2_c = min(mask_h, y2), min(mask_w, x2)
+            all_masks.append(filtered_mask)
+            all_processed_bboxes.append(bboxes[box_idx])
+            all_processed_scores.append(scores[box_idx])
+            all_tile_bounds.append((y_start, y_end, x_start, x_end, h, w))
 
-                # Select mask with highest overlap with bbox
-                best_mask = None
-                best_overlap = -1
-                for m_idx in range(all_masks_np.shape[1]):
-                    candidate = all_masks_np[mask_idx, m_idx]
-                    overlap = candidate[y1_c:y2_c, x1_c:x2_c].sum()
-                    if overlap > best_overlap:
-                        best_overlap = overlap
-                        best_mask = candidate
-
-                if best_mask is None or best_overlap == 0:
-                    continue
-
-                # Isolate only the connected component that overlaps with bbox
-                # (finetuned model predicts multiple trees, we want just the one)
-                mask_uint8 = best_mask.astype(np.uint8)
-                num_labels, labels = cv2.connectedComponents(mask_uint8)
-
-                # Find which component overlaps with bbox
-                bbox_labels = labels[y1_c:y2_c, x1_c:x2_c]
-                overlapping_labels = set(bbox_labels.flatten()) - {0}
-
-                if not overlapping_labels:
-                    continue
-
-                # Keep only the largest overlapping component
-                best_label = None
-                best_size = 0
-                for lbl in overlapping_labels:
-                    size = (labels == lbl).sum()
-                    if size > best_size:
-                        best_size = size
-                        best_label = lbl
-
-                # Create filtered mask with only the selected component
-                filtered_mask = labels == best_label
-
-                all_masks.append(filtered_mask)
-                all_processed_bboxes.append(bboxes[box_idx])
-                all_processed_scores.append(scores[box_idx])
-                all_tile_bounds.append((y_start, y_end, x_start, x_end, h, w))
-
-            # Flush to disk periodically
-            if len(all_masks) >= batch_size:
-                batch_file = cache_dir / f"batch_{len(cache_files):04d}.npz"
-                # Create object array for variable-shaped masks
-                masks_arr = np.empty(len(all_masks), dtype=object)
-                for i, m in enumerate(all_masks):
-                    masks_arr[i] = m
-                np.savez_compressed(
-                    batch_file,
-                    masks=masks_arr,
-                    bboxes=np.array(all_processed_bboxes, dtype=np.float32),
-                    bounds=np.array(all_tile_bounds, dtype=np.int32),
-                )
-                cache_files.append(batch_file)
-                mb = batch_file.stat().st_size / (1024**2)
-                print(f"   💾 Cached {len(all_masks)} masks ({mb:.1f}MB)")
-                all_masks = []
-                all_processed_bboxes = []
-                all_tile_bounds = []
+        # Flush to disk periodically
+        if len(all_masks) >= batch_size:
+            batch_file = cache_dir / f"batch_{len(cache_files):04d}.npz"
+            # Create object array for variable-shaped masks
+            masks_arr = np.empty(len(all_masks), dtype=object)
+            for i, m in enumerate(all_masks):
+                masks_arr[i] = m
+            np.savez_compressed(
+                batch_file,
+                masks=masks_arr,
+                bboxes=np.array(all_processed_bboxes, dtype=np.float32),
+                bounds=np.array(all_tile_bounds, dtype=np.int32),
+            )
+            cache_files.append(batch_file)
+            mb = batch_file.stat().st_size / (1024**2)
+            print(f"   💾 Cached {len(all_masks)} masks ({mb:.1f}MB)")
+            all_masks = []
+            all_processed_bboxes = []
+            all_tile_bounds = []
 
     # Flush remaining
     if len(all_masks) > 0:
@@ -1169,18 +1251,31 @@ def segment_trees_sam(
         with np.load(cf) as data:
             all_bboxes_loaded.extend(data["bboxes"].tolist())
 
-    # Apply NMS
-    print("\n🔄 Applying NMS (IoU=0.5, coverage=0.5)...")
-    keep_indices = apply_nms(
-        all_bboxes_loaded,
-        all_processed_scores,
-        iou_threshold=0.5,
-        coverage_threshold=0.5,
-    )
-    keep_set = set(keep_indices)
+    # Apply NMS (skip if requested)
+    if skip_nms:
+        print(f"\n⚠️  SAM-stage NMS skipped: keeping all {len(all_bboxes_loaded)} detections")
+        keep_indices = list(range(len(all_bboxes_loaded)))
+    else:
+        print("\n🔄 Applying NMS (IoU=0.5, coverage=0.5)...")
+        keep_indices = apply_nms(
+            all_bboxes_loaded,
+            all_processed_scores,
+            iou_threshold=0.5,
+            coverage_threshold=0.5,
+        )
+        removed = len(all_bboxes_loaded) - len(keep_indices)
+        print(f"   Removed {removed} overlapping detections")
 
-    removed = len(all_bboxes_loaded) - len(keep_indices)
-    print(f"   Removed {removed} overlapping detections")
+        if containment_threshold:
+            nms_bboxes = [all_bboxes_loaded[i] for i in keep_indices]
+            nms_scores = [all_processed_scores[i] for i in keep_indices]
+            keep2 = apply_containment_suppression(nms_bboxes, containment_threshold)
+            before = len(keep_indices)
+            keep_indices = [keep_indices[i] for i in keep2]
+            print(f"   Containment suppression (thr={containment_threshold}): "
+                  f"removed {before - len(keep_indices)} nested boxes")
+
+    keep_set = set(keep_indices)
     print(f"   Keeping {len(keep_indices)} unique trees")
 
     # Filter results
@@ -1290,11 +1385,11 @@ def load_masks_from_cache(cache_files):
             masks  = data["masks"]
             bounds = data["bounds"]
             bboxes = data["bboxes"]
-            for local_mask, bound, bbox in zip(masks, bounds, bboxes):
+            for local_mask, bound, det_bbox in zip(masks, bounds, bboxes):
                 y_start, y_end, x_start, x_end, h, w = bound
                 full_mask = np.zeros((h, w), dtype=bool)
                 full_mask[y_start:y_end, x_start:x_end] = local_mask
-                yield full_mask, bbox.tolist()
+                yield full_mask, det_bbox.tolist()
 
 
 def mask_to_polygon(mask, simplify_tolerance=1.0):
@@ -1344,7 +1439,8 @@ def mask_to_polygon(mask, simplify_tolerance=1.0):
 
 
 def save_results(
-    cache_files, bboxes, deepforest_scores, output_dir, tif_stem, crs=None
+    cache_files, bboxes, deepforest_scores, output_dir, tif_stem, crs=None,
+    poly_containment_threshold=0.9,
 ):
     """
     Save segmentation results as GeoJSON and visualization.
@@ -1357,41 +1453,75 @@ def save_results(
         output_dir: Output directory path
         tif_stem: Stem name of input TIF file
         crs: Coordinate reference system
+        poly_containment_threshold: Remove any polygon whose area is >=this
+            fraction covered by the union of all larger polygons (default 0.9).
+            Set to 0 to disable.
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Convert masks to GeoJSON features
-    features = []
+    # Build polygon list from all masks first so we can run containment on polygons.
+    from shapely.strtree import STRtree as _STRtree
+    from shapely.validation import make_valid as _make_valid
 
-    # Load masks one at a time from cache.
-    # Use the bbox stored alongside each mask in the cache (guaranteed aligned),
-    # not the external bboxes parameter (which can be in a different order).
     mask_generator = load_masks_from_cache(cache_files)
-
+    raw = []  # (polygon, score, det_bbox)
     for i, score in enumerate(deepforest_scores):
         mask, bbox = next(mask_generator)
         polygon = mask_to_polygon(mask)
+        raw.append((polygon, float(score), list(bbox)))
 
+    # Polygon-level containment suppression: remove small polygons whose area
+    # is >=poly_containment_threshold covered by a single larger polygon.
+    if poly_containment_threshold > 0:
+        valid_polys = [
+            (p if p.is_valid else _make_valid(p)) if p is not None else None
+            for p, _, _ in raw
+        ]
+        areas = [p.area if p is not None else 0.0 for p in valid_polys]
+        to_remove = set()
+        # Build STRtree over all non-None polys for fast candidate lookup
+        idx_map = [i for i, p in enumerate(valid_polys) if p is not None]
+        if idx_map:
+            tree = _STRtree([valid_polys[i] for i in idx_map])
+            for i, p in enumerate(valid_polys):
+                if p is None or i in to_remove:
+                    continue
+                candidates = tree.query(p, predicate="intersects")
+                for c in candidates:
+                    j = idx_map[c]
+                    if j == i or j in to_remove:
+                        continue
+                    if areas[j] <= areas[i]:
+                        continue
+                    inter = p.intersection(valid_polys[j]).area
+                    if areas[i] > 0 and inter / areas[i] >= poly_containment_threshold:
+                        to_remove.add(i)
+                        break
+        if to_remove:
+            print(f"   Polygon containment suppression (thr={poly_containment_threshold}): "
+                  f"removed {len(to_remove)} nested polygons")
+        raw = [(p, s, b) for k, (p, s, b) in enumerate(raw) if k not in to_remove]
+
+    # Convert to GeoJSON features
+    features = []
+    for i, (polygon, score, det_bbox) in enumerate(raw):
         if polygon is None:
             continue
-
-        # Create feature
         feature = {
             "type": "Feature",
             "id": i,
             "properties": {
                 "tree_id": i,
-                "deepforest_score": float(score),
+                "deepforest_score": score,
                 "area_pixels": float(polygon.area),
-                "bbox": bbox,
+                "det_bbox": det_bbox,
             },
             "geometry": {
                 "type": "Polygon",
                 "coordinates": [list(polygon.exterior.coords)],
             },
         }
-
         features.append(feature)
 
     # Create GeoJSON FeatureCollection
@@ -1676,16 +1806,21 @@ def main(args):
         return
 
     # Apply NMS immediately to remove duplicates
-    print(f"\n🔄 Applying NMS to {len(all_bboxes)} detections...")
-    keep_indices = apply_nms(
-        all_bboxes, all_scores, iou_threshold=0.5, coverage_threshold=0.5
-    )
-    valid_bboxes = [all_bboxes[i] for i in keep_indices]
-    valid_scores = [all_scores[i] for i in keep_indices]
-
-    removed = len(all_bboxes) - len(valid_bboxes)
-    print(f"   Removed {removed} overlapping detections")
-    print(f"   Keeping {len(valid_bboxes)} unique trees")
+    if args.skip_nms:
+        print(f"\n⚠️  NMS skipped (--skip_nms): keeping all {len(all_bboxes)} detections")
+        valid_bboxes = all_bboxes
+        valid_scores = all_scores
+    else:
+        print(f"\n🔄 Applying NMS to {len(all_bboxes)} detections...")
+        keep_indices = apply_nms(
+            all_bboxes, all_scores, iou_threshold=0.5, coverage_threshold=0.5,
+            area_weight=args.area_weight,
+        )
+        valid_bboxes = [all_bboxes[i] for i in keep_indices]
+        valid_scores = [all_scores[i] for i in keep_indices]
+        removed = len(all_bboxes) - len(valid_bboxes)
+        print(f"   Removed {removed} overlapping detections")
+        print(f"   Keeping {len(valid_bboxes)} unique trees")
 
     # Debug: limit to single box
     if args.debug_single_box and len(valid_bboxes) > 0:
@@ -1704,6 +1839,10 @@ def main(args):
         tile_overlap=args.sam_tile_overlap,
         cache_dir=args.cache_dir,
         batch_size=args.batch_size,
+        sam_mode=args.sam_mode,
+        containment_threshold=0 if args.skip_nms else args.containment_threshold,
+        bbox_pad=args.bbox_pad,
+        skip_nms=args.skip_nms,
     )
     timings["SAM"] = time.time() - sam_start
 
@@ -1756,7 +1895,8 @@ def main(args):
     # Save results (loads masks from cache)
     save_start = time.time()
     output_geojson_path, features = save_results(
-        cache_files, valid_bboxes, valid_scores, args.output_dir, tif_path.stem, crs
+        cache_files, valid_bboxes, valid_scores, args.output_dir, tif_path.stem, crs,
+        poly_containment_threshold=0 if args.skip_nms else args.poly_containment_threshold,
     )
     timings["Save GeoJSON"] = time.time() - save_start
 
@@ -1920,9 +2060,59 @@ def parse_args():
     ap.add_argument(
         "--sam_tile_overlap",
         type=float,
-        default=0.15,
-        help="SAM tile overlap as fraction (default: 0.1 = 10%%). "
-        "Overlap prevents mask clipping at tile edges.",
+        default=0.2,
+        help="SAM tile overlap as fraction (default: 0.2 = 20%%). "
+        "With best_tile assignment, overlap mainly ensures tiles exist for edge boxes.",
+    )
+
+    ap.add_argument(
+        "--sam_mode",
+        type=str,
+        default="best_tile",
+        choices=["grid", "per_box", "best_tile"],
+        help="SAM tiling mode: 'best_tile' (default) assigns each box to the tile "
+             "where it is most contained, avoiding prompt clamping at tile edges.",
+    )
+
+    ap.add_argument(
+        "--containment_threshold",
+        type=float,
+        default=0.8,
+        help="Post-NMS containment pass: remove any box that is ≥this fraction "
+             "contained within a larger box (default 0.8). Set to 0 to disable.",
+    )
+
+    ap.add_argument(
+        "--poly_containment_threshold",
+        type=float,
+        default=0.9,
+        help="Post-SAM polygon containment pass: remove any polygon whose area "
+             "is ≥this fraction covered by a single larger polygon (default 0.9). "
+             "Set to 0 to disable.",
+    )
+
+    ap.add_argument(
+        "--skip_nms",
+        action="store_true",
+        help="Skip all NMS passes (detection-stage and SAM-stage). "
+             "Passes all raw detections to SAM. Useful for debugging.",
+    )
+
+    ap.add_argument(
+        "--bbox_pad",
+        type=float,
+        default=0.0,
+        help="Expand each detection bbox by this fraction of its width/height "
+             "before passing to SAM as a prompt (default 0.25 = 25%%). "
+             "Helps SAM see beyond clipped detection edges. Set to 0 to disable.",
+    )
+
+    ap.add_argument(
+        "--area_weight",
+        type=float,
+        default=0.5,
+        help="Area bias in NMS ranking: sort key = score * (area/median_area)^area_weight. "
+             "Larger values prefer bigger boxes over higher-scoring clipped ones (default 0.5).",
     )
 
     ap.add_argument(

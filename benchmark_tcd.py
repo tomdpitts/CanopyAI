@@ -336,8 +336,26 @@ def load_predictions(pred_path, meta):
     sc = score_column(gdf)
     scores = gdf[sc].values.astype(float) if sc else np.ones(len(gdf))
 
-    # Bounding-box polygons (for box-IoU comparison if needed)
-    box_polys = [shapely_box(*g.bounds) if g else None for g in gdf.geometry]
+    # Detection bbox polygons: use stored det_bbox if available, else fall back to polygon bounds
+    box_polys = []
+    for i, g in enumerate(gdf.geometry):
+        if g is None:
+            box_polys.append(None)
+            continue
+        det_bbox = None
+        if "det_bbox" in gdf.columns:
+            raw = gdf["det_bbox"].iloc[i]
+            if raw is not None:
+                import json as _json
+                if isinstance(raw, str):
+                    raw = _json.loads(raw)
+                if isinstance(raw, (list, tuple)) and len(raw) == 4:
+                    # det_bbox is in pixel space; apply same transform as geometry
+                    x0, y0, x1, y1 = raw
+                    det_bbox = affine_transform(shapely_box(x0, y0, x1, y1), coeffs)
+        if det_bbox is None:
+            det_bbox = shapely_box(*g.bounds)
+        box_polys.append(det_bbox)
 
     return list(gdf.geometry), list(scores), box_polys
 
