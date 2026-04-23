@@ -1,0 +1,187 @@
+model,tile_stem,biome_name,biome_group,country,image_id,threshold,n_gt,n_pred,tp,fp,fn,poly_precision,poly_recall,poly_f1,area_precision,area_recall,area_f1
+weecology,tcd_tile_0,West Sudanian savanna,Arid / dryland,,1159,0.3522,42,254,16,238,26,0.063,0.381,0.1081,0.9395,0.2563,0.4027
+weecology,tcd_tile_1,West Sudanian savanna,Arid / dryland,,1325,0.3522,43,56,24,32,19,0.4286,0.5581,0.4848,0.771,0.1806,0.2926
+weecology,tcd_tile_10,West Sudanian savanna,Arid / dryland,,775,0.3522,34,38,11,27,23,0.2895,0.3235,0.3056,0.6297,0.1241,0.2074
+weecology,tcd_tile_100,Northern Zanzibar-Inhambane coastal forest mosaic,African tropical forest,,2591,0.3522,177,134,40,94,137,0.2985,0.226,0.2572,0.9591,0.056,0.1059
+weecology,tcd_tile_101,Sulawesi lowland rain forests,SE Asian & Pacific rainforest,,4396,0.3522,98,30,22,8,76,0.7333,0.2245,0.3438,0.8146,0.1701,0.2814
+weecology,tcd_tile_102,Rodope montane mixed forests,European forest,,4562,0.3522,47,53,15,38,32,0.283,0.3191,0.3,0.9032,0.0997,0.1796
+weecology,tcd_tile_103,Southeastern mixed forests,N. American forest,,833,0.3522,24,8,7,1,17,0.875,0.2917,0.4375,0.9257,0.0136,0.0267
+weecology,tcd_tile_104,Sarmatic mixed forests,European forest,,2868,0.3522,6,17,2,15,4,0.1176,0.3333,0.1739,0.9998,0.1389,0.2439
+weecology,tcd_tile_105,Luzon rain forests,SE Asian & Pacific rainforest,,1290,0.3522,3,567,1,566,2,0.0018,0.3333,0.0035,0.9998,0.1448,0.2529
+weecology,tcd_tile_106,Upper Midwest forest-savanna transition,N. American forest,,1833,0.3522,19,40,17,23,2,0.425,0.8947,0.5763,0.9052,0.3407,0.495
+weecology,tcd_tile_107,Taiwan subtropical evergreen forests,SE Asian & Pacific rainforest,,2527,0.3522,63,82,28,54,35,0.3415,0.4444,0.3862,0.5748,0.0911,0.1573
+weecology,tcd_tile_108,Tongan tropical moist forests,SE Asian & Pacific rainforest,,4466,0.3522,96,12,2,10,94,0.1667,0.0208,0.037,0.2906,0.0074,0.0144
+weecology,tcd_tile_109,Celtic broadleaf forests,European forest,,4770,0.3522,20,11,7,4,13,0.6364,0.35,0.4516,0.7106,0.2101,0.3243
+weecology,tcd_tile_11,Low Monte,Arid / dryland,,573,0.3522,302,224,133,91,169,0.5938,0.4404,0.5057,0.9789,0.2841,0.4404
+weecology,tcd_tile_112,Northern Zanzibar-Inhambane coastal forest mosaic,African tropical forest,,4203,0.3522,296,484,101,383,195,0.2087,0.3412,0.259,0.9339,0.2078,0.34
+weecology,tcd_tile_113,East European forest steppe,European forest,,1897,0.3522,48,184,27,157,21,0.1467,0.5625,0.2328,0.6871,0.0759,0.1367
+weecology,tcd_tile_114,Central European mixed forests,European forest,,3112,0.3522,81,86,34,52,47,0.3953,0.4198,0.4072,0.7262,0.0859,0.1537
+weecology,tcd_tile_115,Northern Zanzibar-Inhambane coastal forest mosaic,African tropical forest,,1978,0.3522,228,86,43,43,185,0.5,0.1886,0.2739,0.928,0.1241,0.2189
+weecology,tcd_tile_117,Northern Zanzibar-Inhambane coastal forest mosaic,African tropical forest,,1728,0.3522,193,51,46,5,147,0.902,0.2383,0.377,0.9059,0.1253,0.2202
+weecology,tcd_tile_118,Northern Zanzibar-Inhambane coastal forest mosaic,African tropical forest,,1145,0.3522,93,251,49,202,44,0.1952,0.5269,0.2849,0.7488,0.1715,0.279
+weecology,tcd_tile_12,Sechura desert,Arid / dryland,,152,0.3522,52,14,5,9,47,0.3571,0.0962,0.1515,0.9828,0.0322,0.0623
+weecology,tcd_tile_120,Caucasus mixed forests,European forest,,33,0.3522,81,85,14,71,67,0.1647,0.1728,0.1687,0.9617,0.0389,0.0748
+weecology,tcd_tile_121,Northern Zanzibar-Inhambane coastal forest mosaic,African tropical forest,,3674,0.3522,131,264,65,199,66,0.2462,0.4962,0.3291,0.8919,0.2086,0.3381
+weecology,tcd_tile_122,Southern Zanzibar-Inhambane coastal forest mosaic,African tropical forest,,5008,0.3522,186,153,88,65,98,0.5752,0.4731,0.5192,0.8982,0.2195,0.3527
+weecology,tcd_tile_124,Southern Zanzibar-Inhambane coastal forest mosaic,African tropical forest,,4433,0.3522,141,157,44,113,97,0.2803,0.3121,0.2953,0.9129,0.1046,0.1877
+weecology,tcd_tile_126,Central European mixed forests,European forest,,4195,0.3522,0,26,0,26,0,0.0,0.0,0.0,0.0,0.0,0.0
+weecology,tcd_tile_128,Northern Zanzibar-Inhambane coastal forest mosaic,African tropical forest,,2671,0.3522,140,224,38,186,102,0.1696,0.2714,0.2088,0.9389,0.1411,0.2453
+weecology,tcd_tile_129,Palawan rain forests,SE Asian & Pacific rainforest,,2967,0.3522,82,371,32,339,50,0.0863,0.3902,0.1413,0.923,0.1519,0.2608
+weecology,tcd_tile_13,Chilean matorral,Arid / dryland,,746,0.3522,12,3,0,3,12,0.0,0.0,0.0,0.0,0.0,0.0
+weecology,tcd_tile_133,East European forest steppe,European forest,,1466,0.3522,23,71,11,60,12,0.1549,0.4783,0.234,0.8616,0.0933,0.1684
+weecology,tcd_tile_135,Northern Zanzibar-Inhambane coastal forest mosaic,African tropical forest,,1315,0.3522,58,72,27,45,31,0.375,0.4655,0.4154,0.8943,0.1039,0.1861
+weecology,tcd_tile_136,Central European mixed forests,European forest,,1131,0.3522,46,49,23,26,23,0.4694,0.5,0.4842,0.7845,0.0595,0.1106
+weecology,tcd_tile_137,Northern Zanzibar-Inhambane coastal forest mosaic,African tropical forest,,2487,0.3522,143,131,60,71,83,0.458,0.4196,0.438,0.7609,0.2336,0.3574
+weecology,tcd_tile_14,West Sudanian savanna,Arid / dryland,,116,0.3522,42,15,11,4,31,0.7333,0.2619,0.386,0.9531,0.1127,0.2015
+weecology,tcd_tile_140,Central European mixed forests,European forest,,2561,0.3522,39,67,13,54,26,0.194,0.3333,0.2453,0.9265,0.0694,0.1291
+weecology,tcd_tile_141,Southern Zanzibar-Inhambane coastal forest mosaic,African tropical forest,,4425,0.3522,315,120,51,69,264,0.425,0.1619,0.2345,0.8835,0.114,0.2019
+weecology,tcd_tile_143,Northeastern coastal forests,N. American forest,,2507,0.3522,75,33,15,18,60,0.4545,0.2,0.2778,0.8484,0.0912,0.1648
+weecology,tcd_tile_144,Greater Negros-Panay rain forests,SE Asian & Pacific rainforest,,3015,0.3522,43,680,27,653,16,0.0397,0.6279,0.0747,0.9823,0.2186,0.3576
+weecology,tcd_tile_145,Luzon rain forests,SE Asian & Pacific rainforest,,3862,0.3522,5,148,1,147,4,0.0068,0.2,0.0131,0.9937,0.0326,0.0632
+weecology,tcd_tile_146,Madeira-Tapajós moist forests,Latin American forest,,4691,0.3522,1,835,1,834,0,0.0012,1.0,0.0024,1.0,0.2266,0.3695
+weecology,tcd_tile_147,Southern Great Lakes forests,N. American forest,,413,0.3522,47,65,20,45,27,0.3077,0.4255,0.3571,0.8404,0.0684,0.1266
+weecology,tcd_tile_148,Timor and Wetar deciduous forests,SE Asian & Pacific rainforest,,837,0.3522,183,54,35,19,148,0.6481,0.1913,0.2954,0.8074,0.0319,0.0613
+weecology,tcd_tile_149,East European forest steppe,European forest,,1822,0.3522,37,47,12,35,25,0.2553,0.3243,0.2857,0.9363,0.0519,0.0983
+weecology,tcd_tile_15,West Sudanian savanna,Arid / dryland,,287,0.3522,7,16,5,11,2,0.3125,0.7143,0.4348,0.6408,0.2216,0.3293
+weecology,tcd_tile_150,Atlantic mixed forests,European forest,,4723,0.3522,22,317,12,305,10,0.0379,0.5455,0.0708,0.9681,0.1467,0.2548
+weecology,tcd_tile_152,Northern Zanzibar-Inhambane coastal forest mosaic,African tropical forest,,1947,0.3522,217,148,80,68,137,0.5405,0.3687,0.4384,0.8322,0.1094,0.1933
+weecology,tcd_tile_153,Northern Zanzibar-Inhambane coastal forest mosaic,African tropical forest,,3099,0.3522,342,170,116,54,226,0.6824,0.3392,0.4531,0.8589,0.1711,0.2853
+weecology,tcd_tile_155,Western European broadleaf forests,European forest,,0,0.3522,48,12,9,3,39,0.75,0.1875,0.3,0.5832,0.0257,0.0492
+weecology,tcd_tile_156,Mindanao-Eastern Visayas rain forests,SE Asian & Pacific rainforest,,1505,0.3522,56,320,26,294,30,0.0813,0.4643,0.1383,0.8596,0.1312,0.2276
+weecology,tcd_tile_157,Northern Zanzibar-Inhambane coastal forest mosaic,African tropical forest,,1645,0.3522,111,209,35,174,76,0.1675,0.3153,0.2188,0.9341,0.0791,0.1458
+weecology,tcd_tile_158,Sierra Nevada forests,N. American forest,,1484,0.3522,96,175,55,120,41,0.3143,0.5729,0.4059,0.9214,0.1282,0.2251
+weecology,tcd_tile_16,West Sudanian savanna,Arid / dryland,,1126,0.3522,172,137,77,60,95,0.562,0.4477,0.4984,0.9431,0.2693,0.4189
+weecology,tcd_tile_161,Northern Zanzibar-Inhambane coastal forest mosaic,African tropical forest,,4025,0.3522,75,60,39,21,36,0.65,0.52,0.5778,0.8942,0.2424,0.3814
+weecology,tcd_tile_162,Eastern Java-Bali rain forests,SE Asian & Pacific rainforest,,4910,0.3522,152,250,52,198,100,0.208,0.3421,0.2587,0.9088,0.0974,0.1759
+weecology,tcd_tile_164,Hispaniolan moist forests,SE Asian & Pacific rainforest,,976,0.3522,14,6,3,3,11,0.5,0.2143,0.3,0.5729,0.1124,0.1879
+weecology,tcd_tile_165,Central European mixed forests,European forest,,2803,0.3522,52,83,22,61,30,0.2651,0.4231,0.3259,0.8615,0.0838,0.1527
+weecology,tcd_tile_167,Celtic broadleaf forests,European forest,,2190,0.3522,4,37,3,34,1,0.0811,0.75,0.1463,0.9961,0.1742,0.2965
+weecology,tcd_tile_168,Caucasus mixed forests,European forest,,1271,0.3522,60,143,27,116,33,0.1888,0.45,0.266,0.9802,0.1057,0.1908
+weecology,tcd_tile_17,Chilean matorral,Arid / dryland,,618,0.3522,159,50,39,11,120,0.78,0.2453,0.3732,0.845,0.1374,0.2364
+weecology,tcd_tile_170,Sarmatic mixed forests,European forest,,57,0.3522,15,231,14,217,1,0.0606,0.9333,0.1138,0.8195,0.0525,0.0986
+weecology,tcd_tile_171,Sierra Nevada forests,N. American forest,,3071,0.3522,139,294,85,209,54,0.2891,0.6115,0.3926,0.9316,0.1243,0.2194
+weecology,tcd_tile_172,Eastern Great Lakes lowland forests,N. American forest,,4647,0.3522,94,41,22,19,72,0.5366,0.234,0.3259,0.8986,0.0412,0.0789
+weecology,tcd_tile_173,Luzon rain forests,SE Asian & Pacific rainforest,,2541,0.3522,16,27,6,21,10,0.2222,0.375,0.2791,0.544,0.0414,0.0769
+weecology,tcd_tile_175,Sumatran lowland rain forests,SE Asian & Pacific rainforest,,2472,0.3522,412,228,168,60,244,0.7368,0.4078,0.525,0.8767,0.176,0.2931
+weecology,tcd_tile_179,Southern Zanzibar-Inhambane coastal forest mosaic,African tropical forest,,2982,0.3522,113,157,10,147,103,0.0637,0.0885,0.0741,0.9998,0.0564,0.1068
+weecology,tcd_tile_18,Chilean matorral,Arid / dryland,,1016,0.3522,0,2,0,2,0,0.0,0.0,0.0,0.0,0.0,0.0
+weecology,tcd_tile_180,Maputaland coastal forest mosaic,African tropical forest,,504,0.3522,17,4,3,1,14,0.75,0.1765,0.2857,0.8652,0.1027,0.1837
+weecology,tcd_tile_181,Timor and Wetar deciduous forests,SE Asian & Pacific rainforest,,215,0.3522,7,2,2,0,5,1.0,0.2857,0.4444,0.9495,0.0276,0.0537
+weecology,tcd_tile_183,Mindanao-Eastern Visayas rain forests,SE Asian & Pacific rainforest,,3070,0.3522,179,628,78,550,101,0.1242,0.4358,0.1933,0.8368,0.1304,0.2256
+weecology,tcd_tile_186,Northern Zanzibar-Inhambane coastal forest mosaic,African tropical forest,,2675,0.3522,26,1,1,0,25,1.0,0.0385,0.0741,0.7036,0.0015,0.003
+weecology,tcd_tile_187,Northern Zanzibar-Inhambane coastal forest mosaic,African tropical forest,,2710,0.3522,180,119,41,78,139,0.3445,0.2278,0.2742,0.9329,0.0898,0.1639
+weecology,tcd_tile_188,Hispaniolan moist forests,SE Asian & Pacific rainforest,,3569,0.3522,21,14,4,10,17,0.2857,0.1905,0.2286,0.3937,0.0791,0.1317
+weecology,tcd_tile_189,Cerrado,Latin American forest,,1214,0.3522,1,10,1,9,0,0.1,1.0,0.1818,0.314,0.0253,0.0468
+weecology,tcd_tile_19,West Sudanian savanna,Arid / dryland,,699,0.3522,101,58,37,21,64,0.6379,0.3663,0.4654,0.9598,0.1896,0.3166
+weecology,tcd_tile_190,Central U.S. hardwood forests,N. American forest,,1538,0.3522,48,45,17,28,31,0.3778,0.3542,0.3656,0.7601,0.0982,0.174
+weecology,tcd_tile_191,Serra do Mar coastal forests,Latin American forest,,4347,0.3522,11,547,4,543,7,0.0073,0.3636,0.0143,0.9782,0.0837,0.1543
+weecology,tcd_tile_198,New England-Acadian forests,N. American forest,,2455,0.3522,2,152,2,150,0,0.0132,1.0,0.026,0.9879,0.0714,0.1331
+weecology,tcd_tile_199,Madeira-Tapajós moist forests,Latin American forest,,805,0.3522,1,1007,1,1006,0,0.001,1.0,0.002,0.9997,0.2745,0.4307
+weecology,tcd_tile_2,Central Mexican matorral,Arid / dryland,,882,0.3522,65,55,25,30,40,0.4545,0.3846,0.4167,0.954,0.0596,0.1122
+weecology,tcd_tile_20,Zambezian and Mopane woodlands,Arid / dryland,,276,0.3522,37,103,23,80,14,0.2233,0.6216,0.3286,0.6069,0.2801,0.3832
+weecology,tcd_tile_200,Northern Zanzibar-Inhambane coastal forest mosaic,African tropical forest,,4424,0.3522,117,1096,101,995,16,0.0922,0.8632,0.1665,0.9684,0.3419,0.5054
+weecology,tcd_tile_202,Northern Zanzibar-Inhambane coastal forest mosaic,African tropical forest,,2808,0.3522,251,158,123,35,128,0.7785,0.49,0.6015,0.9524,0.3708,0.5338
+weecology,tcd_tile_203,Mindanao-Eastern Visayas rain forests,SE Asian & Pacific rainforest,,2819,0.3522,152,472,68,404,84,0.1441,0.4474,0.2179,0.8837,0.1137,0.2015
+weecology,tcd_tile_207,Central U.S. hardwood forests,N. American forest,,1379,0.3522,49,28,9,19,40,0.3214,0.1837,0.2338,0.408,0.0225,0.0427
+weecology,tcd_tile_208,Northeastern coastal forests,N. American forest,,1813,0.3522,102,72,16,56,86,0.2222,0.1569,0.1839,0.9358,0.0953,0.1729
+weecology,tcd_tile_209,Hispaniolan moist forests,SE Asian & Pacific rainforest,,1254,0.3522,0,1,0,1,0,0.0,0.0,0.0,0.0,0.0,0.0
+weecology,tcd_tile_21,Chilean matorral,Arid / dryland,,357,0.3522,132,15,7,8,125,0.4667,0.053,0.0952,0.7129,0.0449,0.0844
+weecology,tcd_tile_213,Mizoram-Manipur-Kachin rain forests,SE Asian & Pacific rainforest,,4555,0.3522,30,225,11,214,19,0.0489,0.3667,0.0863,0.9482,0.1128,0.2016
+weecology,tcd_tile_214,Palawan rain forests,SE Asian & Pacific rainforest,,1461,0.3522,116,200,41,159,75,0.205,0.3534,0.2595,0.9012,0.115,0.2039
+weecology,tcd_tile_216,Eastern Java-Bali rain forests,SE Asian & Pacific rainforest,,4351,0.3522,19,103,9,94,10,0.0874,0.4737,0.1475,0.9295,0.0922,0.1678
+weecology,tcd_tile_218,Lesser Sundas deciduous forests,SE Asian & Pacific rainforest,,3103,0.3522,124,111,17,94,107,0.1532,0.1371,0.1447,0.8454,0.0509,0.096
+weecology,tcd_tile_22,Chilean matorral,Arid / dryland,,1192,0.3522,22,9,2,7,20,0.2222,0.0909,0.129,0.1987,0.1125,0.1437
+weecology,tcd_tile_221,Northeastern coastal forests,N. American forest,,1097,0.3522,99,73,49,24,50,0.6712,0.4949,0.5698,0.907,0.4005,0.5556
+weecology,tcd_tile_222,Mato Grosso seasonal forests,Latin American forest,,1672,0.3522,197,202,116,86,81,0.5743,0.5888,0.5815,0.8804,0.2718,0.4154
+weecology,tcd_tile_225,Madeira-Tapajós moist forests,Latin American forest,,600,0.3522,1,831,1,830,0,0.0012,1.0,0.0024,0.999,0.2063,0.342
+weecology,tcd_tile_228,Upper Midwest forest-savanna transition,N. American forest,,4077,0.3522,15,35,11,24,4,0.3143,0.7333,0.44,0.6431,0.3645,0.4653
+weecology,tcd_tile_23,West Sudanian savanna,Arid / dryland,,985,0.3522,112,99,54,45,58,0.5455,0.4821,0.5118,0.9058,0.1577,0.2686
+weecology,tcd_tile_231,Mato Grosso seasonal forests,Latin American forest,,1926,0.3522,77,100,40,60,37,0.4,0.5195,0.452,0.7556,0.3057,0.4353
+weecology,tcd_tile_232,Northern California coastal forests,N. American forest,,2277,0.3522,14,2,1,1,13,0.5,0.0714,0.125,1.0,0.0006,0.0011
+weecology,tcd_tile_233,Central U.S. hardwood forests,N. American forest,,3069,0.3522,27,31,10,21,17,0.3226,0.3704,0.3448,0.9291,0.0428,0.0819
+weecology,tcd_tile_234,Upper Midwest forest-savanna transition,N. American forest,,3882,0.3522,10,45,5,40,5,0.1111,0.5,0.1818,0.9897,0.2364,0.3817
+weecology,tcd_tile_237,Cerrado,Latin American forest,,416,0.3522,16,76,4,72,12,0.0526,0.25,0.087,0.0982,0.2188,0.1355
+weecology,tcd_tile_238,Southeastern mixed forests,N. American forest,,4416,0.3522,9,81,3,78,6,0.037,0.3333,0.0667,0.8828,0.1132,0.2007
+weecology,tcd_tile_239,Northern California coastal forests,N. American forest,,1895,0.3522,5,1,1,0,4,1.0,0.2,0.3333,0.8681,0.0011,0.0022
+weecology,tcd_tile_24,Central Mexican matorral,Arid / dryland,,1,0.3522,81,22,14,8,67,0.6364,0.1728,0.2718,0.9145,0.021,0.0411
+weecology,tcd_tile_240,Southern Great Lakes forests,N. American forest,,4945,0.3522,39,64,24,40,15,0.375,0.6154,0.466,0.9104,0.151,0.2591
+weecology,tcd_tile_243,Northeastern coastal forests,N. American forest,,3047,0.3522,58,91,20,71,38,0.2198,0.3448,0.2685,0.9789,0.0938,0.1713
+weecology,tcd_tile_246,Madeira-Tapajós moist forests,Latin American forest,,851,0.3522,1,1060,1,1059,0,0.0009,1.0,0.0019,0.9999,0.2502,0.4002
+weecology,tcd_tile_247,Himalayan subtropical broadleaf forests,Other,,4414,0.3522,140,49,27,22,113,0.551,0.1929,0.2857,0.8648,0.1478,0.2524
+weecology,tcd_tile_248,Petén-Veracruz moist forests,Latin American forest,,1486,0.3522,79,154,35,119,44,0.2273,0.443,0.3004,0.8525,0.0829,0.1511
+weecology,tcd_tile_249,Serra do Mar coastal forests,Latin American forest,,5001,0.3522,111,155,34,121,77,0.2194,0.3063,0.2556,0.7576,0.0716,0.1309
+weecology,tcd_tile_25,Zambezian and Mopane woodlands,Arid / dryland,,3,0.3522,41,158,27,131,14,0.1709,0.6585,0.2714,0.6737,0.0871,0.1542
+weecology,tcd_tile_250,Bahia coastal forests,Latin American forest,,3469,0.3522,1,296,1,295,0,0.0034,1.0,0.0067,0.9997,0.1094,0.1973
+weecology,tcd_tile_252,Peruvian Yungas,Latin American forest,,3719,0.3522,126,111,35,76,91,0.3153,0.2778,0.2954,0.738,0.092,0.1636
+weecology,tcd_tile_253,Petén-Veracruz moist forests,Latin American forest,,3170,0.3522,219,111,69,42,150,0.6216,0.3151,0.4182,0.816,0.1202,0.2096
+weecology,tcd_tile_255,Himalayan subtropical broadleaf forests,Other,,4597,0.3522,94,195,44,151,50,0.2256,0.4681,0.3045,0.9677,0.2183,0.3562
+weecology,tcd_tile_256,Cerrado,Latin American forest,,1149,0.3522,10,17,8,9,2,0.4706,0.8,0.5926,0.654,0.2822,0.3943
+weecology,tcd_tile_258,Madeira-Tapajós moist forests,Latin American forest,,2372,0.3522,2,1038,2,1036,0,0.0019,1.0,0.0038,0.9936,0.1953,0.3265
+weecology,tcd_tile_259,Bahia coastal forests,Latin American forest,,4315,0.3522,24,40,8,32,16,0.2,0.3333,0.25,0.8775,0.0397,0.0759
+weecology,tcd_tile_26,West Sudanian savanna,Arid / dryland,,1135,0.3522,71,60,43,17,28,0.7167,0.6056,0.6565,0.9049,0.4973,0.6419
+weecology,tcd_tile_260,Petén-Veracruz moist forests,Latin American forest,,1845,0.3522,37,96,17,79,20,0.1771,0.4595,0.2556,0.9263,0.0763,0.141
+weecology,tcd_tile_261,Madeira-Tapajós moist forests,Latin American forest,,3358,0.3522,34,564,1,563,33,0.0018,0.0294,0.0033,0.9999,0.2483,0.3978
+weecology,tcd_tile_27,Zambezian and Mopane woodlands,Arid / dryland,,1081,0.3522,25,47,12,35,13,0.2553,0.48,0.3333,0.5825,0.2444,0.3443
+weecology,tcd_tile_28,Chilean matorral,Arid / dryland,,360,0.3522,97,113,45,68,52,0.3982,0.4639,0.4286,0.8543,0.1098,0.1946
+weecology,tcd_tile_29,West Sudanian savanna,Arid / dryland,,1295,0.3522,85,161,48,113,37,0.2981,0.5647,0.3902,0.8293,0.0987,0.1764
+weecology,tcd_tile_30,West Sudanian savanna,Arid / dryland,,847,0.3522,10,41,6,35,4,0.1463,0.6,0.2353,0.1634,0.5599,0.253
+weecology,tcd_tile_31,Chilean matorral,Arid / dryland,,343,0.3522,20,10,1,9,19,0.1,0.05,0.0667,0.0649,0.0556,0.0599
+weecology,tcd_tile_32,Chilean matorral,Arid / dryland,,455,0.3522,42,69,22,47,20,0.3188,0.5238,0.3964,0.807,0.1401,0.2387
+weecology,tcd_tile_33,Chilean matorral,Arid / dryland,,92,0.3522,132,120,63,57,69,0.525,0.4773,0.5,0.8734,0.1708,0.2857
+weecology,tcd_tile_34,Sonoran desert,Arid / dryland,,479,0.3522,133,143,52,91,81,0.3636,0.391,0.3768,0.8996,0.1912,0.3154
+weecology,tcd_tile_35,Zambezian and Mopane woodlands,Arid / dryland,,767,0.3522,15,111,12,99,3,0.1081,0.8,0.1905,0.5382,0.128,0.2068
+weecology,tcd_tile_36,West Sudanian savanna,Arid / dryland,,1009,0.3522,150,149,52,97,98,0.349,0.3467,0.3478,0.9823,0.1554,0.2684
+weecology,tcd_tile_38,West Sudanian savanna,Arid / dryland,,572,0.3522,50,66,26,40,24,0.3939,0.52,0.4483,0.7318,0.2563,0.3797
+weecology,tcd_tile_39,Sonoran desert,Arid / dryland,,559,0.3522,112,90,41,49,71,0.4556,0.3661,0.4059,0.9475,0.1216,0.2155
+weecology,tcd_tile_4,West Sudanian savanna,Arid / dryland,,1194,0.3522,121,65,42,23,79,0.6462,0.3471,0.4516,0.8052,0.0907,0.1631
+weecology,tcd_tile_40,West Sudanian savanna,Arid / dryland,,656,0.3522,134,99,74,25,60,0.7475,0.5522,0.6352,0.9389,0.3222,0.4798
+weecology,tcd_tile_41,West Sudanian savanna,Arid / dryland,,108,0.3522,127,82,54,28,73,0.6585,0.4252,0.5167,0.9435,0.3011,0.4565
+weecology,tcd_tile_42,West Sudanian savanna,Arid / dryland,,675,0.3522,50,63,17,46,33,0.2698,0.34,0.3009,0.6706,0.0607,0.1114
+weecology,tcd_tile_43,East Sudanian savanna,Arid / dryland,,887,0.3522,16,18,5,13,11,0.2778,0.3125,0.2941,0.262,0.2708,0.2663
+weecology,tcd_tile_44,Chilean matorral,Arid / dryland,,410,0.3522,83,189,42,147,41,0.2222,0.506,0.3088,0.8615,0.1535,0.2605
+weecology,tcd_tile_45,Zambezian and Mopane woodlands,Arid / dryland,,2524,0.3522,166,130,54,76,112,0.4154,0.3253,0.3649,0.8688,0.1422,0.2444
+weecology,tcd_tile_46,Chilean matorral,Arid / dryland,,1279,0.3522,69,21,8,13,61,0.381,0.1159,0.1778,0.5706,0.0791,0.1389
+weecology,tcd_tile_47,Chilean matorral,Arid / dryland,,732,0.3522,16,4,2,2,14,0.5,0.125,0.2,0.4748,0.0823,0.1403
+weecology,tcd_tile_48,Zambezian and Mopane woodlands,Arid / dryland,,2400,0.3522,109,197,45,152,64,0.2284,0.4128,0.2941,0.9466,0.0971,0.1762
+weecology,tcd_tile_49,West Sudanian savanna,Arid / dryland,,761,0.3522,85,12,11,1,74,0.9167,0.1294,0.2268,0.9743,0.0853,0.1568
+weecology,tcd_tile_5,West Sudanian savanna,Arid / dryland,,1058,0.3522,69,48,36,12,33,0.75,0.5217,0.6154,0.9157,0.4716,0.6226
+weecology,tcd_tile_50,West Sudanian savanna,Arid / dryland,,629,0.3522,132,70,54,16,78,0.7714,0.4091,0.5347,0.9339,0.2749,0.4248
+weecology,tcd_tile_51,Sonoran desert,Arid / dryland,,691,0.3522,133,57,30,27,103,0.5263,0.2256,0.3158,0.6993,0.0822,0.1472
+weecology,tcd_tile_52,West Sudanian savanna,Arid / dryland,,630,0.3522,61,147,39,108,22,0.2653,0.6393,0.375,0.7421,0.1425,0.2391
+weecology,tcd_tile_53,Gulf of Oman desert and semi-desert,Arid / dryland,,22,0.3522,55,3,1,2,54,0.3333,0.0182,0.0345,0.483,0.0128,0.025
+weecology,tcd_tile_54,Zambezian and Mopane woodlands,Arid / dryland,,3668,0.3522,210,123,87,36,123,0.7073,0.4143,0.5225,0.8814,0.2365,0.373
+weecology,tcd_tile_55,West Sudanian savanna,Arid / dryland,,405,0.3522,106,86,45,41,61,0.5233,0.4245,0.4688,0.6951,0.2375,0.3541
+weecology,tcd_tile_56,Chilean matorral,Arid / dryland,,848,0.3522,32,5,1,4,31,0.2,0.0312,0.0541,0.1602,0.0072,0.0138
+weecology,tcd_tile_57,Central Mexican matorral,Arid / dryland,,140,0.3522,65,36,17,19,48,0.4722,0.2615,0.3366,0.8016,0.0476,0.0899
+weecology,tcd_tile_58,Zambezian and Mopane woodlands,Arid / dryland,,2621,0.3522,128,48,30,18,98,0.625,0.2344,0.3409,0.7985,0.0835,0.1513
+weecology,tcd_tile_59,West Sudanian savanna,Arid / dryland,,1191,0.3522,47,102,23,79,24,0.2255,0.4894,0.3087,0.6064,0.1556,0.2477
+weecology,tcd_tile_6,West Sudanian savanna,Arid / dryland,,402,0.3522,38,32,14,18,24,0.4375,0.3684,0.4,0.7557,0.1798,0.2905
+weecology,tcd_tile_60,East Sudanian savanna,Arid / dryland,,844,0.3522,36,35,14,21,22,0.4,0.3889,0.3944,0.3705,0.3168,0.3416
+weecology,tcd_tile_61,Chilean matorral,Arid / dryland,,901,0.3522,58,17,4,13,54,0.2353,0.069,0.1067,0.621,0.082,0.1448
+weecology,tcd_tile_62,East European forest steppe,European forest,,661,0.3522,52,596,28,568,24,0.047,0.5385,0.0864,0.9916,0.2743,0.4297
+weecology,tcd_tile_63,Eastern Guinean forests,African tropical forest,,2039,0.3522,61,63,7,56,54,0.1111,0.1148,0.1129,0.8694,0.0472,0.0895
+weecology,tcd_tile_65,Northern Zanzibar-Inhambane coastal forest mosaic,African tropical forest,,543,0.3522,271,493,136,357,135,0.2759,0.5018,0.356,0.8589,0.2158,0.345
+weecology,tcd_tile_66,Ucayali moist forests,Latin American forest,,2333,0.3522,310,236,103,133,207,0.4364,0.3323,0.3773,0.842,0.1455,0.2482
+weecology,tcd_tile_67,Southern Zanzibar-Inhambane coastal forest mosaic,African tropical forest,,3458,0.3522,208,25,17,8,191,0.68,0.0817,0.1459,0.8197,0.0927,0.1666
+weecology,tcd_tile_70,English Lowlands beech forests,European forest,,24,0.3522,1,21,1,20,0,0.0476,1.0,0.0909,0.1243,0.8375,0.2164
+weecology,tcd_tile_71,Northern Zanzibar-Inhambane coastal forest mosaic,African tropical forest,,2091,0.3522,90,202,42,160,48,0.2079,0.4667,0.2877,0.9158,0.1659,0.2809
+weecology,tcd_tile_72,Himalayan subtropical broadleaf forests,Other,,4300,0.3522,134,169,73,96,61,0.432,0.5448,0.4818,0.8704,0.3375,0.4863
+weecology,tcd_tile_76,Madeira-Tapajós moist forests,Latin American forest,,3471,0.3522,2,875,2,873,0,0.0023,1.0,0.0046,0.9939,0.237,0.3828
+weecology,tcd_tile_77,Taiwan subtropical evergreen forests,SE Asian & Pacific rainforest,,3539,0.3522,172,110,50,60,122,0.4545,0.2907,0.3546,0.7804,0.4833,0.597
+weecology,tcd_tile_78,Madeira-Tapajós moist forests,Latin American forest,,1113,0.3522,1,989,1,988,0,0.001,1.0,0.002,0.9999,0.2358,0.3816
+weecology,tcd_tile_79,Greater Negros-Panay rain forests,SE Asian & Pacific rainforest,,3056,0.3522,75,92,21,71,54,0.2283,0.28,0.2515,0.9383,0.0885,0.1618
+weecology,tcd_tile_8,West Sudanian savanna,Arid / dryland,,336,0.3522,111,76,45,31,66,0.5921,0.4054,0.4813,0.9749,0.3347,0.4983
+weecology,tcd_tile_83,Northern Zanzibar-Inhambane coastal forest mosaic,African tropical forest,,654,0.3522,102,127,25,102,77,0.1969,0.2451,0.2183,0.9155,0.0339,0.0653
+weecology,tcd_tile_84,Southern Zanzibar-Inhambane coastal forest mosaic,African tropical forest,,3371,0.3522,128,143,43,100,85,0.3007,0.3359,0.3173,0.9285,0.1008,0.1818
+weecology,tcd_tile_85,Mato Grosso seasonal forests,Latin American forest,,3779,0.3522,37,211,31,180,6,0.1469,0.8378,0.25,0.8895,0.23,0.3655
+weecology,tcd_tile_87,Sumatran lowland rain forests,SE Asian & Pacific rainforest,,3403,0.3522,200,152,80,72,120,0.5263,0.4,0.4545,0.8372,0.2054,0.3298
+weecology,tcd_tile_89,Balkan mixed forests,European forest,,2879,0.3522,91,145,46,99,45,0.3172,0.5055,0.3898,0.9731,0.0926,0.1691
+weecology,tcd_tile_9,West Sudanian savanna,Arid / dryland,,659,0.3522,48,108,20,88,28,0.1852,0.4167,0.2564,0.917,0.1153,0.2048
+weecology,tcd_tile_90,Eastern Java-Bali rain forests,SE Asian & Pacific rainforest,,4852,0.3522,92,295,15,280,77,0.0508,0.163,0.0775,0.9723,0.1057,0.1907
+weecology,tcd_tile_92,Eastern Guinean forests,African tropical forest,,1424,0.3522,67,307,3,304,64,0.0098,0.0448,0.016,0.9988,0.071,0.1325
+weecology,tcd_tile_93,Upper Midwest forest-savanna transition,N. American forest,,3687,0.3522,10,131,6,125,4,0.0458,0.6,0.0851,0.9642,0.2041,0.3369
+weecology,tcd_tile_94,Caucasus mixed forests,European forest,,2985,0.3522,1,2,1,1,0,0.5,1.0,0.6667,0.9998,0.0006,0.0013
+weecology,tcd_tile_95,Hispaniolan moist forests,SE Asian & Pacific rainforest,,4600,0.3522,0,64,0,64,0,0.0,0.0,0.0,0.0,0.0,0.0
+weecology,tcd_tile_96,Balkan mixed forests,European forest,,1402,0.3522,92,116,38,78,54,0.3276,0.413,0.3654,0.8829,0.1222,0.2147
+weecology,tcd_tile_97,Northern Congolian forest-savanna mosaic,African tropical forest,,136,0.3522,123,14,9,5,114,0.6429,0.0732,0.1314,0.5512,0.0652,0.1166
+weecology,tcd_tile_98,Celtic broadleaf forests,European forest,,1257,0.3522,71,139,39,100,32,0.2806,0.5493,0.3714,0.8521,0.1401,0.2407

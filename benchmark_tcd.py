@@ -471,6 +471,165 @@ def f1_optimal_point(prec, rec, conf):
     return float(prec[idx]), float(rec[idx]), float(f1[idx]), float(conf[idx])
 
 
+def area_metrics(all_preds, gt_by_tile, score_threshold):
+    """
+    Compute area-based precision, recall, F1 at a given score threshold.
+
+    Per tile: union the predicted polygons above threshold and the GT polygons,
+    then compute intersection-based precision/recall. Macro-average across tiles
+    that have any GT or any predictions.
+
+    Returns (area_precision, area_recall, area_f1).
+    """
+    from shapely.ops import unary_union
+
+    preds_by_tile = {}
+    for geom, score, tid in all_preds:
+        if score >= score_threshold and geom is not None and not geom.is_empty:
+            preds_by_tile.setdefault(tid, []).append(
+                geom if geom.is_valid else make_valid(geom)
+            )
+
+    all_tile_ids = set(gt_by_tile.keys()) | set(preds_by_tile.keys())
+
+    precisions, recalls = [], []
+    for tid in all_tile_ids:
+        gt_polys   = gt_by_tile.get(tid, [])
+        pred_polys = preds_by_tile.get(tid, [])
+
+        gt_u   = unary_union([g if g.is_valid else make_valid(g) for g in gt_polys]) if gt_polys else None
+        pred_u = unary_union(pred_polys) if pred_polys else None
+
+        gt_area   = gt_u.area   if gt_u   is not None else 0.0
+        pred_area = pred_u.area if pred_u is not None else 0.0
+
+        if gt_area == 0 and pred_area == 0:
+            continue
+
+        inter = gt_u.intersection(pred_u).area if (gt_u is not None and pred_u is not None) else 0.0
+        precisions.append(inter / pred_area if pred_area > 0 else 0.0)
+        recalls.append(inter / gt_area if gt_area > 0 else 0.0)
+
+    if not precisions:
+        return 0.0, 0.0, 0.0
+
+    ap = float(np.mean(precisions))
+    ar = float(np.mean(recalls))
+    af1 = 2 * ap * ar / (ap + ar) if (ap + ar) > 0 else 0.0
+    return ap, ar, af1
+
+
+def compute_tile_metrics(all_preds, gt_by_tile, iop_thresh, score_threshold):
+    """
+    Per-tile TP/FP/FN + area metrics at a fixed score threshold.
+    Returns {tile_id: dict} with keys:
+      n_gt, n_pred, tp, fp, fn, poly_precision, poly_recall, poly_f1,
+      area_precision, area_recall, area_f1
+    """
+    from shapely.ops import unary_union
+    from shapely.strtree import STRtree
+
+    preds_by_tile = {}
+    for geom, score, tid in all_preds:
+        if score >= score_threshold:
+            preds_by_tile.setdefault(tid, []).append((geom, score))
+
+    all_tids = set(gt_by_tile.keys()) | set(preds_by_tile.keys())
+    results = {}
+
+    for tid in all_tids:
+        gt_polys   = [g if g.is_valid else make_valid(g) for g in gt_by_tile.get(tid, [])]
+        pred_pairs = preds_by_tile.get(tid, [])
+        pred_polys = [g if g is not None and not g.is_empty and (g.is_valid or True)
+                      else None for g, _ in pred_pairs]
+        pred_polys = [make_valid(g) if g is not None and not g.is_valid else g
+                      for g in pred_polys]
+        pred_polys = [g for g in pred_polys if g is not None and not g.is_empty]
+
+        n_gt   = len(gt_polys)
+        n_pred = len(pred_polys)
+
+        # Poly TP/FP/FN via IoP matching
+        tp = 0
+        matched_gt = set()
+        if gt_polys and pred_polys:
+            tree = STRtree(gt_polys)
+            for p in pred_polys:
+                hits = [j for j in tree.query(p, predicate="intersects")
+                        if j not in matched_gt and _iop(p, gt_polys[j]) >= iop_thresh]
+                if hits:
+                    best = max(hits, key=lambda j: _iop(p, gt_polys[j]))
+                    matched_gt.add(best)
+                    tp += 1
+        fp = n_pred - tp
+        fn = n_gt - len(matched_gt)
+
+        poly_p = tp / n_pred    if n_pred > 0 else 0.0
+        poly_r = len(matched_gt) / n_gt if n_gt   > 0 else 0.0
+        poly_f1 = 2 * poly_p * poly_r / (poly_p + poly_r) if (poly_p + poly_r) > 0 else 0.0
+
+        # Area metrics
+        gt_u   = unary_union(gt_polys)   if gt_polys   else None
+        pred_u = unary_union(pred_polys) if pred_polys else None
+        gt_area   = gt_u.area   if gt_u   is not None else 0.0
+        pred_area = pred_u.area if pred_u is not None else 0.0
+        inter = gt_u.intersection(pred_u).area if (gt_u is not None and pred_u is not None) else 0.0
+        area_p  = inter / pred_area if pred_area > 0 else 0.0
+        area_r  = inter / gt_area   if gt_area   > 0 else 0.0
+        area_f1_v = 2 * area_p * area_r / (area_p + area_r) if (area_p + area_r) > 0 else 0.0
+
+        results[tid] = {
+            "n_gt":           n_gt,
+            "n_pred":         n_pred,
+            "tp":             tp,
+            "fp":             fp,
+            "fn":             fn,
+            "poly_precision": round(poly_p,  4),
+            "poly_recall":    round(poly_r,  4),
+            "poly_f1":        round(poly_f1, 4),
+            "area_precision": round(area_p,   4),
+            "area_recall":    round(area_r,   4),
+            "area_f1":        round(area_f1_v, 4),
+        }
+    return results
+
+
+def save_tile_csv(model_name, tile_metrics, tile_meta, score_threshold, out_path):
+    """
+    Writes a per-tile CSV with biome/country metadata + all metrics.
+    Columns: model, tile_stem, biome_name, biome_group, country, image_id,
+             threshold, n_gt, n_pred, tp, fp, fn,
+             poly_precision, poly_recall, poly_f1,
+             area_precision, area_recall, area_f1
+    """
+    import csv
+
+    rows = []
+    for tid, m in tile_metrics.items():
+        meta = tile_meta.get(tid, {})
+        rows.append({
+            "model":          model_name,
+            "tile_stem":      meta.get("stem", str(tid)),
+            "biome_name":     meta.get("biome_name", "unknown"),
+            "biome_group":    meta.get("biome_group", "Other"),
+            "country":        meta.get("country", "unknown"),
+            "image_id":       meta.get("image_id", ""),
+            "threshold":      round(score_threshold, 4),
+            **m,
+        })
+
+    rows.sort(key=lambda r: r["tile_stem"])
+    if not rows:
+        return
+
+    fieldnames = list(rows[0].keys())
+    with open(out_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"📊 Tile CSV saved to {out_path}")
+
+
 # ── Evaluation orchestration ───────────────────────────────────────────────────
 
 def evaluate_model(name, out_dir, tcd_dir, iop_thresh, tile_filter=None):
@@ -478,10 +637,11 @@ def evaluate_model(name, out_dir, tcd_dir, iop_thresh, tile_filter=None):
     Loads all predictions + GT for a model.
     GT pools all annotations (cat=1 canopy + cat=2 trees) into one flat list per tile.
 
-    Returns (all_preds, gt_by_tile, tile_biomes) where:
+    Returns (all_preds, gt_by_tile, tile_biomes, tile_meta) where:
       all_preds   — [(geom, score, tile_id)]
-      gt_by_tile  — {tile_id: [geom, ...]}   (all GT, no category split)
+      gt_by_tile  — {tile_id: [geom, ...]}
       tile_biomes — {tile_id: biome_name}
+      tile_meta   — {tile_id: {"stem": str, "biome_name": str, "country": str}}
     """
     tcd_dir = Path(tcd_dir)
     pred_files = sorted(Path(out_dir).glob("*_canopyai.geojson"))
@@ -494,6 +654,7 @@ def evaluate_model(name, out_dir, tcd_dir, iop_thresh, tile_filter=None):
     gt_by_tile  = {}
     all_preds   = []
     tile_biomes = {}
+    tile_meta   = {}
 
     for i, pred_path in enumerate(pred_files):
         stem = pred_path.stem.replace("_canopyai", "")
@@ -512,16 +673,24 @@ def evaluate_model(name, out_dir, tcd_dir, iop_thresh, tile_filter=None):
             else:
                 continue
 
-        tile_biomes[i] = meta.get("biome_name", "unknown")
+        biome_name = meta.get("biome_name", "unknown")
+        tile_biomes[i] = biome_name
+        tile_meta[i] = {
+            "stem":       stem,
+            "biome_name": biome_name,
+            "biome_group": biome_group(biome_name),
+            "country":    meta.get("country", "unknown"),
+            "image_id":   meta.get("image_id", ""),
+        }
 
-        gt_polys, _ = load_gt(meta, tif_path)   # pool all categories
+        gt_polys, _ = load_gt(meta, tif_path)
         gt_by_tile[i] = gt_polys
 
         polys, scores, _ = load_predictions(pred_path, meta)
         for geom, score in zip(polys, scores):
             all_preds.append((geom, score, i))
 
-    return all_preds, gt_by_tile, tile_biomes
+    return all_preds, gt_by_tile, tile_biomes, tile_meta
 
 
 # ── PR curve plotting ──────────────────────────────────────────────────────────
@@ -564,26 +733,31 @@ def plot_pr_curves(model_results, iop_thresh, save_path):
 
 # ── Results table ──────────────────────────────────────────────────────────────
 
-def print_table(model_results, iop_thresh):
-    print("\n" + "═" * 65)
-    print("  BENCHMARK — Restor TCD  |  AP + F1-optimal operating point")
-    print(f"  All GT (trees + canopy pooled)  |  IoP ≥ {iop_thresh:.2f}  (* = F1-optimal)")
-    print("═" * 65)
+def print_table(model_results, model_area_results, iop_thresh):
+    print("\n" + "═" * 90)
+    print("  BENCHMARK — Restor TCD  |  AP + F1-optimal operating point  |  Area metrics")
+    print(f"  All GT (trees + canopy pooled)  |  IoP ≥ {iop_thresh:.2f}  (* = F1-optimal threshold)")
+    print("═" * 90)
 
-    hdr = f"  {'Model':<18}  {'AP':>6}  {'Prec*':>6}  {'Rec*':>6}  {'F1*':>6}  {'Thr*':>6}"
-    sep = "  " + "-"*18 + "  " + "  ".join(["-"*6]*5)
-    row = "  {:<18}  {:6.3f}  {:6.3f}  {:6.3f}  {:6.3f}  {:6.3f}"
+    hdr = (f"  {'Model':<18}  {'AP':>6}  {'Prec*':>6}  {'Rec*':>6}  {'F1*':>6}  {'Thr*':>6}"
+           f"  {'AreaP':>6}  {'AreaR':>6}  {'AreaF1':>7}")
+    sep  = "  " + "-"*18 + "  " + "  ".join(["-"*6]*8) + "  " + "-"*7
+    row  = ("  {:<18}  {:6.3f}  {:6.3f}  {:6.3f}  {:6.3f}  {:6.3f}"
+            "  {:6.3f}  {:6.3f}  {:7.3f}")
     print(hdr); print(sep)
 
     for name, res in model_results.items():
         if res is None:
-            print(f"  {name:<18}  {'—':>6}  {'—':>6}  {'—':>6}  {'—':>6}  {'—':>6}")
+            dashes = "  ".join(["—".rjust(6)] * 8) + "  " + "—".rjust(7)
+            print(f"  {name:<18}  {dashes}")
             continue
         ap, prec, rec, conf = res
         p_opt, r_opt, f1_opt, c_opt = f1_optimal_point(prec, rec, conf)
-        print(row.format(name, ap, p_opt, r_opt, f1_opt, c_opt))
+        a_res = model_area_results.get(name) or (0.0, 0.0, 0.0)
+        a_prec, a_rec, a_f1 = a_res
+        print(row.format(name, ap, p_opt, r_opt, f1_opt, c_opt, a_prec, a_rec, a_f1))
 
-    print("═" * 65 + "\n")
+    print("═" * 90 + "\n")
 
 
 # ── Per-biome results table ────────────────────────────────────────────────────
@@ -662,8 +836,9 @@ def main():
                       skip_existing=args.skip_existing,
                       tile_filter=set(args.tiles) if args.tiles else None)
 
-    # ── Step 2: AP computation ────────────────────────────────────────────────
+    # ── Step 2: AP + area metric computation ──────────────────────────────────
     model_results       = {}
+    model_area_results  = {}
     model_biome_results = {}
 
     for model_spec, name in zip(args.models, args.names):
@@ -674,35 +849,55 @@ def main():
                               tile_filter=set(args.tiles) if args.tiles else None)
         if data is None:
             model_results[name] = None
+            model_area_results[name] = None
             model_biome_results[name] = None
             continue
 
-        all_preds, gt_by_tile, tile_biomes = data
+        all_preds, gt_by_tile, tile_biomes, tile_meta = data
 
         ap, prec, rec, conf = compute_ap(all_preds, gt_by_tile, args.iop_thresh)
         model_results[name] = (ap, prec, rec, conf)
+
+        _, _, f1_opt, thr_opt = f1_optimal_point(prec, rec, conf)
+        a_prec, a_rec, a_f1 = area_metrics(all_preds, gt_by_tile, thr_opt)
+        model_area_results[name] = (a_prec, a_rec, a_f1)
+
         model_biome_results[name] = compute_biome_results(
             all_preds, gt_by_tile, tile_biomes, args.iop_thresh)
 
-        print(f"    AP={ap:.3f}")
+        # Per-tile CSV
+        tile_m = compute_tile_metrics(all_preds, gt_by_tile, args.iop_thresh, thr_opt)
+        csv_path = output_root / f"{name}_tiles.csv"
+        save_tile_csv(name, tile_m, tile_meta, thr_opt, csv_path)
+
+        print(f"    AP={ap:.3f}  AreaF1={a_f1:.3f}  (area thr={thr_opt:.3f})")
 
     # ── Step 3: Output ────────────────────────────────────────────────────────
-    print_table(model_results, args.iop_thresh)
+    print_table(model_results, model_area_results, args.iop_thresh)
     print_biome_table(model_biome_results, args.iop_thresh, use_groups=False)
     print_biome_table(model_biome_results, args.iop_thresh, use_groups=True)
     plot_pr_curves(model_results, args.iop_thresh, args.pr_save)
 
-    # Save raw AP values
+    # Save summary
     summary = {}
     for name, res in model_results.items():
         if res is None:
             summary[name] = None
             continue
         ap, prec, rec, conf = res
+        a_res = model_area_results.get(name) or (0.0, 0.0, 0.0)
+        a_prec, a_rec, a_f1 = a_res
+        _, _, f1_opt, thr_opt = f1_optimal_point(prec, rec, conf)
         summary[name] = {
             "ap": float(ap),
             "f1_optimal": dict(zip(["precision", "recall", "f1", "threshold"],
-                                   f1_optimal_point(prec, rec, conf))),
+                                   (float(p) for p in f1_optimal_point(prec, rec, conf)))),
+            "area": {
+                "precision": float(a_prec),
+                "recall":    float(a_rec),
+                "f1":        float(a_f1),
+                "threshold": float(thr_opt),
+            },
         }
     with open(output_root / "benchmark_summary.json", "w") as f:
         json.dump(summary, f, indent=2)
