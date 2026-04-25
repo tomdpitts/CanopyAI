@@ -27,8 +27,8 @@ from shapely.validation import make_valid
 from transformers import SegformerForSemanticSegmentation, SegformerImageProcessor
 
 MODEL_ID   = "restor/tcd-segformer-mit-b5"
-TILE_SIZE  = 512
-OVERLAP    = 64
+TILE_SIZE  = 1024   # matches restor/tcd training crop size (default.yaml: tile_size=1024)
+OVERLAP    = 256    # matches restor/tcd default (default.yaml: tile_overlap=256)
 MIN_AREA   = 50     # minimum pixel area to keep an instance
 TREE_CLASS = 1      # class index for tree crown in the TCD model
 

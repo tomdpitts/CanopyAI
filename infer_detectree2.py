@@ -19,7 +19,7 @@ import os
 from pathlib import Path
 
 from detectree2.preprocessing.tiling import tile_data
-from detectree2.models.outputs import project_to_geojson
+from detectree2.models.outputs import project_to_geojson, stitch_crowns, clean_crowns, post_clean
 from detectree2.models.predict import predict_on_data
 from detectree2.models.train import setup_cfg
 from detectron2.engine import DefaultPredictor
@@ -41,7 +41,6 @@ from utils import visualize_validation_results
 from utils import compute_final_metric
 from utils import filter_raw_predictions
 from utils import load_tcd_meta_for_tile
-from utils import apply_nms_to_geojson
 import torch
 import torch.multiprocessing as mp
 
@@ -102,232 +101,216 @@ def smoke_test(model_path: Path):
 # --------------------------------------------------
 # Main pipeline
 # --------------------------------------------------
-def main():
-    # Model path
-    if args.weights == "finetuned":
-        model_path = Path(
-            "model_echo29.pth"
-            # "data/tcd/train_outputs/model_bravo2.pth"
-        )  # alpha5 is the latest model from Modal HPC
-    else:
-        model_path = Path("230103_randresize_full.pth")
+def make_predictor():
+    """Initialise and return a Detectron2 predictor (called once per process)."""
+    model_path = Path("model_echo29.pth") if args.weights == "finetuned" else Path("230103_randresize_full.pth")
 
-    # === 1. Define key paths ===
-    if args.output_root:
-        site_path = Path(args.output_root)
-    else:
-        home = Path.home()
-        site_path = home / "dphil" / "canopyAI" / "data" / "tcd"
-    raw_dir = site_path / "raw"
-
-    # === 2. Create output/working directories ===
-    pred_tiles_path = ensure_dir(site_path / "tiles_pred")
-
-    # === 3. Download pretrained model if missing ===
     if not model_path.exists():
         url = f"https://zenodo.org/records/10522461/files/{model_path}"
         print(f"📦 Model not found locally — downloading from {url} ...")
         wget.download(url, out=str(model_path))
         print("\n✅ Model download complete.")
 
-    # === 4. Initialize Detectron2 predictor ===
     print("\n⚙️  Initializing Detectron2 predictor ...")
-    cfg = setup_cfg()  # Don't set weights yet
-
-    # Load the config used for training if using fine-tuned weights
+    cfg = setup_cfg()
     if args.weights == "finetuned":
         config_path = Path("configs/full_train.yaml")
         if config_path.exists():
-            print(f"📄 Loading config from {config_path}")
             cfg.merge_from_file(str(config_path))
-        else:
-            print(f"⚠️ Config {config_path} not found, using defaults")
-
-    # Force the correct weights *after* merging config
     cfg.MODEL.WEIGHTS = str(model_path)
-
     set_device(cfg)
     predictor = DefaultPredictor(cfg)
     print("✅ Predictor ready.")
+    return predictor
 
-    # Initialize accumulators
-    all_tree_scores = []
-    all_canopy_scores = []
-    total_pred = 0
-    total_gt_trees = 0
-    total_gt_canopy = 0
 
-    # === 5–12. Process each tile ===
-    if args.image_path:
-        img_path = Path(args.image_path)
-        if not img_path.exists():
-            raise FileNotFoundError(f"❌ Image not found: {img_path}")
+def process_tile(img_path, predictor, working_root, output_dir=None):
+    """
+    Run full detectree2 pipeline on a single tile.
+    If output_dir is given, writes {stem}_canopyai.geojson there and cleans up
+    the working directory. Otherwise uses the legacy validation/overlay flow.
+    """
+    image_info = load_tcd_meta_for_tile(img_path)
+    image_id   = image_info.get("image_id", "unknown") if image_info else "unknown"
 
-        raw_dir = img_path.parent
-        files_to_process = [img_path]
-        print(f"\n🎯 Processing single image: {img_path}")
-    elif args.test_data_dir:
-        raw_dir = Path(args.test_data_dir)
-        print(f"\n🧪 Using TEST data from {raw_dir}/")
-        files_to_process = sorted(raw_dir.glob("tcd_tile_*.tif"))
-    elif args.use_test_data:
-        raw_dir = Path("data/tcd/raw_test")
-        print("\n🧪 Using TEST data from data/tcd/raw_test/")
-        files_to_process = sorted(raw_dir.glob("tcd_tile_*.tif"))
-    else:
-        raw_dir = Path("data/tcd/raw")
-        print("\n📊 Using TRAINING data from data/tcd/raw/")
-        files_to_process = sorted(raw_dir.glob("tcd_tile_*.tif"))
+    site_path      = Path(working_root)
+    pred_tiles_path = ensure_dir(site_path / "tiles_pred")
+    chip_dir        = Path(pred_tiles_path) / f"{img_path.stem}_chips"
+    ensure_dir(chip_dir)
 
-    if len(files_to_process) == 0:
-        raise FileNotFoundError(
-            f"❌ No TCD tiles found in {raw_dir}.\n"
-            "Please run prepare_data.py first to download the dataset."
+    buffer     = 30
+    tile_width = args.tile_size
+    tile_height = args.tile_size
+
+    try:
+        tile_data(
+            str(img_path), chip_dir, buffer, tile_width, tile_height,
+            dtype_bool=True, full_coverage=True,
         )
+    except AttributeError as e:
+        print(f"⚠️ Non-georeferenced image — skipping CRS: {e}")
+
+    chips = list(Path(chip_dir).glob("*.tif"))
+    chip_geo_dir = chip_dir / "predictions_geo"
+    chip_geo_dir.mkdir(parents=True, exist_ok=True)
+    merged_geojson = chip_geo_dir / f"{img_path.stem}_merged.geojson"
+
+    if len(chips) == 0:
+        print(f"  ⚠️  no usable chips (nodata tile) — writing empty GeoJSON")
+        import json as _json
+        with open(merged_geojson, "w") as _f:
+            _json.dump({"type": "FeatureCollection", "features": []}, _f)
+    else:
+        chip_pred_dir = chip_dir / "predictions"
+        predict_on_data(chip_dir, out_folder=chip_pred_dir, predictor=predictor, save=True)
+        filter_raw_predictions(chip_pred_dir, score_thresh=filter_threshold, overwrite=True)
+        project_to_geojson(tiles_path=chip_dir, pred_fold=chip_pred_dir, output_fold=chip_geo_dir)
+
+        try:
+            crowns_raw = stitch_crowns(str(chip_geo_dir), shift=1)
+        except (FileNotFoundError, ValueError):
+            crowns_raw = gpd.GeoDataFrame(columns=["Confidence_score", "geometry"])
+
+        if crowns_raw.empty:
+            import json as _json
+            with open(merged_geojson, "w") as _f:
+                _json.dump({"type": "FeatureCollection", "features": []}, _f)
+        else:
+            crowns_clean = clean_crowns(
+                crowns_raw, iou_threshold=0.7, confidence=0.2,
+                area_threshold=2, containment_threshold=0.85,
+            )
+            if crowns_clean.empty:
+                crowns_raw.to_file(str(merged_geojson), driver="GeoJSON")
+            else:
+                crowns_final = post_clean(crowns_raw, crowns_clean, iou_threshold=0.3)
+                crowns_final.to_file(str(merged_geojson), driver="GeoJSON")
+
+    if output_dir is not None:
+        # Batch mode: copy out and clean up intermediates
+        import shutil
+        shutil.copy(merged_geojson, Path(output_dir) / f"{img_path.stem}_canopyai.geojson")
+        shutil.rmtree(site_path, ignore_errors=True)
+        return True
+
+    # Legacy single-tile mode: run validation/visualisation
+    if image_id in ("unknown", "WON"):
+        print(f"⚠️ No ground truth metadata for {img_path.name} — skipping validation metrics.")
+        visualize_validation_results(pred=gpd.read_file(merged_geojson), gt=None, ious=None,
+                                     site_path=site_path, rgb_path=img_path,
+                                     tile_name=img_path.stem, image_id=image_id)
+        return True
+
+    metrics_all, pred, gt, scores, coco_anns = clean_validate_predictions_vs_tcd_segments(
+        pred_geojson_path=merged_geojson, image_tif=image_info,
+        iou_thresh_tree=0.5, iop_thresh_canopy=0.7,
+    )
+    if metrics_all is None:
+        print(f"⚠️ No GT for tile {image_id} — skipping.")
+        return True
+
+    visualize_validation_results(pred, gt, scores, coco_anns, site_path=site_path,
+                                 rgb_path=img_path, tile_name=img_path.stem, image_id=image_id)
+    return metrics_all
+
+
+def main():
+    # ── Batch mode (benchmark_tcd.py) ─────────────────────────────────────────
+    if args.tcd_dir:  # set via --tcd-dir (argparse converts - to _)
+        tcd_dir    = Path(args.tcd_dir)
+        output_dir = Path(args.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        working_root = output_dir / f"_detectree2_working_{os.getpid()}"
+
+        tile_set = set(args.tiles) if args.tiles else None
+        tifs = sorted(tcd_dir.glob("*.tif"))
+        if tile_set:
+            tifs = [t for t in tifs if t.stem in tile_set]
+
+        with open(os.devnull, "w") as devnull:
+            old_fds = os.dup(1), os.dup(2)
+            os.dup2(devnull.fileno(), 1); os.dup2(devnull.fileno(), 2)
+            try:
+                predictor = make_predictor()
+            finally:
+                os.dup2(old_fds[0], 1); os.close(old_fds[0])
+                os.dup2(old_fds[1], 2); os.close(old_fds[1])
+        print("⚙️  Predictor ready.")
+        ok = skipped = 0
+        for tif in tifs:
+            out_file = output_dir / f"{tif.stem}_canopyai.geojson"
+            if args.skip_existing and out_file.exists():
+                skipped += 1
+                ok += 1
+                continue
+            print(f"    {tif.name} ... ", end="", flush=True)
+            try:
+                with open(os.devnull, "w") as devnull:
+                    old_fds = os.dup(1), os.dup(2)
+                    os.dup2(devnull.fileno(), 1)
+                    os.dup2(devnull.fileno(), 2)
+                    try:
+                        process_tile(tif, predictor, working_root, output_dir=output_dir)
+                    finally:
+                        os.dup2(old_fds[0], 1); os.close(old_fds[0])
+                        os.dup2(old_fds[1], 2); os.close(old_fds[1])
+                print("✓")
+                ok += 1
+            except Exception as e:
+                print(f"✗  ({e})")
+        if skipped:
+            print(f"  {skipped} tiles skipped (already exist)")
+        print(f"  {ok}/{len(tifs)} successful")
+        return
+
+    # ── Single-tile / legacy mode ──────────────────────────────────────────────
+    if args.output_root:
+        site_path = Path(args.output_root)
+    else:
+        site_path = Path.home() / "dphil" / "canopyAI" / "data" / "tcd"
+
+    if args.image_path:
+        files_to_process = [Path(args.image_path)]
+        print(f"\n🎯 Processing single image: {args.image_path}")
+    elif args.test_data_dir:
+        files_to_process = sorted(Path(args.test_data_dir).glob("tcd_tile_*.tif"))
+    elif args.use_test_data:
+        files_to_process = sorted(Path("data/tcd/raw_test").glob("tcd_tile_*.tif"))
+    else:
+        files_to_process = sorted(Path("data/tcd/raw").glob("tcd_tile_*.tif"))
+
+    if not files_to_process:
+        raise FileNotFoundError("❌ No TCD tiles found.")
+
+    predictor = make_predictor()
+
+    all_tree_scores   = []
+    all_canopy_scores = []
+    total_pred = total_gt_trees = total_gt_canopy = 0
 
     for img_path in files_to_process:
         image_info = load_tcd_meta_for_tile(img_path)
-
-        if image_info is not None:
-            image_id = image_info.get("image_id", "unknown")
-        else:
-            image_id = "unknown"
-
+        image_id   = image_info.get("image_id", "unknown") if image_info else "unknown"
         print(f"\n================ Processing {image_id} ================")
         print(f"Biome: {image_info.get('biome_name', 'N/A') if image_info else 'N/A'}")
 
-        # ------------------------------------------------------------
-        # 5. Tile orthomosaic into chips for inference
-        # ------------------------------------------------------------
-        print("\n🧩 Tiling image into smaller chips ...")
-
-        chip_dir = Path(pred_tiles_path) / f"{img_path.stem}_chips"
-        ensure_dir(chip_dir)
-
-        buffer = 30
-        tile_width = args.tile_size
-        tile_height = args.tile_size
-
-        try:
-            # Detectree2 tiler (preserves CRS if the input GeoTIFF is georeferenced)
-            tile_data(
-                str(img_path),
-                chip_dir,  # output directory
-                buffer,
-                tile_width,
-                tile_height,
-                dtype_bool=True,  # Detectree2 expects this for mask chips
-            )
-            print("✅ Tiling complete.")
-        except AttributeError as e:
-            print(f"⚠️ Non-georeferenced image — skipping CRS: {e}")
-
-        # If no tiles were created, just skip this image and continue.
-        chips = list(Path(chip_dir).glob("*.tif"))
-        if len(chips) == 0:
-            print(
-                f"⚠️  Skipping {image_id} — no tiles produced (likely nodata or invalid raster)."
-            )
-            continue
-
-        # ------------------------------------------------------------
-        # 6. Run Detectron2 inference on chips
-        # ------------------------------------------------------------
-        print("\n🔮 Running model inference on tiled chips ...")
-        predict_on_data(chip_dir, out_folder=chip_dir / "predictions", predictor=predictor, save=True)
-        print("✅ Inference complete.")
-
-        # ------------------------------------------------------------
-        # 7. Filter raw Detectron2 predictions *inside chip folder*
-        # ------------------------------------------------------------
-        chip_pred_dir = chip_dir / "predictions"
-        filter_raw_predictions(
-            chip_pred_dir,
-            score_thresh=filter_threshold,
-            overwrite=True,
-        )
-
-        # ------------------------------------------------------------
-        # 8. Reproject tiled predictions → GeoJSON in global CRS
-        # ------------------------------------------------------------
-        print("\n🗺️  Projecting tile predictions to GeoJSON ...")
-        chip_geo_dir = chip_dir / "predictions_geo"
-        ensure_dir(chip_geo_dir)
-
-        project_to_geojson(
-            tiles_path=chip_dir, pred_fold=chip_pred_dir, output_fold=chip_geo_dir
-        )
-        print("✅ GeoJSON projection complete.")
-
-        # ------------------------------------------------------------
-        # 9. Visualize & Validate on the *merged* predictions
-        # ------------------------------------------------------------
-        # Detectree2 produces one GeoJSON per tile — merge them for evaluation
-        merged_geojson = chip_geo_dir / f"{img_path.stem}_merged.geojson"
-        merge_tile_geojsons(chip_geo_dir, merged_geojson)
-        # Apply NMS to remove duplicate overlapping polygons
-        apply_nms_to_geojson(merged_geojson, iou_threshold=nms_dedupe_threshold)
-
-        # Skip validation if no ground truth metadata
-        if image_id == "unknown" or image_id == "WON":
-            print(
-                f"⚠️ No ground truth metadata for {img_path.name} — skipping validation metrics."
-            )
-
-            # Use the main visualization function (now handles gt=None)
-            visualize_validation_results(
-                pred=gpd.read_file(merged_geojson),
-                gt=None,
-                ious=None,
-                site_path=site_path,
-                rgb_path=img_path,
-                tile_name=img_path.stem,
-                image_id=image_id,
-            )
-            continue
-
-        metrics_all, pred, gt, scores, coco_anns = (
-            clean_validate_predictions_vs_tcd_segments(
-                pred_geojson_path=merged_geojson,
-                image_tif=image_info,
-                iou_thresh_tree=0.5,
-                iop_thresh_canopy=0.7,
-            )
-        )
-
-        if metrics_all is None:
-            print(f"⚠️ No GT for tile {image_id} — skipping.")
-            continue
-        scores_trees, scores_canopy = scores
-
-        total_pred += metrics_all["n_pred"]
-        total_gt_trees += metrics_all["n_gt_trees"]
-        total_gt_canopy += metrics_all["n_gt_canopy"]
-
-        # Extend raw overlap score lists
-        all_tree_scores.extend(scores_trees.tolist())
-        all_canopy_scores.extend(scores_canopy.tolist())
-
-        visualize_validation_results(
-            pred,
-            gt,
-            scores,
-            coco_anns,
-            site_path=site_path,
-            rgb_path=img_path,
-            tile_name=img_path.stem,
-            image_id=image_id,
-        )
+        result = process_tile(img_path, predictor, site_path, output_dir=None)
+        if isinstance(result, dict):
+            metrics_all = result
+            total_pred      += metrics_all["n_pred"]
+            total_gt_trees  += metrics_all["n_gt_trees"]
+            total_gt_canopy += metrics_all["n_gt_canopy"]
+            scores_trees, scores_canopy = metrics_all.get("scores", ([], []))
+            all_tree_scores.extend(scores_trees)
+            all_canopy_scores.extend(scores_canopy)
 
     final_tree = compute_final_metric(
         all_tree_scores, thresh=0.5, n_pred=total_pred, n_gt=total_gt_trees
     )
-
     final_canopy = compute_final_metric(
         all_canopy_scores, thresh=0.7, n_pred=total_pred, n_gt=total_gt_canopy
     )
-
-    print(f"============= Cohort Metrics ================")
+    print("============= Cohort Metrics ================")
     print_metrics("Trees (IoU)", final_tree)
     print_metrics("Canopy (IoP)", final_canopy)
 
@@ -407,18 +390,37 @@ def parse_args():
         help="Root directory for all outputs (tiles_pred/, overlays_validation/). "
              "Defaults to ~/dphil/canopyAI/data/tcd/",
     )
+    # ── Batch mode (used by benchmark_tcd.py) ────────────────────────────────
+    ap.add_argument(
+        "--tcd-dir",
+        type=str,
+        default=None,
+        help="Directory of .tif tiles to process in batch (model loaded once).",
+    )
+    ap.add_argument(
+        "--output-dir",
+        type=str,
+        default=None,
+        help="Output directory for *_canopyai.geojson files (batch mode).",
+    )
+    ap.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="Skip tiles whose *_canopyai.geojson already exists in --output-dir.",
+    )
+    ap.add_argument(
+        "--tiles",
+        nargs="+",
+        default=None,
+        help="Restrict to these tile stems (e.g. tcd_tile_3 tcd_tile_7).",
+    )
 
     return ap.parse_args()
 
 
 def set_device(cfg):
-    # Prefer Apple MPS, else CPU (no CUDA on Apple Silicon)
-    # device = "mps" if torch.backends.mps.is_available() else "cpu"
-    device = "cpu"
-    cfg.MODEL.DEVICE = device
-    print(f"🖥️ Using device: {device}")
-    cfg.DATALOADER.NUM_WORKERS = 0
-    torch.set_num_threads(1)
+    cfg.MODEL.DEVICE = "cpu"
+    cfg.DATALOADER.NUM_WORKERS = 4
 
 
 def visualize_saved_prediction_with_masks(
@@ -529,6 +531,9 @@ def visualize_saved_prediction_with_masks(
 # --------------------------------------------------
 if __name__ == "__main__":
     os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+    import logging
+    for _noisy in ("detectree2", "fvcore", "detectron2"):
+        logging.getLogger(_noisy).setLevel(logging.WARNING)
     args = parse_args()
 
     if args.smoke:

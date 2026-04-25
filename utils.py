@@ -1080,7 +1080,6 @@ def filter_raw_predictions(
         with open(out_path, "w") as f:
             json.dump(preds, f)
 
-        print(f"📊 {fpath.name}: kept {after}/{before} predictions (≥ {score_thresh})")
 
     print(
         f"✅ Filtering complete — overwrote {len(json_files)} files at ≥ {score_thresh}."

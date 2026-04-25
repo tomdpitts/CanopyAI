@@ -8,7 +8,7 @@ are pooled together. A prediction is TP if IoP ≥ iop_thresh against any GT pol
 
 Supported model specifiers:
   weecology          → weecology/deepforest NEON pretrained   (foxtrot.py → SAM polygon)
-  detectree2         → Detectree2 Mask R-CNN baseline         (infer.py   → polygon)
+  detectree2         → Detectree2 Mask R-CNN baseline         (infer_detectree2.py → polygon)
   <path>.pth         → ShadowConditionedDeepForest checkpoint  (foxtrot.py → SAM polygon)
 
 Usage:
@@ -30,6 +30,7 @@ Usage:
 """
 
 import argparse, json, os, shutil, subprocess, sys, tempfile
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import geopandas as gpd
@@ -196,28 +197,33 @@ def run_segformer(image_path, out_dir):
     return True
 
 
-def run_detectree2(image_path, out_dir):
-    # infer.py writes: {infer_root}/tiles_pred/{stem}_chips/predictions_geo/{stem}_merged.geojson
-    infer_root = Path(out_dir) / "_detectree2_working"
-    infer_root.mkdir(parents=True, exist_ok=True)
-    cmd = [sys.executable, "infer.py",
-           "--image_path", str(image_path),
-           "--output_root", str(infer_root)]
-    r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if r.returncode != 0:
-        print(f"      ⚠  infer.py failed: {r.stderr[-500:]}")
-        return False
-    stem = image_path.stem
-    merged = infer_root / "tiles_pred" / f"{stem}_chips" / "predictions_geo" / f"{stem}_merged.geojson"
-    if not merged.exists():
-        print(f"      ⚠  merged GeoJSON not found for {stem} (expected: {merged})")
-        return False
-    shutil.copy(merged, out_dir / f"{stem}_canopyai.geojson")
-    return True
+def run_detectree2(tcd_dir, out_dir, skip_existing=False, tile_filter=None, num_shards=2):
+    tcd_dir = Path(tcd_dir)
+    all_tiles = sorted(t.stem for t in tcd_dir.glob("*.tif"))
+    if tile_filter:
+        all_tiles = [s for s in all_tiles if s in set(tile_filter)]
+
+    shards = [all_tiles[i::num_shards] for i in range(num_shards)]
+
+    def _launch(shard_tiles):
+        cmd = [sys.executable, "infer_detectree2.py",
+               "--tcd-dir",    str(tcd_dir),
+               "--output-dir", str(out_dir),
+               "--tiles"] + shard_tiles
+        if skip_existing:
+            cmd.append("--skip-existing")
+        return subprocess.Popen(cmd, text=True)
+
+    procs = [_launch(s) for s in shards if s]
+    codes = [p.wait() for p in procs]
+    return all(c == 0 for c in codes)
 
 
 def run_inference(model_spec, mtype, tcd_dir, out_dir, shadow_model, abs_luma_max=None,
                   skip_existing=False, tile_filter=None):
+    if mtype == "detectree2":
+        return run_detectree2(tcd_dir, out_dir, skip_existing, tile_filter)
+
     tifs = sorted(Path(tcd_dir).glob("*.tif"))
     if tile_filter is not None:
         tifs = [t for t in tifs if t.stem in tile_filter]
@@ -230,9 +236,7 @@ def run_inference(model_spec, mtype, tcd_dir, out_dir, shadow_model, abs_luma_ma
             ok += 1
             continue
         print(f"    {tif.name} ... ", end="", flush=True)
-        if mtype == "detectree2":
-            success = run_detectree2(tif, out_dir)
-        elif mtype == "segformer":
+        if mtype == "segformer":
             success = run_segformer(tif, out_dir)
         else:
             success = run_foxtrot(model_spec, mtype, tif, out_dir, shadow_model, abs_luma_max)
@@ -302,7 +306,7 @@ def load_gt(meta, tif_path=None):
 
 def score_column(gdf):
     """Return the confidence-score column name from a foxtrot/detectree2 GeoJSON."""
-    for col in ("deepforest_score", "score", "Confidence", "confidence"):
+    for col in ("deepforest_score", "Confidence_score", "score", "Confidence", "confidence"):
         if col in gdf.columns:
             return col
     return None
@@ -519,6 +523,59 @@ def area_metrics(all_preds, gt_by_tile, score_threshold):
     return ap, ar, af1
 
 
+def _compute_tile_worker(args):
+    from shapely.ops import unary_union
+    tid, gt_polys_raw, pred_pairs, iop_thresh = args
+    gt_polys   = [g if g.is_valid else make_valid(g) for g in gt_polys_raw]
+    pred_polys = [make_valid(g) if g is not None and not g.is_valid else g
+                  for g, _ in pred_pairs]
+    pred_polys = [g for g in pred_polys if g is not None and not g.is_empty]
+
+    n_gt   = len(gt_polys)
+    n_pred = len(pred_polys)
+
+    tp = 0
+    matched_gt = set()
+    if gt_polys and pred_polys:
+        tree = STRtree(gt_polys)
+        for p in pred_polys:
+            hits = [j for j in tree.query(p, predicate="intersects")
+                    if j not in matched_gt and _iop(p, gt_polys[j]) >= iop_thresh]
+            if hits:
+                best = max(hits, key=lambda j: _iop(p, gt_polys[j]))
+                matched_gt.add(best)
+                tp += 1
+    fp = n_pred - tp
+    fn = n_gt - len(matched_gt)
+
+    poly_p  = tp / n_pred            if n_pred > 0 else 0.0
+    poly_r  = len(matched_gt) / n_gt if n_gt   > 0 else 0.0
+    poly_f1 = 2 * poly_p * poly_r / (poly_p + poly_r) if (poly_p + poly_r) > 0 else 0.0
+
+    gt_u   = unary_union(gt_polys)   if gt_polys   else None
+    pred_u = unary_union(pred_polys) if pred_polys else None
+    gt_area   = gt_u.area   if gt_u   is not None else 0.0
+    pred_area = pred_u.area if pred_u is not None else 0.0
+    inter = gt_u.intersection(pred_u).area if (gt_u is not None and pred_u is not None) else 0.0
+    area_p   = inter / pred_area if pred_area > 0 else 0.0
+    area_r   = inter / gt_area   if gt_area   > 0 else 0.0
+    area_f1v = 2 * area_p * area_r / (area_p + area_r) if (area_p + area_r) > 0 else 0.0
+
+    return tid, {
+        "n_gt":           n_gt,
+        "n_pred":         n_pred,
+        "tp":             tp,
+        "fp":             fp,
+        "fn":             fn,
+        "poly_precision": round(poly_p,   4),
+        "poly_recall":    round(poly_r,   4),
+        "poly_f1":        round(poly_f1,  4),
+        "area_precision": round(area_p,   4),
+        "area_recall":    round(area_r,   4),
+        "area_f1":        round(area_f1v, 4),
+    }
+
+
 def compute_tile_metrics(all_preds, gt_by_tile, iop_thresh, score_threshold):
     """
     Per-tile TP/FP/FN + area metrics at a fixed score threshold.
@@ -526,71 +583,21 @@ def compute_tile_metrics(all_preds, gt_by_tile, iop_thresh, score_threshold):
       n_gt, n_pred, tp, fp, fn, poly_precision, poly_recall, poly_f1,
       area_precision, area_recall, area_f1
     """
-    from shapely.ops import unary_union
-    from shapely.strtree import STRtree
-
     preds_by_tile = {}
     for geom, score, tid in all_preds:
         if score >= score_threshold:
             preds_by_tile.setdefault(tid, []).append((geom, score))
 
     all_tids = set(gt_by_tile.keys()) | set(preds_by_tile.keys())
+    worker_args = [
+        (tid, gt_by_tile.get(tid, []), preds_by_tile.get(tid, []), iop_thresh)
+        for tid in all_tids
+    ]
+
     results = {}
-
-    for tid in all_tids:
-        gt_polys   = [g if g.is_valid else make_valid(g) for g in gt_by_tile.get(tid, [])]
-        pred_pairs = preds_by_tile.get(tid, [])
-        pred_polys = [g if g is not None and not g.is_empty and (g.is_valid or True)
-                      else None for g, _ in pred_pairs]
-        pred_polys = [make_valid(g) if g is not None and not g.is_valid else g
-                      for g in pred_polys]
-        pred_polys = [g for g in pred_polys if g is not None and not g.is_empty]
-
-        n_gt   = len(gt_polys)
-        n_pred = len(pred_polys)
-
-        # Poly TP/FP/FN via IoP matching
-        tp = 0
-        matched_gt = set()
-        if gt_polys and pred_polys:
-            tree = STRtree(gt_polys)
-            for p in pred_polys:
-                hits = [j for j in tree.query(p, predicate="intersects")
-                        if j not in matched_gt and _iop(p, gt_polys[j]) >= iop_thresh]
-                if hits:
-                    best = max(hits, key=lambda j: _iop(p, gt_polys[j]))
-                    matched_gt.add(best)
-                    tp += 1
-        fp = n_pred - tp
-        fn = n_gt - len(matched_gt)
-
-        poly_p = tp / n_pred    if n_pred > 0 else 0.0
-        poly_r = len(matched_gt) / n_gt if n_gt   > 0 else 0.0
-        poly_f1 = 2 * poly_p * poly_r / (poly_p + poly_r) if (poly_p + poly_r) > 0 else 0.0
-
-        # Area metrics
-        gt_u   = unary_union(gt_polys)   if gt_polys   else None
-        pred_u = unary_union(pred_polys) if pred_polys else None
-        gt_area   = gt_u.area   if gt_u   is not None else 0.0
-        pred_area = pred_u.area if pred_u is not None else 0.0
-        inter = gt_u.intersection(pred_u).area if (gt_u is not None and pred_u is not None) else 0.0
-        area_p  = inter / pred_area if pred_area > 0 else 0.0
-        area_r  = inter / gt_area   if gt_area   > 0 else 0.0
-        area_f1_v = 2 * area_p * area_r / (area_p + area_r) if (area_p + area_r) > 0 else 0.0
-
-        results[tid] = {
-            "n_gt":           n_gt,
-            "n_pred":         n_pred,
-            "tp":             tp,
-            "fp":             fp,
-            "fn":             fn,
-            "poly_precision": round(poly_p,  4),
-            "poly_recall":    round(poly_r,  4),
-            "poly_f1":        round(poly_f1, 4),
-            "area_precision": round(area_p,   4),
-            "area_recall":    round(area_r,   4),
-            "area_f1":        round(area_f1_v, 4),
-        }
+    with ProcessPoolExecutor() as executor:
+        for tid, metrics in executor.map(_compute_tile_worker, worker_args, chunksize=10):
+            results[tid] = metrics
     return results
 
 
@@ -632,6 +639,37 @@ def save_tile_csv(model_name, tile_metrics, tile_meta, score_threshold, out_path
 
 # ── Evaluation orchestration ───────────────────────────────────────────────────
 
+def _load_tile_worker(args):
+    i, pred_path_str, tcd_dir_str = args
+    pred_path = Path(pred_path_str)
+    tcd_dir   = Path(tcd_dir_str)
+    stem      = pred_path.stem.replace("_canopyai", "")
+    meta_path = tcd_dir / f"{stem}_meta.json"
+    tif_path  = tcd_dir / f"{stem}.tif"
+    if not meta_path.exists():
+        return None
+    with open(meta_path) as f:
+        meta = json.load(f)
+    if "width" not in meta or "height" not in meta:
+        import rasterio
+        if tif_path.exists():
+            with rasterio.open(tif_path) as src:
+                meta["width"], meta["height"] = src.width, src.height
+        else:
+            return None
+    biome_name = meta.get("biome_name", "unknown")
+    meta_entry = {
+        "stem":        stem,
+        "biome_name":  biome_name,
+        "biome_group": biome_group(biome_name),
+        "country":     meta.get("country", "unknown"),
+        "image_id":    meta.get("image_id", ""),
+    }
+    gt_polys, _ = load_gt(meta, tif_path)
+    polys, scores, _ = load_predictions(pred_path, meta)
+    return i, gt_polys, list(zip(polys, scores)), biome_name, meta_entry
+
+
 def evaluate_model(name, out_dir, tcd_dir, iop_thresh, tile_filter=None):
     """
     Loads all predictions + GT for a model.
@@ -656,39 +694,17 @@ def evaluate_model(name, out_dir, tcd_dir, iop_thresh, tile_filter=None):
     tile_biomes = {}
     tile_meta   = {}
 
-    for i, pred_path in enumerate(pred_files):
-        stem = pred_path.stem.replace("_canopyai", "")
-        meta_path = tcd_dir / f"{stem}_meta.json"
-        tif_path  = tcd_dir / f"{stem}.tif"
-        if not meta_path.exists():
-            continue
-
-        with open(meta_path) as f:
-            meta = json.load(f)
-        if "width" not in meta or "height" not in meta:
-            import rasterio
-            if tif_path.exists():
-                with rasterio.open(tif_path) as src:
-                    meta["width"], meta["height"] = src.width, src.height
-            else:
+    worker_args = [(i, str(p), str(tcd_dir)) for i, p in enumerate(pred_files)]
+    with ProcessPoolExecutor() as executor:
+        for result in executor.map(_load_tile_worker, worker_args, chunksize=10):
+            if result is None:
                 continue
-
-        biome_name = meta.get("biome_name", "unknown")
-        tile_biomes[i] = biome_name
-        tile_meta[i] = {
-            "stem":       stem,
-            "biome_name": biome_name,
-            "biome_group": biome_group(biome_name),
-            "country":    meta.get("country", "unknown"),
-            "image_id":   meta.get("image_id", ""),
-        }
-
-        gt_polys, _ = load_gt(meta, tif_path)
-        gt_by_tile[i] = gt_polys
-
-        polys, scores, _ = load_predictions(pred_path, meta)
-        for geom, score in zip(polys, scores):
-            all_preds.append((geom, score, i))
+            i, gt_polys, pred_pairs, biome_name, meta_entry = result
+            gt_by_tile[i]  = gt_polys
+            tile_biomes[i] = biome_name
+            tile_meta[i]   = meta_entry
+            for geom, score in pred_pairs:
+                all_preds.append((geom, score, i))
 
     return all_preds, gt_by_tile, tile_biomes, tile_meta
 
@@ -733,31 +749,32 @@ def plot_pr_curves(model_results, iop_thresh, save_path):
 
 # ── Results table ──────────────────────────────────────────────────────────────
 
-def print_table(model_results, model_area_results, iop_thresh):
-    print("\n" + "═" * 90)
+def print_table(model_results, model_area_results, model_n_tiles, iop_thresh):
+    print("\n" + "═" * 96)
     print("  BENCHMARK — Restor TCD  |  AP + F1-optimal operating point  |  Area metrics")
     print(f"  All GT (trees + canopy pooled)  |  IoP ≥ {iop_thresh:.2f}  (* = F1-optimal threshold)")
-    print("═" * 90)
+    print("═" * 96)
 
-    hdr = (f"  {'Model':<18}  {'AP':>6}  {'Prec*':>6}  {'Rec*':>6}  {'F1*':>6}  {'Thr*':>6}"
+    hdr = (f"  {'Model':<18}  {'N':>5}  {'AP':>6}  {'Prec*':>6}  {'Rec*':>6}  {'F1*':>6}  {'Thr*':>6}"
            f"  {'AreaP':>6}  {'AreaR':>6}  {'AreaF1':>7}")
-    sep  = "  " + "-"*18 + "  " + "  ".join(["-"*6]*8) + "  " + "-"*7
-    row  = ("  {:<18}  {:6.3f}  {:6.3f}  {:6.3f}  {:6.3f}  {:6.3f}"
+    sep  = "  " + "-"*18 + "  " + "-"*5 + "  " + "  ".join(["-"*6]*8) + "  " + "-"*7
+    row  = ("  {:<18}  {:5d}  {:6.3f}  {:6.3f}  {:6.3f}  {:6.3f}  {:6.3f}"
             "  {:6.3f}  {:6.3f}  {:7.3f}")
     print(hdr); print(sep)
 
     for name, res in model_results.items():
         if res is None:
             dashes = "  ".join(["—".rjust(6)] * 8) + "  " + "—".rjust(7)
-            print(f"  {name:<18}  {dashes}")
+            print(f"  {name:<18}  {'—':>5}  {dashes}")
             continue
         ap, prec, rec, conf = res
         p_opt, r_opt, f1_opt, c_opt = f1_optimal_point(prec, rec, conf)
         a_res = model_area_results.get(name) or (0.0, 0.0, 0.0)
         a_prec, a_rec, a_f1 = a_res
-        print(row.format(name, ap, p_opt, r_opt, f1_opt, c_opt, a_prec, a_rec, a_f1))
+        n = model_n_tiles.get(name, 0)
+        print(row.format(name, n, ap, p_opt, r_opt, f1_opt, c_opt, a_prec, a_rec, a_f1))
 
-    print("═" * 90 + "\n")
+    print("═" * 96 + "\n")
 
 
 # ── Per-biome results table ────────────────────────────────────────────────────
@@ -840,6 +857,7 @@ def main():
     model_results       = {}
     model_area_results  = {}
     model_biome_results = {}
+    model_n_tiles       = {}
 
     for model_spec, name in zip(args.models, args.names):
         out_dir = output_root / name
@@ -854,6 +872,7 @@ def main():
             continue
 
         all_preds, gt_by_tile, tile_biomes, tile_meta = data
+        model_n_tiles[name] = len(gt_by_tile)
 
         ap, prec, rec, conf = compute_ap(all_preds, gt_by_tile, args.iop_thresh)
         model_results[name] = (ap, prec, rec, conf)
@@ -873,8 +892,7 @@ def main():
         print(f"    AP={ap:.3f}  AreaF1={a_f1:.3f}  (area thr={thr_opt:.3f})")
 
     # ── Step 3: Output ────────────────────────────────────────────────────────
-    print_table(model_results, model_area_results, args.iop_thresh)
-    print_biome_table(model_biome_results, args.iop_thresh, use_groups=False)
+    print_table(model_results, model_area_results, model_n_tiles, args.iop_thresh)
     print_biome_table(model_biome_results, args.iop_thresh, use_groups=True)
     plot_pr_curves(model_results, args.iop_thresh, args.pr_save)
 

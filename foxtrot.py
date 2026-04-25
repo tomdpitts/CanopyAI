@@ -1802,7 +1802,8 @@ def main(args):
     timings["DeepForest"] = time.time() - df_start
 
     if len(all_bboxes) == 0:
-        print("\n❌ No trees detected by DeepForest. Exiting.")
+        print("\n❌ No trees detected by DeepForest. Writing empty GeoJSON.")
+        _write_empty_geojson(args.output_dir, tif_path.stem)
         return
 
     # Apply NMS immediately to remove duplicates
@@ -1847,7 +1848,8 @@ def main(args):
     timings["SAM"] = time.time() - sam_start
 
     if len(valid_bboxes) == 0:
-        print("\n❌ No trees detected or segmented. Exiting.")
+        print("\n❌ No trees detected or segmented. Writing empty GeoJSON.")
+        _write_empty_geojson(args.output_dir, tif_path.stem)
         return
 
     # Optional: VLM shadow filtering
@@ -2200,6 +2202,15 @@ def parse_args():
     )
 
     return ap.parse_args()
+
+
+def _write_empty_geojson(output_dir, tif_stem):
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    path = out / f"{tif_stem}_canopyai.geojson"
+    with open(path, "w") as f:
+        json.dump({"type": "FeatureCollection", "features": []}, f)
+    print(f"💾 Empty GeoJSON written to {path}")
 
 
 if __name__ == "__main__":
