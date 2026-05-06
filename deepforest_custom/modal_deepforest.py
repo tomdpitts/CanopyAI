@@ -31,13 +31,40 @@ Training strategy — 3 stages from weecology pretrained weights:
            to leverage shadow context; gates continue to grow.
 
 ─────────────────────────────────────────────────────────────
-Phase 21 — WON + BRU + manually annotated NEON, shadow λ4
+Phase 22 — WON + BRU + manually annotated NEON, shadow L4 (fixed)
+─────────────────────────────────────────────────────────────
+Same training data as phase 21 but with per-image shadow_angle correctly
+populated in the train CSV. Phase 21 B_L4 was silently broken: the train
+CSV had no shadow_angle column so the loss reweight fell back to a global
+215° constant for all images, making the L4 weight meaningless.
+
+Fix: shadow angles for BRU/WON joined from phase5_train_aug.csv;
+55 NEON images manually annotated via annotate_shadow.py web app.
+Saved to phase21/phase21_train_with_shadow.csv.
+
+Upload before running:
+    modal volume put canopyai-deepforest-data phase22/phase22_train.csv phase22_train.csv
+    modal volume put canopyai-deepforest-data phase22/phase22_val.csv   phase22_val.csv
+
+    source venv310/bin/activate && \
+    modal run --detach deepforest_custom/modal_deepforest.py \
+        --train-csv /data/phase22_train.csv \
+        --val-csv /data/phase22_val.csv \
+        --run-name phase22_B_L4 \
+        --shadow-loss-reweight --shadow-loss-weight 4.0 \
+        --epochs 50 --patience 10 --lr 0.001 --batch-size 16
+
+─────────────────────────────────────────────────────────────
+Phase 21 — WON + BRU + manually annotated NEON, shadow λ4 (broken)
 ─────────────────────────────────────────────────────────────
 Replaces phase19 sparse auto-annotations with 72 manually annotated NEON crops:
   - 52 images with tree boxes (334 boxes total)
   - 20 confirmed-empty hard negatives
 Crops span DCFS, NOGP, OAES, WOOD, STER, JORN, TOOL + new LAJA (tropical),
 LENO (wetland), CLBJ (savanna) sites. 80/20 train/val split by image.
+
+NOTE: shadow_angle missing from train CSV — L4 reweight used 215° globally.
+Superseded by phase22_B_L4.
 
 Upload before running:
     # Tar up manual annotation crops
@@ -237,6 +264,37 @@ image = (
 )
 
 # ---------------------------------------------------------------------------
+# Augmentation suites matching the TCD paper (arxiv 2407.11743 §4).
+# Used when --tcd-augmentations is set.
+#
+# Two variants:
+#   TCD_AUGMENTATIONS        — full suite for models without directional shadow
+#                              features (baseline, shadow_channel etc.)
+#   TCD_AUGMENTATIONS_COLOUR — colour/blur only, for shadow_loss_reweight (L4).
+#                              Geometric transforms (flip, rotation) change the
+#                              shadow direction relative to image coordinates,
+#                              which breaks the directional loss weighting even
+#                              though no spatial shadow map is used at inference.
+# ---------------------------------------------------------------------------
+TCD_AUGMENTATIONS = [
+    {"HorizontalFlip":            {"p": 0.5}},
+    {"VerticalFlip":              {"p": 0.5}},
+    {"RandomRotate90":            {"p": 0.5}},
+    {"GaussianBlur":              {"blur_limit": [3, 7], "p": 0.3}},
+    {"RandomBrightnessContrast":  {"brightness_limit": 0.2, "contrast_limit": 0.2, "p": 0.5}},
+    {"HueSaturationValue":        {"hue_shift_limit": 10, "sat_shift_limit": 20,
+                                   "val_shift_limit": 20, "p": 0.5}},
+]
+
+TCD_AUGMENTATIONS_COLOUR = [
+    {"GaussianBlur":              {"blur_limit": [3, 7], "p": 0.3}},
+    {"RandomBrightnessContrast":  {"brightness_limit": 0.2, "contrast_limit": 0.2, "p": 0.5}},
+    {"HueSaturationValue":        {"hue_shift_limit": 10, "sat_shift_limit": 20,
+                                   "val_shift_limit": 20, "p": 0.5}},
+]
+
+
+# ---------------------------------------------------------------------------
 # Volumes
 # ---------------------------------------------------------------------------
 checkpoint_volume = modal.Volume.from_name(
@@ -284,6 +342,7 @@ def train_deepforest_modal(
     checkpoint: str = None,
     dry_run: bool = False,
     freeze_backbone: bool = False,
+    tcd_augmentations: bool = False,  # Use TCD paper augmentation suite (overrides wrapper disable)
 ):
     """
     Train DeepForest on Modal GPU. Auto-resumes from checkpoint if one exists
@@ -380,6 +439,8 @@ def train_deepforest_modal(
             ("/Users/tompitts/dphil/CanopyAI/neon_sparse_annotations/", "/data/images/neon_sparse_annotations/"),
             # Manually annotated NEON crops (phase21)
             ("/Users/tompitts/dphil/CanopyAI/manual_annotations/", "/data/images/manual_annotations/"),
+            # TCD training chips (prepare_tcd_training.py)
+            ("/Users/tompitts/dphil/CanopyAI/data/tcd/tcd_chips/", "/data/images/tcd_chips/"),
         ]
 
         def _rewrite_csv(csv_path):
@@ -622,6 +683,11 @@ def train_deepforest_modal(
         shadow_proposals_iso=shadow_proposals_iso,
         shadow_loss_reweight=shadow_loss_reweight,
         shadow_loss_weight=shadow_loss_weight,
+        augmentations=(
+            TCD_AUGMENTATIONS_COLOUR if (tcd_augmentations and shadow_loss_reweight)
+            else TCD_AUGMENTATIONS   if tcd_augmentations
+            else None
+        ),
     )
 
     # Persist checkpoints

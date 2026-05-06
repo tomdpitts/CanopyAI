@@ -238,12 +238,19 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
                 import pandas as pd
                 df = pd.read_csv(csv_path)
                 if "shadow_x" in df.columns and "shadow_y" in df.columns:
+                    import pandas as _pd
                     before = len(self.shadow_lookup)
                     for _, row in df.drop_duplicates("image_path").iterrows():
+                        sx, sy = row["shadow_x"], row["shadow_y"]
+                        if _pd.isna(sx) or _pd.isna(sy):
+                            continue   # tile has no shadow annotation — trains as baseline
                         self.shadow_lookup[row["image_path"]] = np.array(
-                            [row["shadow_x"], row["shadow_y"]], dtype=np.float32
+                            [float(sx), float(sy)], dtype=np.float32
                         )
-                    print(f"   Loaded {len(self.shadow_lookup)-before} shadow vectors from {label} CSV")
+                    n_loaded = len(self.shadow_lookup) - before
+                    n_skipped = df["image_path"].nunique() - n_loaded
+                    print(f"   Loaded {n_loaded} shadow vectors from {label} CSV "
+                          f"({n_skipped} skipped — no shadow annotation)")
                 else:
                     print(f"   No shadow_x/shadow_y in {label} CSV — will use angle fallback")
                 if all(c in df.columns for c in ["dg_scale", "dark_scale", "otsu_ctr"]):
@@ -740,6 +747,8 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
     # Shadow probe distances (px): range covering ~1–15 m trees at 30–50° sun elevation
     _SLR_PROBE_DISTANCES = (12, 20, 30, 42, 55, 75, 100)
     _SLR_SHADOW_THRESH   = 0.35   # min shadow_map value to count as shadow evidence
+    _SLR_PROBE_RADIUS    = 2      # half-side of neighbourhood patch sampled at each probe
+                                  # point — max over (2r+1)×(2r+1) pixels rather than 1px
 
     def _compute_shadow_gt_weights(self, images, image_paths, targets):
         """
@@ -782,12 +791,17 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
             cx = ((boxes[:, 0] + boxes[:, 2]) / 2).cpu().numpy()
             cy = ((boxes[:, 1] + boxes[:, 3]) / 2).cpu().numpy()
 
+            r = self._SLR_PROBE_RADIUS
             for i in range(N_gt):
                 for d in self._SLR_PROBE_DISTANCES:
                     px = int(round(cx[i] + d * sdx))
                     py = int(round(cy[i] + d * sdy))
-                    if 0 <= px < W and 0 <= py < H:
-                        if sm_np[py, px] >= self._SLR_SHADOW_THRESH:
+                    # Sample max over (2r+1)×(2r+1) neighbourhood — robust to
+                    # single-pixel misses at shadow edges and direction noise.
+                    y0c = max(py - r, 0);  y1c = min(py + r + 1, H)
+                    x0c = max(px - r, 0);  x1c = min(px + r + 1, W)
+                    if y1c > y0c and x1c > x0c:
+                        if sm_np[y0c:y1c, x0c:x1c].max() >= self._SLR_SHADOW_THRESH:
                             weights[i] = self.shadow_loss_weight
                             break   # one hit is enough
 

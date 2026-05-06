@@ -1,0 +1,17 @@
+image_path,xmin,ymin,xmax,ymax,label
+/Users/tompitts/dphil/CanopyAI/phase18/neon_patches/CPER_2020_CPER_5_518000_4524000_image_crop_1824_409.tif,0,0,0,0,Tree
+/Users/tompitts/dphil/CanopyAI/phase18/neon_patches/CPER_2020_CPER_5_520000_4520000_image_crop_4506_4012.tif,0,0,0,0,Tree
+/Users/tompitts/dphil/CanopyAI/phase18/neon_patches/DCFS_2019_WOOD_3_492000_5222000_image_crop_3657_2286.tif,0,0,0,0,Tree
+/Users/tompitts/dphil/CanopyAI/phase18/neon_patches/DCFS_2019_WOOD_3_494000_5220000_image_crop_1679_8935.tif,0,0,0,0,Tree
+/Users/tompitts/dphil/CanopyAI/phase18/neon_patches/JORN_2019_JORN_3_318000_3617000_image_crop_1424_6912.tif,0,0,0,0,Tree
+/Users/tompitts/dphil/CanopyAI/phase18/neon_patches/JORN_2019_JORN_3_323000_3620000_image_crop_520_488.tif,0,0,0,0,Tree
+/Users/tompitts/dphil/CanopyAI/phase18/neon_patches/NOGP_2019_NOGP_3_352000_5182000_image_crop_1535_3582.tif,0,0,0,0,Tree
+/Users/tompitts/dphil/CanopyAI/phase18/neon_patches/NOGP_2019_NOGP_3_352000_5183000_image_crop_3811_8279.tif,0,0,0,0,Tree
+/Users/tompitts/dphil/CanopyAI/phase18/neon_patches/OAES_2021_OAES_5_494000_3905000_image_crop_6873_3611.tif,0,0,0,0,Tree
+/Users/tompitts/dphil/CanopyAI/phase18/neon_patches/OAES_2021_OAES_5_496000_3906000_image_crop_7359_4557.tif,0,0,0,0,Tree
+/Users/tompitts/dphil/CanopyAI/phase18/neon_patches/STER_2021_STER_3_660000_4487000_image_crop_6224_1584.tif,0,0,0,0,Tree
+/Users/tompitts/dphil/CanopyAI/phase18/neon_patches/STER_2021_STER_3_664000_4485000_image_crop_5881_5635.tif,0,0,0,0,Tree
+/Users/tompitts/dphil/CanopyAI/phase18/neon_patches/TOOL_2019_TOOL_3_404000_7607000_image_crop_4333_711.tif,0,0,0,0,Tree
+/Users/tompitts/dphil/CanopyAI/phase18/neon_patches/TOOL_2019_TOOL_3_404000_7619000_image_crop_7527_8785.tif,0,0,0,0,Tree
+/Users/tompitts/dphil/CanopyAI/phase18/neon_patches/WOOD_2021_WOOD_5_483000_5224000_image_crop_2045_6201.tif,0,0,0,0,Tree
+/Users/tompitts/dphil/CanopyAI/phase18/neon_patches/WOOD_2021_WOOD_5_483000_5226000_image_crop_1291_9044.tif,0,0,0,0,Tree

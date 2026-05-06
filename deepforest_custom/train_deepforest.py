@@ -214,6 +214,7 @@ def train_deepforest(
     shadow_loss_reweight=False,   # Phase 17: upweight focal loss for shadow-casting GT boxes
     shadow_loss_weight=2.0,       # Multiplier for shadow-casting GT positive anchors
     won_bbox_shrink=True,         # Always apply WON bbox normalisation for consistent evaluation
+    augmentations=None,           # If set (list of dicts), overrides default/wrapper augmentation logic
 ):
     """
     Train a DeepForest model using DeepForest 2.0 config-based API.
@@ -389,13 +390,25 @@ def train_deepforest(
     model.config.train.lr = lr
     model.config.batch_size = batch_size
 
-    # Disable default augmentations when using the wrapper (shadow modes or WON shrink).
-    # Flips/rotations would misalign the shadow vector stored in the CSV.
-    if use_wrapper:
+    # Augmentation policy:
+    # - Explicit augmentations param always wins (e.g. TCD training regime).
+    # - Otherwise disable when wrapper is active: spatial shadow features
+    #   (ShadowChannel, ShadowCrossAttention, ShadowProposals) embed the shadow
+    #   direction in the forward pass, so flips/rotations would misalign it.
+    #   shadow_loss_reweight only uses the angle at loss-weighting time, so it
+    #   does not strictly require disabling — but we preserve existing behaviour
+    #   unless augmentations are explicitly overridden.
+    uses_spatial_shadow = (shadow_channel or shadow_cross_attention
+                           or shadow_proposals or shadow_luma_only or shadow_input_only)
+    if augmentations is not None:
+        model.config.train.augmentations = augmentations
+        print(f"   🔄 Augmentations: explicit override ({len(augmentations)} transforms)")
+    elif use_wrapper:
         model.config.train.augmentations = []
-        print("   🔄 Default augmentations disabled (wrapper model active)")
+        note = "spatial shadow active" if uses_spatial_shadow else "wrapper active"
+        print(f"   🔄 Augmentations disabled ({note})")
     else:
-        print("   🔄 Default augmentations: active (raw baseline mode)")
+        print("   🔄 Augmentations: default (HorizontalFlip)")
 
     if val_csv:
         model.config.validation.csv_file = val_csv

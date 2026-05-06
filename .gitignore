@@ -71,3 +71,6 @@ scratch/
 
 # Detectree2 prediction JSON outputs
 Prediction_*.json
+
+.claude*
+*visualize*

@@ -220,6 +220,9 @@ def generate_shadow_map(
     abs_luma_max: float | None = None,   # luma ceiling; None → _SM_ABS_LUMA_MAX (71)
     act_floor: float | None = None,      # activation floor; None → _SM_ACT_FLOOR (0.2)
     speckle_min: int | None = None,      # min shadow blob area; None → _SM_SPECKLE_MIN (150)
+    clahe: bool = False,                 # apply CLAHE before processing for brightness invariance
+    clahe_clip: float = 2.0,            # CLAHE clip limit
+    clahe_grid: int = 8,                # CLAHE tile grid size
 ) -> np.ndarray:
     """
     Generate a shadow probability map using the Slot 2 algorithm.
@@ -231,11 +234,19 @@ def generate_shadow_map(
                           When None, falls back to per-tile max (not recommended).
         dark_scale:       Ignored. Kept so existing callers don't break.
         otsu_ctr:         Sigmoid centre. None → uses Slot 2 default (0.35).
+        clahe:            If True, apply CLAHE to normalise local contrast before
+                          processing. Makes the map more invariant to overall image
+                          brightness — useful for globally diverse datasets (e.g. TCD).
 
     Returns:
         shadow_map: H×W float32 array in [0, 1].
     """
-    gray  = cv2.cvtColor(img_rgb.astype(np.uint8), cv2.COLOR_RGB2GRAY).astype(np.float32)
+    gray = cv2.cvtColor(img_rgb.astype(np.uint8), cv2.COLOR_RGB2GRAY)
+    if clahe:
+        _clahe = cv2.createCLAHE(clipLimit=clahe_clip,
+                                  tileGridSize=(clahe_grid, clahe_grid))
+        gray = _clahe.apply(gray)
+    gray  = gray.astype(np.float32)
     valid = _sm_valid_mask(gray)
     adx, ady, sdx, sdy = _sm_vectors(shadow_angle_deg)
 
