@@ -38,7 +38,7 @@ sys.path.insert(0, str(ROOT / "deepforest_custom"))
 
 DEFAULT_JSON    = ROOT / "data/tcd/tcd_shadow_vectors.json"
 DEFAULT_TCD_DIR = ROOT / "data/tcd/images/data/tcd/raw"
-THUMBNAIL_SIZE  = 600   # px — displayed size in browser
+THUMBNAIL_SIZE  = 900   # px — displayed size in browser
 
 
 def parse_args():
@@ -48,12 +48,12 @@ def parse_args():
     ap.add_argument("--min-consensus", type=float, default=60.0,
                     help="Tiles below this consensus are flagged (default 60)")
     ap.add_argument("--filter",        default="low",
-                    choices=["low", "high", "all", "unreviewed"],
+                    choices=["low", "high", "all", "unreviewed", "reviewed"],
                     help="Which tiles to show: low=low-confidence, high=high-confidence not yet reviewed, "
-                         "all, unreviewed=not manually reviewed")
+                         "all, unreviewed=not manually reviewed, reviewed=already manually reviewed")
     ap.add_argument("--port",          type=int, default=5055)
-    ap.add_argument("--max-tiles",     type=int, default=500,
-                    help="Max tiles to load (default 500)")
+    ap.add_argument("--max-tiles",     type=int, default=1000,
+                    help="Max tiles to load (default 1000)")
     ap.add_argument("--sort",          default="asc", choices=["asc", "desc"],
                     help="asc=low confidence first, desc=high confidence first (default asc)")
     return ap.parse_args()
@@ -88,6 +88,8 @@ def _build_tile_list(vectors):
                      and not vectors[s].get("manually_reviewed", False))]
     elif args.filter == "unreviewed":
         stems = [s for s in stems if not vectors[s].get("manually_reviewed", False)]
+    elif args.filter == "reviewed":
+        stems = [s for s in stems if vectors[s].get("manually_reviewed", False)]
     return stems
 
 def load_vectors():

@@ -93,8 +93,8 @@ def main():
 
     from datasets import load_dataset, Image
 
-    print(f"📦 Loading TCD validation split ...")
-    ds = load_dataset("restor/tcd", split="validation", streaming=True).cast_column(
+    print(f"📦 Loading TCD holdout test split ...")
+    ds = load_dataset("restor/tcd", split="test", streaming=True).cast_column(
         "image", Image(decode=False)
     )
 

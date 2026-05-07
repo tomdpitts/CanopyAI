@@ -31,6 +31,45 @@ Training strategy — 3 stages from weecology pretrained weights:
            to leverage shadow context; gates continue to grow.
 
 ─────────────────────────────────────────────────────────────
+Phase 23 — Full TCD training set (~4k tiles), shadow L4, from phase22_B_L4 checkpoint
+─────────────────────────────────────────────────────────────
+Goal: beat Restor TCD paper results by fine-tuning from phase22_B_L4 (which already
+knows BRU/WON/NEON shadow structure) on the full TCD training set with per-tile
+shadow vectors. Test on TCD holdout set (HuggingFace split="test", 439 tiles).
+
+Follows the paper's exact split strategy (arxiv 2407.11743 §3.1):
+  - Folds 0–3 (~3,335 tiles): training
+  - Fold 4  (~834 tiles):     early stopping validation
+  - test split (439 tiles):   holdout benchmark — DO NOT use for training
+
+Shadow vectors: 620 manually reviewed tiles only (shadow_loss_reweight fires for
+those tiles; remaining ~3,549 tiles train as baseline).
+
+Canopy annotations (category 1): subdivided into ITC-sized pseudo-bboxes via
+polygon-area overlap grid (see phase23/build_phase23_csvs.py for details).
+
+Upload before running:
+    source venv310/bin/activate
+    python phase23/build_phase23_csvs.py   # streams HF, repairs meta.json, writes CSVs
+    modal volume put canopyai-deepforest-data phase23/phase23_tcd_train.csv phase23_tcd_train.csv
+    modal volume put canopyai-deepforest-data phase23/phase23_tcd_val.csv   phase23_tcd_val.csv
+
+    source venv310/bin/activate && \
+    modal run --detach deepforest_custom/modal_deepforest.py \
+        --train-csv /data/phase23_tcd_train.csv \
+        --val-csv   /data/phase23_tcd_val.csv \
+        --run-name  phase23_tcd_L4 \
+        --shadow-loss-reweight --shadow-loss-weight 4.0 \
+        --tcd-augmentations \
+        --checkpoint /checkpoints/phase22_B_L4/deepforest_final.pth \
+        --epochs 50 --patience 10 --lr 0.0005 --batch-size 16
+
+After training, download holdout tiles and benchmark:
+    python phase23/download_tcd_holdout.py
+    python benchmark_tcd.py --tcd-dir data/tcd/images/data/tcd/test \
+        --output-root benchmark_results/phase23_holdout
+
+─────────────────────────────────────────────────────────────
 Phase 22 — WON + BRU + manually annotated NEON, shadow L4 (fixed)
 ─────────────────────────────────────────────────────────────
 Same training data as phase 21 but with per-image shadow_angle correctly
@@ -439,6 +478,8 @@ def train_deepforest_modal(
             ("/Users/tompitts/dphil/CanopyAI/neon_sparse_annotations/", "/data/images/neon_sparse_annotations/"),
             # Manually annotated NEON crops (phase21)
             ("/Users/tompitts/dphil/CanopyAI/manual_annotations/", "/data/images/manual_annotations/"),
+            # TCD raw tiles (phase23+) — extracted from tcd_images.tar.gz → /data/images/data/tcd/raw/
+            ("/Users/tompitts/Library/Mobile Documents/com~apple~CloudDocs/dphil icloud/CanopyAI/data/tcd/images/", "/data/images/"),
             # TCD training chips (prepare_tcd_training.py)
             ("/Users/tompitts/dphil/CanopyAI/data/tcd/tcd_chips/", "/data/images/tcd_chips/"),
         ]
