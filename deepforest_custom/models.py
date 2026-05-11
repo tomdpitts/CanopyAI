@@ -984,15 +984,29 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
             images = self._prepend_shadow_channel(images, image_paths)
 
         batch  = (images, targets, *batch[2:])
+
+        # Patch model.forward to cache its output on the first call so that
+        # super().validation_step() and domain accumulation share one GPU pass.
+        _cache    = [None]
+        _orig_fwd = self.model.forward
+
+        def _caching_forward(*args, **kwargs):
+            if _cache[0] is None:
+                _cache[0] = _orig_fwd(*args, **kwargs)
+            return _cache[0]
+
+        if self.domain_lookup:
+            self.model.forward = _caching_forward
+
         result = super().validation_step(batch, batch_idx)
 
-        # Per-domain prediction accumulation — runs model a second time in eval mode.
-        # Only active when domain_lookup is populated (CSV has a 'domain' column).
+        if self.domain_lookup:
+            self.model.forward = _orig_fwd   # restore immediately
+
+        # Per-domain accumulation — uses cached predictions, no second GPU pass.
         if self.domain_lookup:
             try:
-                self.eval()
-                with torch.no_grad():
-                    raw_preds = self.model(images)
+                raw_preds = _cache[0] or []
                 for pred, target, path in zip(raw_preds, targets, image_paths):
                     domain = self.domain_lookup.get(path)
                     if domain is None:

@@ -556,7 +556,9 @@ def train_deepforest(
                 batch_size=dl.batch_size,
                 shuffle=True,
                 collate_fn=ds.collate_fn,
-                num_workers=dl.num_workers,
+                num_workers=4,
+                pin_memory=True,
+                persistent_workers=True,
             )
 
         model.train_dataloader = types.MethodType(_train_dataloader_with_empties, model)
@@ -602,7 +604,9 @@ def train_deepforest(
                     batch_size=dl.batch_size,
                     shuffle=False,
                     collate_fn=ds.collate_fn,
-                    num_workers=dl.num_workers,
+                    num_workers=4,
+                    pin_memory=True,
+                    persistent_workers=True,
                 )
 
             model.val_dataloader = types.MethodType(_val_dataloader_with_empties, model)
@@ -615,7 +619,8 @@ def train_deepforest(
                 dl = _orig_vl(self_model)
                 tiled_ds = _TiledValDataset(dl.dataset, patch_size=CROP_SIZE, min_visibility=MIN_VIS)
                 return DataLoader(tiled_ds, batch_size=dl.batch_size, shuffle=False,
-                                  collate_fn=dl.dataset.collate_fn, num_workers=dl.num_workers)
+                                  collate_fn=dl.dataset.collate_fn,
+                                  num_workers=4, pin_memory=True, persistent_workers=True)
             model.val_dataloader = types.MethodType(_val_dataloader_tiled, model)
 
         print(f"\n📊 Loading validation data from {val_csv}...")
