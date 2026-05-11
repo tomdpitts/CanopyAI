@@ -103,6 +103,9 @@ def parse_polygon(seg, img_w: int, img_h: int):
             import pycocotools.mask as mask_utils
             import rasterio.features
             from shapely.geometry import shape
+            # counts can be a list (uncompressed RLE) or bytes/str (compressed RLE)
+            if isinstance(seg.get("counts"), list):
+                seg = mask_utils.frPyObjects(seg, seg["size"][0], seg["size"][1])
             mask = mask_utils.decode(seg)
             shapes = list(rasterio.features.shapes(mask.astype(np.uint8), mask > 0))
             polys = [shape(geom) for geom, val in shapes if val == 1]
@@ -114,26 +117,27 @@ def parse_polygon(seg, img_w: int, img_h: int):
 
 
 _RNG = np.random.default_rng(42)
-MAX_BOXES_PER_POLYGON = 500   # hard cap so huge single polygons don't dominate
-FILL_FACTOR           = 0.55  # <1 → more boxes than polygon_area/cell_area → ~90% coverage
+MAX_BOXES_PER_POLYGON = 5000  # safety cap only — grid pass is no longer K-limited
+EDGE_THRESH           = 0.3   # min fraction of cell area overlapping polygon for edge cells
 
 
 def subdivide_canopy(polygon: Polygon, cell_size: int, img_w: int, img_h: int) -> list:
     """
-    Stratified jittered sampling:
-      - Divides polygon bounding box into ~cell_size cells
-      - Places one randomly-jittered point per cell (inside polygon)
-      - Cells shuffled before filling to K → even spatial coverage, no grid pattern,
-        no clumping, minimum spacing ≈ cell_size.
-    K = polygon_area / (cell_area * FILL_FACTOR) for slight density boost.
+    Jittered grid with edge-cell recovery:
+      Pass 1 — visit every grid cell, place a jittered box where the centroid
+               lands inside the polygon. No K cutoff → full interior coverage.
+      Pass 2 — for cells whose jittered centroid missed the polygon, check if
+               ≥30% of the cell area intersects it; if so, add the box anyway.
+               Catches boundary cells the centroid check would skip.
+    Result: organic randomness preserved, near-zero interior gaps, better edge
+    coverage, no visible grid pattern.
     """
-    cell_area = float(cell_size ** 2)
-    K = min(MAX_BOXES_PER_POLYGON, max(1, int(round(polygon.area / (cell_area * FILL_FACTOR)))))
+    half   = cell_size / 2.0
+    thresh = EDGE_THRESH * cell_size * cell_size
 
-    half = cell_size / 2.0
     minx, miny, maxx, maxy = polygon.bounds
-    minx = max(half, minx); miny = max(half, miny)
-    maxx = min(img_w - half, maxx); maxy = min(img_h - half, maxy)
+    minx = max(0., minx); miny = max(0., miny)
+    maxx = min(float(img_w), maxx); maxy = min(float(img_h), maxy)
     if maxx <= minx or maxy <= miny:
         return []
 
@@ -143,62 +147,47 @@ def subdivide_canopy(polygon: Polygon, cell_size: int, img_w: int, img_h: int) -
     col_w  = W / n_cols
     row_h  = H / n_rows
 
-    cells = [(r, c) for r in range(n_rows) for c in range(n_cols)]
-    _RNG.shuffle(cells)
+    boxes        = []
+    edge_cells   = []   # (cx, cy, x1, y1, x2, y2) — failed centroid check
 
-    boxes = []
-    for r, c in cells:
-        if len(boxes) >= K:
-            break
-        cx = minx + (c + _RNG.uniform(0.15, 0.85)) * col_w
-        cy = miny + (r + _RNG.uniform(0.15, 0.85)) * row_h
-        try:
-            inside = polygon.contains(
-                shapely_box(cx - half, cy - half, cx + half, cy + half).centroid)
-        except Exception:
-            inside = False
-        if inside:
-            boxes.append((float(cx - half), float(cy - half),
-                          float(cx + half), float(cy + half)))
-
-    # Second pass: random fill for remaining spots, enforcing min spacing = cell_size
-    remaining = K - len(boxes)
-    if remaining > 0:
-        existing_cx = np.array([(b[0]+b[2])/2 for b in boxes], dtype=np.float32)
-        existing_cy = np.array([(b[1]+b[3])/2 for b in boxes], dtype=np.float32)
-        raw_minx, raw_miny, raw_maxx, raw_maxy = polygon.bounds
-        raw_minx = max(0, raw_minx); raw_miny = max(0, raw_miny)
-        raw_maxx = min(img_w, raw_maxx); raw_maxy = min(img_h, raw_maxy)
-        min_dist2 = float(cell_size ** 2)
-        tries = 0
-        while len(boxes) < K and tries < remaining * 30:
-            cx = float(_RNG.uniform(raw_minx, raw_maxx))
-            cy = float(_RNG.uniform(raw_miny, raw_maxy))
-            # Reject if too close to an existing box
-            if len(existing_cx):
-                d2 = ((existing_cx - cx)**2 + (existing_cy - cy)**2).min()
-                if d2 < min_dist2:
-                    tries += 1
-                    continue
+    # Pass 1: jittered centroid check over all cells
+    for r in range(n_rows):
+        for c in range(n_cols):
+            cx = minx + (c + _RNG.uniform(0.15, 0.85)) * col_w
+            cy = miny + (r + _RNG.uniform(0.15, 0.85)) * row_h
+            x1 = max(0., cx - half);          y1 = max(0., cy - half)
+            x2 = min(float(img_w), cx + half); y2 = min(float(img_h), cy + half)
             try:
                 inside = polygon.contains(
                     shapely_box(cx - half, cy - half, cx + half, cy + half).centroid)
             except Exception:
                 inside = False
             if inside:
-                boxes.append((float(max(0, cx - half)), float(max(0, cy - half)),
-                              float(min(img_w, cx + half)), float(min(img_h, cy + half))))
-                existing_cx = np.append(existing_cx, cx)
-                existing_cy = np.append(existing_cy, cy)
-            tries += 1
+                boxes.append((x1, y1, x2, y2))
+            else:
+                edge_cells.append((cx, cy, x1, y1, x2, y2))
 
-    # Centroid fallback for polygons that got zero boxes
+    # Pass 2: intersection-area check for cells that failed pass 1
+    for cx, cy, x1, y1, x2, y2 in edge_cells:
+        if len(boxes) >= MAX_BOXES_PER_POLYGON:
+            break
+        try:
+            cell = shapely_box(x1, y1, x2, y2)
+            if polygon.intersects(cell) and polygon.intersection(cell).area >= thresh:
+                boxes.append((x1, y1, x2, y2))
+        except Exception:
+            pass
+
+    if len(boxes) > MAX_BOXES_PER_POLYGON:
+        boxes = boxes[:MAX_BOXES_PER_POLYGON]
+
+    # Centroid fallback for zero-box polygons (degenerate/very small)
     if not boxes:
         try:
             c = polygon.centroid
             cx, cy = float(c.x), float(c.y)
             boxes.append((max(0., cx - half), max(0., cy - half),
-                          min(img_w, cx + half), min(img_h, cy + half)))
+                          min(float(img_w), cx + half), min(float(img_h), cy + half)))
         except Exception:
             pass
     return boxes

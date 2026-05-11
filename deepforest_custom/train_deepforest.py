@@ -483,7 +483,7 @@ def train_deepforest(
     MIN_VIS      = 0.5   # min bbox visibility fraction to survive crop
     BBOX_PARAMS  = A.BboxParams(format="pascal_voc", label_fields=["category_ids"],
                                 clip=True, min_visibility=MIN_VIS)
-    crop_transform = A.RandomSizedBBoxSafeCrop(height=CROP_SIZE, width=CROP_SIZE, p=1.0)
+    crop_transform = A.RandomCrop(height=CROP_SIZE, width=CROP_SIZE, p=1.0)
 
     def _build_train_transform(extra_augs):
         aug_list = []
