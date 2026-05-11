@@ -12,7 +12,12 @@ On Modal:
 """
 
 import argparse
+import sys
 from pathlib import Path
+
+# Ensure project root is on sys.path so utils.py is importable when this
+# script is run directly (e.g. python deepforest_custom/train_deepforest.py)
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import pandas as pd
 import numpy as np
 import torch
@@ -786,6 +791,22 @@ def main():
         default=None,
         help="Base shadow azimuth in degrees. Auto-derived from CSV if not set.",
     )
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default=None,
+        help="Path to initial weights (.pth or .ckpt). Auto-resumes if omitted.",
+    )
+    parser.add_argument(
+        "--freeze-backbone",
+        action="store_true",
+        help="Freeze ResNet body, train FPN + head only.",
+    )
+    parser.add_argument(
+        "--fast-dev-run",
+        action="store_true",
+        help="Run 1 train + 1 val batch then exit (sanity check).",
+    )
 
     args = parser.parse_args()
 
@@ -809,6 +830,7 @@ def main():
         shadow_proposals_iso=args.shadow_proposals_iso,
         shadow_loss_reweight=args.shadow_loss_reweight,
         shadow_loss_weight=args.shadow_loss_weight,
+        fast_dev_run=args.fast_dev_run,
     )
 
 
