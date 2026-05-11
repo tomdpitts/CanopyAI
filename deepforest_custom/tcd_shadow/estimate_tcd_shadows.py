@@ -45,8 +45,8 @@ sys.path.insert(0, str(ROOT / "deepforest_custom"))
 from predict_tcd_shadows import load_shadow_model, predict_shadow_vector  # noqa: E402
 
 DEFAULT_SHADOW_MODEL = ROOT / "solar/shadow_regression/output/shadow_model_combined_best.pth"
-DEFAULT_TCD_DIR      = ROOT / "data/tcd/images/data/tcd/raw"
-DEFAULT_OUTPUT       = ROOT / "data/tcd/tcd_shadow_vectors.json"
+DEFAULT_TCD_DIR      = ROOT / "data/tcd/images/data/tcd/by_id"
+DEFAULT_OUTPUT       = ROOT / "data/tcd/tcd_shadow_vectors_by_id.json"
 
 
 def parse_args():

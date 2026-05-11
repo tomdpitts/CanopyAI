@@ -36,8 +36,8 @@ from PIL import Image
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "deepforest_custom"))
 
-DEFAULT_JSON    = ROOT / "data/tcd/tcd_shadow_vectors.json"
-DEFAULT_TCD_DIR = ROOT / "data/tcd/images/data/tcd/raw"
+DEFAULT_JSON    = ROOT / "data/tcd/tcd_shadow_vectors_by_id.json"
+DEFAULT_TCD_DIR = ROOT / "data/tcd/images/data/tcd/by_id"
 THUMBNAIL_SIZE  = 900   # px — displayed size in browser
 
 
@@ -141,6 +141,7 @@ def api_tiles():
             "n_inliers":         int(v.get("n_inliers", 0)),
             "n_crops":           int(v.get("n_crops", 30)),
             "manually_reviewed": bool(v.get("manually_reviewed", False)),
+            "excluded":          bool(v.get("excluded", False)),
         })
     return jsonify(out)
 
@@ -161,6 +162,7 @@ def api_save(stem):
         "shadow_y":          float(payload["shadow_y"]),
         "shadow_angle_deg":  float(payload["shadow_angle_deg"]),
         "manually_reviewed": bool(payload.get("manually_reviewed", True)),
+        "excluded":          bool(payload.get("excluded", False)),
     })
     save_vectors(_vectors)
     return jsonify({"ok": True})
@@ -192,7 +194,8 @@ HTML = """<!DOCTYPE html>
   .tile-item.active { background: #2a3a2a; border-left: 3px solid #4a4; }
   .tile-item .consensus { color: #888; }
   .tile-item.low-conf .consensus { color: #c84; }
-  .tile-item.reviewed { opacity: 0.5; }
+  .tile-item.reviewed  { opacity: 0.5; }
+  .tile-item.excluded  { opacity: 0.4; color: #c44; text-decoration: line-through; }
   #main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
   #toolbar { padding: 10px 16px; background: #111; border-bottom: 1px solid #333;
              display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
@@ -216,6 +219,8 @@ HTML = """<!DOCTYPE html>
   #hint { padding: 4px 16px; font-size: 11px; color: #555; background: #111;
           border-top: 1px solid #222; }
   #progress { padding: 4px 16px; font-size: 11px; color: #666; background: #111; }
+  #progress-bar-wrap { height: 4px; background: #222; }
+  #progress-bar { height: 4px; background: #4a4; width: 0%; transition: width 0.2s; }
 </style>
 </head>
 <body>
@@ -237,8 +242,10 @@ HTML = """<!DOCTYPE html>
     <button onclick="prevTile()">← Prev</button>
     <button onclick="nextTile()">→ Next</button>
     <button class="primary" onclick="acceptAuto()" title="A">Accept (A)</button>
-    <button onclick="saveOverride()" title="Enter">Save override (↵)</button>
-    <button onclick="nextTile()" title="S">Skip (S)</button>
+    <button onclick="saveOverride()" title="Enter/Space">Save override (↵/space)</button>
+    <button onclick="skipTile()" title="S">Skip/Accept (S)</button>
+    <button onclick="excludeTile()" title="Backspace" style="border-color:#c44;color:#c44">Exclude (⌫)</button>
+    <button onclick="undoLast()" title="Ctrl+Z" style="color:#aaa">Undo (⌘Z)</button>
   </div>
 
   <div id="img-wrap">
@@ -255,6 +262,7 @@ HTML = """<!DOCTYPE html>
     </div>
   </div>
 
+  <div id="progress-bar-wrap"><div id="progress-bar"></div></div>
   <div id="progress">— / —</div>
   <pre id="debug" style="padding:4px 14px;font-size:10px;color:#0f0;background:#111;
        max-height:80px;overflow:auto;border-top:1px solid #333;margin:0"></pre>
@@ -262,6 +270,16 @@ HTML = """<!DOCTYPE html>
 
 <script>
 let tiles = [], idx = 0, currentAngle = 0, overridden = false;
+let _undoStack = [];  // [{stem, prev}] for undo
+
+function updateProgress() {
+  const done  = tiles.filter(t => t.manually_reviewed || t.excluded).length;
+  const total = tiles.length;
+  const pct   = total ? (done / total * 100).toFixed(1) : 0;
+  document.getElementById('progress-bar').style.width = pct + '%';
+  document.getElementById('progress').textContent =
+    `${idx+1} / ${total}  —  ${done} done (${pct}%)`;
+}
 const MIN_CONSENSUS = """ + str(args.min_consensus) + """;
 const SIDEBAR_WIN   = 80;
 const dbg = document.getElementById('debug');
@@ -339,7 +357,7 @@ function renderSidebar() {
     s.style.color='#555'; s.textContent=`… ${lo} earlier tiles`; ul.appendChild(s); }
   for (let i = lo; i < hi; i++) {
     const t = tiles[i], d = document.createElement('div');
-    d.className = 'tile-item'+(t.manually_reviewed?' reviewed':'')+(i===idx?' active':'');
+    d.className = 'tile-item'+(t.excluded?' excluded':t.manually_reviewed?' reviewed':'')+(i===idx?' active':'');
     d.innerHTML = `<div>${t.stem.replace('tcd_tile_','tile ')}</div>` +
       `<div class="consensus">${t.consensus_pct.toFixed(0)}%${t.manually_reviewed?' ✓':''}</div>`;
     d.onclick = () => showTile(i);
@@ -360,7 +378,7 @@ function showTile(i) {
   document.getElementById('s-inliers').textContent = `${t.n_inliers}/${t.n_crops}`;
   document.getElementById('s-std').textContent     = t.circular_std_deg.toFixed(1);
   document.getElementById('s-angle').textContent   = t.shadow_angle_deg.toFixed(1);
-  document.getElementById('progress').textContent  = `${i+1} / ${tiles.length}`;
+  updateProgress();
   renderSidebar();
   log(`loading image for ${t.stem}`);
   tileImg.onerror = () => log(`ERROR loading image: ${tileImg.src}`);
@@ -368,29 +386,62 @@ function showTile(i) {
   tileImg.src     = `/api/tile_image/${t.stem}?v=${i}`;
 }
 
-async function saveVector(angle_deg, reviewed) {
+async function saveVector(angle_deg, reviewed, excluded=false) {
+  const t   = tiles[idx];
+  // Push undo snapshot before saving
+  _undoStack.push({
+    stem: t.stem, idxSnapshot: idx,
+    prev: {shadow_angle_deg: t.shadow_angle_deg, manually_reviewed: t.manually_reviewed, excluded: t.excluded||false}
+  });
+  if (_undoStack.length > 50) _undoStack.shift();
+
   const rad = angle_deg * Math.PI / 180;
-  await fetch(`/api/save/${tiles[idx].stem}`, {
+  await fetch(`/api/save/${t.stem}`, {
     method: 'POST', headers: {'Content-Type':'application/json'},
     body: JSON.stringify({shadow_x:Math.sin(rad), shadow_y:Math.cos(rad),
-                          shadow_angle_deg:angle_deg, manually_reviewed:reviewed})
+                          shadow_angle_deg:angle_deg, manually_reviewed:reviewed,
+                          excluded:excluded})
   });
-  tiles[idx].shadow_angle_deg = angle_deg;
-  tiles[idx].manually_reviewed = reviewed;
+  t.shadow_angle_deg = angle_deg;
+  t.manually_reviewed = reviewed;
+  t.excluded = excluded;
   renderSidebar();
+  updateProgress();
 }
 
-async function acceptAuto()   { await saveVector(tiles[idx].shadow_angle_deg, true); nextTile(); }
-async function saveOverride() { await saveVector(currentAngle, true); nextTile(); }
+async function acceptAuto()  { await saveVector(tiles[idx].shadow_angle_deg, true); nextTile(); }
+async function skipTile()    { await acceptAuto(); }  // S = accept auto so tile leaves unreviewed queue
+async function saveOverride(){ await saveVector(currentAngle, true);                  nextTile(); }
+async function excludeTile() { await saveVector(tiles[idx].shadow_angle_deg, true, true); nextTile(); }
+
+async function undoLast() {
+  if (!_undoStack.length) return;
+  const {stem, idxSnapshot, prev} = _undoStack.pop();
+  const rad = (prev.shadow_angle_deg||0) * Math.PI / 180;
+  await fetch(`/api/save/${stem}`, {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({shadow_x:Math.sin(rad), shadow_y:Math.cos(rad),
+                          shadow_angle_deg:prev.shadow_angle_deg||0,
+                          manually_reviewed:prev.manually_reviewed,
+                          excluded:prev.excluded})
+  });
+  const t = tiles.find(x => x.stem===stem);
+  if (t) { t.shadow_angle_deg=prev.shadow_angle_deg; t.manually_reviewed=prev.manually_reviewed; t.excluded=prev.excluded; }
+  showTile(idxSnapshot);
+  updateProgress();
+}
+
 function prevTile() { if (idx > 0)              showTile(idx-1); }
 function nextTile() { if (idx < tiles.length-1) showTile(idx+1); }
 
 document.addEventListener('keydown', e => {
-  if (e.key==='a'||e.key==='A') acceptAuto();
-  if (e.key==='s'||e.key==='S') nextTile();
-  if (e.key==='Enter')          saveOverride();
-  if (e.key==='ArrowLeft')      prevTile();
-  if (e.key==='ArrowRight')     nextTile();
+  if (e.key==='a'||e.key==='A')                      acceptAuto();
+  if (e.key==='s'||e.key==='S')                      skipTile();
+  if (e.key==='Enter'||e.key===' ')                 { e.preventDefault(); saveOverride(); }
+  if (e.key==='ArrowLeft')                           prevTile();
+  if (e.key==='ArrowRight')                          nextTile();
+  if (e.key==='Backspace')                         { e.preventDefault(); excludeTile(); }
+  if ((e.ctrlKey||e.metaKey) && e.key==='z')       { e.preventDefault(); undoLast(); }
 });
 
 loadTiles();

@@ -400,15 +400,41 @@ def train_deepforest(
     #   unless augmentations are explicitly overridden.
     uses_spatial_shadow = (shadow_channel or shadow_cross_attention
                            or shadow_proposals or shadow_luma_only or shadow_input_only)
+    from omegaconf import OmegaConf
+    import albumentations as A
+    from albumentations.pytorch import ToTensorV2
+
+    # Crop 2048×2048 TCD tiles to 400×400 patches — matches the size all prior
+    # phases used (pre-chipped tiles) and prevents OOM from full-tile RPN.
+    CROP_SIZE    = 400
+    MIN_VIS      = 0.5   # min bbox visibility fraction to survive crop
+    BBOX_PARAMS  = A.BboxParams(format="pascal_voc", label_fields=["category_ids"],
+                                clip=True, min_visibility=MIN_VIS)
+    crop_transform = A.RandomSizedBBoxSafeCrop(height=CROP_SIZE, width=CROP_SIZE, p=1.0)
+
+    def _build_train_transform(extra_augs):
+        aug_list = []
+        for a in (extra_augs or []):
+            name   = list(a.keys())[0] if isinstance(a, dict) else a
+            params = list(a.values())[0] if isinstance(a, dict) else {}
+            cls    = getattr(A, name, None)
+            if cls is not None:
+                aug_list.append(cls(**params) if params else cls())
+        return A.Compose([crop_transform] + aug_list + [ToTensorV2()], bbox_params=BBOX_PARAMS)
+
     if augmentations is not None:
-        model.config.train.augmentations = augmentations
-        print(f"   🔄 Augmentations: explicit override ({len(augmentations)} transforms)")
+        model._train_transform_override = _build_train_transform(augmentations)
+        model.config.train.augmentations = OmegaConf.create([])
+        names = [list(a.keys())[0] if isinstance(a, dict) else a for a in augmentations]
+        print(f"   🔄 Train transform: crop{CROP_SIZE} + {names} + ToTensorV2")
     elif use_wrapper:
-        model.config.train.augmentations = []
+        model._train_transform_override = _build_train_transform(None)
+        model.config.train.augmentations = OmegaConf.create([])
         note = "spatial shadow active" if uses_spatial_shadow else "wrapper active"
-        print(f"   🔄 Augmentations disabled ({note})")
+        print(f"   🔄 Train transform: crop{CROP_SIZE} + ToTensorV2 ({note})")
     else:
-        print("   🔄 Augmentations: default (HorizontalFlip)")
+        model._train_transform_override = _build_train_transform([{"HorizontalFlip": {"p": 0.5}}])
+        print(f"   🔄 Train transform: crop{CROP_SIZE} + HorizontalFlip + ToTensorV2 (default)")
 
     if val_csv:
         model.config.validation.csv_file = val_csv
@@ -426,9 +452,88 @@ def train_deepforest(
     # dataset is built — BoxDataset already handles the zero-box case at
     # __getitem__ line 162 (np.sum(boxes)==0 → torch.zeros).
     # ------------------------------------------------------------------
+    # ── Tiled validation dataset ──────────────────────────────────────────────
+    # Tiles each full image into CROP_SIZE × CROP_SIZE patches so validation
+    # uses the same input size as training (avoids OOM on 2048×2048 tiles).
+    class _TiledValDataset:
+        def __init__(self, base_ds, patch_size=400, overlap=0.0, min_visibility=0.5):
+            import albumentations as A
+            from albumentations.pytorch import ToTensorV2
+            self.base        = base_ds
+            self.patch_size  = patch_size
+            self.step        = max(1, int(patch_size * (1 - overlap)))
+            self.min_vis     = min_visibility
+            self.collate_fn  = base_ds.collate_fn
+            self._val_t      = A.Compose(
+                [ToTensorV2()],
+                bbox_params=A.BboxParams(format="pascal_voc",
+                                         label_fields=["category_ids"],
+                                         clip=True, min_visibility=min_visibility),
+            )
+            # Assume all tiles are the same size; read one to get dims
+            _sample = base_ds.load_image(0)
+            self._H, self._W = _sample.shape[:2]
+            self._build_patch_list()
+
+        def _build_patch_list(self):
+            self._patches = []
+            for img_idx in range(len(self.base.image_names)):
+                for py in range(0, self._H, self.step):
+                    for px in range(0, self._W, self.step):
+                        py2 = min(py + self.patch_size, self._H)
+                        px2 = min(px + self.patch_size, self._W)
+                        py1 = max(0, py2 - self.patch_size)
+                        px1 = max(0, px2 - self.patch_size)
+                        self._patches.append((img_idx, px1, py1, px2, py2))
+
+        def __len__(self):
+            return len(self._patches)
+
+        def __getitem__(self, idx):
+            img_idx, px1, py1, px2, py2 = self._patches[idx]
+            img_name = self.base.image_names[img_idx]
+            img      = self.base.load_image(img_idx)
+            patch    = img[py1:py2, px1:px2]
+
+            gt      = self.base.annotations_for_path(img_name)
+            boxes   = gt["boxes"]
+            labels  = gt["labels"]
+
+            if len(boxes):
+                cx1 = np.maximum(boxes[:, 0], px1) - px1
+                cy1 = np.maximum(boxes[:, 1], py1) - py1
+                cx2 = np.minimum(boxes[:, 2], px2) - px1
+                cy2 = np.minimum(boxes[:, 3], py2) - py1
+                bw  = boxes[:, 2] - boxes[:, 0]; bh = boxes[:, 3] - boxes[:, 1]
+                vis = np.where(bw * bh > 0,
+                               np.maximum(cx2 - cx1, 0) * np.maximum(cy2 - cy1, 0) / (bw * bh),
+                               0)
+                keep = vis >= self.min_vis
+                if keep.any():
+                    patch_boxes = np.stack(
+                        [cx1[keep], cy1[keep], cx2[keep], cy2[keep]],
+                        axis=1).astype(np.float32)
+                    patch_labels = labels[keep]
+                else:
+                    patch_boxes, patch_labels = np.zeros((0, 4), np.float32), np.zeros(0, np.int64)
+            else:
+                patch_boxes, patch_labels = np.zeros((0, 4), np.float32), np.zeros(0, np.int64)
+
+            aug     = self._val_t(image=patch, bboxes=patch_boxes, category_ids=patch_labels)
+            image   = aug["image"]
+            boxes_t = torch.from_numpy(np.array(aug["bboxes"], dtype=np.float32)).reshape(-1, 4)
+            labels_t= torch.from_numpy(np.array(aug["category_ids"], dtype=np.int64))
+            return image, {"boxes": boxes_t, "labels": labels_t}, img_name
+
+    # ── end _TiledValDataset ──────────────────────────────────────────────────
+
     train_df = pd.read_csv(train_csv)
     _empty_mask = train_df["xmin"].isna() | (train_df["xmin"].astype(str).str.strip() == "")
     _empty_image_paths = train_df.loc[_empty_mask, "image_path"].unique().tolist()
+    import types
+    from deepforest.datasets.training import BoxDataset
+    from torch.utils.data import DataLoader
+
     if _empty_image_paths:
         print(f"\n🔲 Found {len(_empty_image_paths)} confirmed-empty (hard-negative) images — "
               f"will be injected into dataset after CSV loading")
@@ -436,17 +541,14 @@ def train_deepforest(
         train_df[~_empty_mask].to_csv(_clean_train_csv, index=False)
         model.config.train.csv_file = _clean_train_csv
 
-        # Build a wrapped train_dataloader that extends image_names with empties
-        import types
-        from deepforest.datasets.training import BoxDataset
-        from torch.utils.data import DataLoader
-
         _orig_train_dataloader = model.train_dataloader.__func__  # unbound method
 
         def _train_dataloader_with_empties(self_model):
             dl = _orig_train_dataloader(self_model)
             ds = dl.dataset
             ds.image_names = np.append(ds.image_names, _empty_image_paths)
+            if hasattr(self_model, "_train_transform_override"):
+                ds.transform = self_model._train_transform_override
             print(f"   ✅ Injected {len(_empty_image_paths)} empty images into training dataset "
                   f"(total: {len(ds.image_names)} images)")
             return DataLoader(
@@ -460,6 +562,14 @@ def train_deepforest(
         model.train_dataloader = types.MethodType(_train_dataloader_with_empties, model)
     else:
         _clean_train_csv = train_csv
+        # No empty images — still need to inject transform override if set
+        if hasattr(model, "_train_transform_override"):
+            _orig_tl = model.train_dataloader.__func__
+            def _train_dataloader_with_transform(self_model):
+                dl = _orig_tl(self_model)
+                dl.dataset.transform = self_model._train_transform_override
+                return dl
+            model.train_dataloader = types.MethodType(_train_dataloader_with_transform, model)
 
     print(f"\n📊 Loading training data from {train_csv}...")
     print(f"   Training samples: {len(train_df[~_empty_mask])} bounding boxes")
@@ -483,11 +593,12 @@ def train_deepforest(
             _orig_val_dataloader = model.val_dataloader.__func__
 
             def _val_dataloader_with_empties(self_model):
-                dl = _orig_val_dataloader(self_model)
-                ds = dl.dataset
+                dl  = _orig_val_dataloader(self_model)
+                ds  = dl.dataset
                 ds.image_names = np.append(ds.image_names, _val_empty_paths)
+                tiled_ds = _TiledValDataset(ds, patch_size=CROP_SIZE, min_visibility=MIN_VIS)
                 return DataLoader(
-                    ds,
+                    tiled_ds,
                     batch_size=dl.batch_size,
                     shuffle=False,
                     collate_fn=ds.collate_fn,
@@ -495,6 +606,17 @@ def train_deepforest(
                 )
 
             model.val_dataloader = types.MethodType(_val_dataloader_with_empties, model)
+        else:
+            # No empty val images — still apply tiling
+            import types
+            from torch.utils.data import DataLoader
+            _orig_vl = model.val_dataloader.__func__
+            def _val_dataloader_tiled(self_model):
+                dl = _orig_vl(self_model)
+                tiled_ds = _TiledValDataset(dl.dataset, patch_size=CROP_SIZE, min_visibility=MIN_VIS)
+                return DataLoader(tiled_ds, batch_size=dl.batch_size, shuffle=False,
+                                  collate_fn=dl.dataset.collate_fn, num_workers=dl.num_workers)
+            model.val_dataloader = types.MethodType(_val_dataloader_tiled, model)
 
         print(f"\n📊 Loading validation data from {val_csv}...")
         print(f"   Validation samples: {len(val_df[~_val_empty_mask])} bounding boxes")
@@ -516,10 +638,15 @@ def train_deepforest(
     callbacks = []
 
     # Model checkpoint callback - save best model
+    # Monitor map_tcd (per-domain metric from on_validation_epoch_end) rather than
+    # DeepForest's built-in `map` which returns -1.0 when val patches have empty GT
+    # (our tiled val dataset produces many zero-GT patches which DeepForest filters
+    # out before updating its mAP metric, leaving it with no data → -1.0 sentinel).
+    _monitor = "map_tcd"
     checkpoint_callback = ModelCheckpoint(
         dirpath=run_output_dir,
-        filename="deepforest-{epoch:02d}-{map:.2f}",
-        monitor="map",
+        filename="deepforest-{epoch:02d}-{map_tcd:.2f}",
+        monitor=_monitor,
         mode="max",
         save_top_k=1,
         verbose=True,
@@ -529,7 +656,7 @@ def train_deepforest(
     # Early stopping callback
     if val_csv:
         early_stop_callback = EarlyStopping(
-            monitor="map",
+            monitor=_monitor,
             patience=patience,
             mode="max",
             verbose=True,

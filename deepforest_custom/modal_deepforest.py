@@ -287,6 +287,8 @@ image = (
         "albumentations>=2.0.0",
         "wandb",
         "deepforest==2.0.0",
+        "datasets",
+        "huggingface_hub",
     )
     # Mount specific files and directories instead of the whole root.
     # Large data folders are intentionally excluded — data lives on Modal volumes.
@@ -343,11 +345,91 @@ data_volume = modal.Volume.from_name("canopyai-deepforest-data", create_if_missi
 
 
 # ---------------------------------------------------------------------------
+# HuggingFace tile downloader (used inside the Modal container)
+# ---------------------------------------------------------------------------
+def _download_missing_tcd_tiles(csv_paths, save_dir="/data/images/data/tcd/raw"):
+    """Download any TCD tiles missing from the volume by streaming from HuggingFace."""
+    import io, json
+    from pathlib import Path
+    import cv2
+    import numpy as np
+    import pandas as pd
+    import rasterio
+    from rasterio.transform import from_bounds
+
+    save_dir = Path(save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    # Collect indices of missing tiles from all CSVs
+    missing = set()
+    for csv_path in csv_paths:
+        if not csv_path or not os.path.exists(csv_path):
+            continue
+        df = pd.read_csv(csv_path)
+        for path in df["image_path"].unique():
+            stem = Path(path).stem  # tcd_tile_N
+            if not stem.startswith("tcd_tile_"):
+                continue
+            tif = save_dir / f"{stem}.tif"
+            if not tif.exists() or tif.stat().st_size == 0:
+                try:
+                    missing.add(int(stem.split("_")[-1]))
+                except ValueError:
+                    pass
+
+    if not missing:
+        print("✅ All TCD tiles already present on volume")
+        return
+
+    print(f"\n📥 Downloading {len(missing)} missing TCD tiles from HuggingFace "
+          f"(streaming restor/tcd)...")
+    max_idx = max(missing)
+
+    from datasets import load_dataset, Image as HFImage
+    ds = load_dataset("restor/tcd", split="train", streaming=True).cast_column(
+        "image", HFImage(decode=False)
+    )
+
+    downloaded = 0
+    for i, item in enumerate(ds):
+        if i > max_idx:
+            break
+        if i not in missing:
+            continue
+
+        img_bytes = item["image"]["bytes"]
+        img_array = np.frombuffer(img_bytes, dtype=np.uint8)
+        img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+        if img is None:
+            from PIL import Image as PILImage
+            img = np.array(PILImage.open(io.BytesIO(img_bytes)))
+            if img.ndim == 3 and img.shape[2] == 3:
+                img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        if img.ndim == 3 and img.shape[2] == 3:
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+        h, w = img.shape[:2]
+        transform = from_bounds(*item["bounds"], width=w, height=h)
+        tif_path = save_dir / f"tcd_tile_{i}.tif"
+        with rasterio.open(tif_path, "w", driver="GTiff", height=h, width=w,
+                           count=3, dtype=img.dtype,
+                           crs=item["crs"], transform=transform) as dst:
+            for b in range(3):
+                dst.write(img[:, :, b], b + 1)
+
+        downloaded += 1
+        if downloaded % 100 == 0 or downloaded == len(missing):
+            print(f"   {downloaded}/{len(missing)} tiles downloaded")
+
+    print(f"✅ Downloaded {downloaded} TCD tiles from HuggingFace")
+
+
+# ---------------------------------------------------------------------------
 # Training function
 # ---------------------------------------------------------------------------
 @app.function(
     image=image,
-    gpu="H100",
+    gpu="A100",
     volumes={
         "/checkpoints": checkpoint_volume,
         "/data": data_volume,
@@ -500,6 +582,11 @@ def train_deepforest_modal(
         _rewrite_csv(train_csv)
         if val_csv:
             _rewrite_csv(val_csv)
+
+        # ------------------------------------------------------------------
+        # Download any missing TCD tiles from HuggingFace
+        # ------------------------------------------------------------------
+        _download_missing_tcd_tiles([train_csv, val_csv])
 
         # ------------------------------------------------------------------
         # DEBUG: Verify images exist and have correct dimensions
@@ -775,6 +862,7 @@ def main(
     checkpoint: str = None,
     dry_run: bool = False,
     freeze_backbone: bool = False,
+    tcd_augmentations: bool = False,
 ):
     """
 Modal deployment for DeepForest fine-tuning
@@ -861,6 +949,7 @@ Phase 5 training data is already in Modal storage:
         checkpoint=checkpoint,
         dry_run=dry_run,
         freeze_backbone=freeze_backbone,
+        tcd_augmentations=tcd_augmentations,
     )
 
     if results:
@@ -875,7 +964,7 @@ Phase 5 training data is already in Modal storage:
 # ---------------------------------------------------------------------------
 # Utility functions
 # ---------------------------------------------------------------------------
-@app.function(volumes={"/checkpoints": checkpoint_volume})
+@app.function(image=image, volumes={"/checkpoints": checkpoint_volume})
 def list_checkpoints():
     """List saved checkpoints in the volume."""
     import os
@@ -891,7 +980,7 @@ def list_checkpoints():
     print("  modal volume get canopyai-deepforest-checkpoints <remote_path> <local_path>")
 
 
-@app.function(volumes={"/data": data_volume})
+@app.function(image=image, volumes={"/data": data_volume})
 def list_data():
     """List all files in the data volume (shows both legacy and phase3 data)."""
     import os

@@ -184,8 +184,23 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
         # Override DeepForest's default COCO mAP metric (averages IoU 0.5→0.95) with
         # IoU=0.4 to match evaluate_boxes threshold and suit aerial tree crown detection,
         # where predictions tighter than the GT box are still valid detections.
-        from torchmetrics.detection.mean_ap import MeanAveragePrecision as _MAP
-        self.mAP_metric = _MAP(iou_thresholds=[0.4])
+        # Note: self.mAP_metric (DeepForest's built-in) is intentionally left as default.
+        # It returns -1.0 for TCD because DeepForest's validation_step filters out
+        # zero-GT patches before updating the metric (our tiled val dataset produces
+        # many such patches). We monitor map_tcd instead (per-domain metric in
+        # on_validation_epoch_end which correctly accumulates all patch predictions).
+
+        # Cap proposals to avoid OOM on large TCD tiles (2048×2048) where
+        # uncapped NMS across thousands of anchors blows GPU memory.
+        try:
+            inner = self.model.model if hasattr(self.model, "model") else self.model
+            if hasattr(inner, "rpn"):
+                inner.rpn.nms_thresh = 0.7
+                inner.rpn._post_nms_top_n = {"training": 1000, "testing": 1000}
+            if hasattr(inner, "roi_heads"):
+                inner.roi_heads.detections_per_img = 500
+        except Exception:
+            pass
 
         self.freeze_backbone = freeze_backbone
         if freeze_backbone:
@@ -744,11 +759,12 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
     # Shadow loss reweighting
     # ------------------------------------------------------------------
 
-    # Shadow probe distances (px): range covering ~1–15 m trees at 30–50° sun elevation
-    _SLR_PROBE_DISTANCES = (12, 20, 30, 42, 55, 75, 100)
+    # Shadow probe fractions of ray-box intersection distance (exact edge in shadow direction).
+    # 3 inside crown (< 1.0×edge), 3 outside (> 1.0×edge).
+    _SLR_PROBE_FRACTIONS = (0.26, 0.54, 0.80, 1.12, 1.52, 2.0)
+    _SLR_PROBE_MIN_PX    = 5      # minimum probe distance in px (floor for tiny boxes)
     _SLR_SHADOW_THRESH   = 0.35   # min shadow_map value to count as shadow evidence
     _SLR_PROBE_RADIUS    = 2      # half-side of neighbourhood patch sampled at each probe
-                                  # point — max over (2r+1)×(2r+1) pixels rather than 1px
 
     def _compute_shadow_gt_weights(self, images, image_paths, targets):
         """
@@ -790,10 +806,19 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
 
             cx = ((boxes[:, 0] + boxes[:, 2]) / 2).cpu().numpy()
             cy = ((boxes[:, 1] + boxes[:, 3]) / 2).cpu().numpy()
+            bw = (boxes[:, 2] - boxes[:, 0]).cpu().numpy()
+            bh = (boxes[:, 3] - boxes[:, 1]).cpu().numpy()
 
             r = self._SLR_PROBE_RADIUS
             for i in range(N_gt):
-                for d in self._SLR_PROBE_DISTANCES:
+                # Ray-box intersection: exact distance from crown centre to box
+                # edge in the shadow direction — direction-invariant boundary.
+                t_x = ((float(bw[i]) / 2) / abs(sdx)) if abs(sdx) > 1e-6 else float("inf")
+                t_y = ((float(bh[i]) / 2) / abs(sdy)) if abs(sdy) > 1e-6 else float("inf")
+                edge_dist = max(min(t_x, t_y), self._SLR_PROBE_MIN_PX)
+                probe_dists = [max(f * edge_dist, self._SLR_PROBE_MIN_PX)
+                               for f in self._SLR_PROBE_FRACTIONS]
+                for d in probe_dists:
                     px = int(round(cx[i] + d * sdx))
                     py = int(round(cy[i] + d * sdy))
                     # Sample max over (2r+1)×(2r+1) neighbourhood — robust to

@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
-build_phase23_csvs.py — Build phase23 TCD training and early-stopping val CSVs.
+build_phase24_csvs.py — Build phase24 TCD training and early-stopping val CSVs.
 
 Streams restor/tcd split="train" (4,169 tiles) from HuggingFace.
 As a side-effect, repairs the empty _meta.json files on disk (lost during
 Mac transfer) by rewriting them from the streamed annotation data.
 
 Outputs:
-    phase23/phase23_tcd_train.csv   folds 0–3  (~3,335 tiles)
-    phase23/phase23_tcd_val.csv     fold 4     (~834 tiles, early stopping)
+    phase24/phase24_tcd_train.csv   folds 0–3  (~3,335 tiles)
+    phase24/phase24_tcd_val.csv     fold 4     (~834 tiles, early stopping)
 
 The holdout test split (439 tiles) is intentionally NOT touched here.
-Download it separately with phase23/download_tcd_holdout.py after training.
+Download it separately with phase24/download_tcd_holdout.py after training.
 
 --- Tile matching assumption ---
 Tiles were originally downloaded in HuggingFace streaming order, so
@@ -30,9 +30,9 @@ Joined from data/tcd/tcd_shadow_vectors.json for manually_reviewed tiles only.
 
 Usage:
     source venv310/bin/activate
-    python phase23/build_phase23_csvs.py
-    python phase23/build_phase23_csvs.py --dry-run        # counts only, no writes
-    python phase23/build_phase23_csvs.py --skip-repair    # skip meta.json rewrite
+    python phase24/build_phase24_csvs.py
+    python phase24/build_phase24_csvs.py --dry-run        # counts only, no writes
+    python phase24/build_phase24_csvs.py --skip-repair    # skip meta.json rewrite
 """
 
 import argparse
@@ -49,7 +49,7 @@ from tqdm import tqdm
 ROOT      = Path(__file__).resolve().parent.parent
 TRAIN_DIR = ROOT / "data/tcd/images/data/tcd/raw"   # original sequential tiles
 SHADOW_JSON = ROOT / "data/tcd/tcd_shadow_vectors_by_id.json"
-OUT_DIR   = ROOT / "phase23"
+OUT_DIR   = ROOT / "phase24"
 
 CANOPY_CAT            = 1
 ITC_CAT               = 2
@@ -256,7 +256,7 @@ def main():
             tifs = tifs[:args.max]
         print(f"Reading from disk: {len(tifs)} tiles in {TRAIN_DIR}")
 
-        for tif_path in tqdm(tifs, desc="Building phase23 CSVs"):
+        for tif_path in tqdm(tifs, desc="Building phase24 CSVs"):
             tile_stem = tif_path.stem
             meta_path = TRAIN_DIR / f"{tile_stem}_meta.json"
             i = int(tile_stem.split("_")[-1])
@@ -295,7 +295,7 @@ def main():
             "image", HFImage(decode=False)
         )
 
-        for i, item in enumerate(tqdm(ds, total=args.max or 4169, desc="Building phase23 CSVs")):
+        for i, item in enumerate(tqdm(ds, total=args.max or 4169, desc="Building phase24 CSVs")):
             if args.max is not None and i >= args.max:
                 break
             tile_stem = f"tcd_tile_{i}"
@@ -388,8 +388,8 @@ def main():
     print(f"Shadow tiles rescued from val→train : {n_rescued}")
     print(f"Replacement tiles pulled into val   : {len(replacement_tiles)}")
 
-    train_path = OUT_DIR / "phase23_tcd_train.csv"
-    val_path   = OUT_DIR / "phase23_tcd_val.csv"
+    train_path = OUT_DIR / "phase24_tcd_train.csv"
+    val_path   = OUT_DIR / "phase24_tcd_val.csv"
     train_df.to_csv(train_path, index=False)
     val_df.to_csv(val_path,     index=False)
 
@@ -399,9 +399,9 @@ def main():
     print(f"Val CSV   : {len(val_df):6d} rows  {n_val_tiles} tiles → {val_path.name}")
     print("\nNext:")
     print("  modal volume put canopyai-deepforest-data "
-          "phase23/phase23_tcd_train.csv phase23_tcd_train.csv")
+          "phase24/phase24_tcd_train.csv phase24_tcd_train.csv")
     print("  modal volume put canopyai-deepforest-data "
-          "phase23/phase23_tcd_val.csv phase23_tcd_val.csv")
+          "phase24/phase24_tcd_val.csv phase24_tcd_val.csv")
 
 
 if __name__ == "__main__":

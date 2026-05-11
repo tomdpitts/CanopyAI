@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
-build_phase23_csvs.py — Build phase23 TCD training and early-stopping val CSVs.
+build_phase26_csvs.py — Build phase26 TCD training and early-stopping val CSVs.
 
 Streams restor/tcd split="train" (4,169 tiles) from HuggingFace.
 As a side-effect, repairs the empty _meta.json files on disk (lost during
 Mac transfer) by rewriting them from the streamed annotation data.
 
 Outputs:
-    phase23/phase23_tcd_train.csv   folds 0–3  (~3,335 tiles)
-    phase23/phase23_tcd_val.csv     fold 4     (~834 tiles, early stopping)
+    phase26/phase26_tcd_train.csv   folds 0–3  (~3,335 tiles)
+    phase26/phase26_tcd_val.csv     fold 4     (~834 tiles, early stopping)
 
 The holdout test split (439 tiles) is intentionally NOT touched here.
-Download it separately with phase23/download_tcd_holdout.py after training.
+Download it separately with phase26/download_tcd_holdout.py after training.
 
 --- Tile matching assumption ---
 Tiles were originally downloaded in HuggingFace streaming order, so
@@ -30,9 +30,9 @@ Joined from data/tcd/tcd_shadow_vectors.json for manually_reviewed tiles only.
 
 Usage:
     source venv310/bin/activate
-    python phase23/build_phase23_csvs.py
-    python phase23/build_phase23_csvs.py --dry-run        # counts only, no writes
-    python phase23/build_phase23_csvs.py --skip-repair    # skip meta.json rewrite
+    python phase26/build_phase26_csvs.py
+    python phase26/build_phase26_csvs.py --dry-run        # counts only, no writes
+    python phase26/build_phase26_csvs.py --skip-repair    # skip meta.json rewrite
 """
 
 import argparse
@@ -49,7 +49,7 @@ from tqdm import tqdm
 ROOT      = Path(__file__).resolve().parent.parent
 TRAIN_DIR = ROOT / "data/tcd/images/data/tcd/raw"   # original sequential tiles
 SHADOW_JSON = ROOT / "data/tcd/tcd_shadow_vectors_by_id.json"
-OUT_DIR   = ROOT / "phase23"
+OUT_DIR   = ROOT / "phase26"
 
 CANOPY_CAT            = 1
 ITC_CAT               = 2
@@ -113,29 +113,94 @@ def parse_polygon(seg, img_w: int, img_h: int):
     return None
 
 
+_RNG = np.random.default_rng(42)
+MAX_BOXES_PER_POLYGON = 500   # hard cap so huge single polygons don't dominate
+FILL_FACTOR           = 0.55  # <1 → more boxes than polygon_area/cell_area → ~90% coverage
+
+
 def subdivide_canopy(polygon: Polygon, cell_size: int, img_w: int, img_h: int) -> list:
-    """Return (xmin, ymin, xmax, ymax) tuples for grid cells inside the polygon."""
+    """
+    Stratified jittered sampling:
+      - Divides polygon bounding box into ~cell_size cells
+      - Places one randomly-jittered point per cell (inside polygon)
+      - Cells shuffled before filling to K → even spatial coverage, no grid pattern,
+        no clumping, minimum spacing ≈ cell_size.
+    K = polygon_area / (cell_area * FILL_FACTOR) for slight density boost.
+    """
+    cell_area = float(cell_size ** 2)
+    K = min(MAX_BOXES_PER_POLYGON, max(1, int(round(polygon.area / (cell_area * FILL_FACTOR)))))
+
+    half = cell_size / 2.0
     minx, miny, maxx, maxy = polygon.bounds
-    minx = max(0, int(math.floor(minx)))
-    miny = max(0, int(math.floor(miny)))
-    maxx = min(img_w, int(math.ceil(maxx)))
-    maxy = min(img_h, int(math.ceil(maxy)))
+    minx = max(half, minx); miny = max(half, miny)
+    maxx = min(img_w - half, maxx); maxy = min(img_h - half, maxy)
+    if maxx <= minx or maxy <= miny:
+        return []
+
+    W = maxx - minx; H = maxy - miny
+    n_cols = max(1, round(W / cell_size))
+    n_rows = max(1, round(H / cell_size))
+    col_w  = W / n_cols
+    row_h  = H / n_rows
+
+    cells = [(r, c) for r in range(n_rows) for c in range(n_cols)]
+    _RNG.shuffle(cells)
 
     boxes = []
-    x = minx
-    while x + cell_size <= maxx:
-        y = miny
-        while y + cell_size <= maxy:
-            cell = shapely_box(x, y, x + cell_size, y + cell_size)
+    for r, c in cells:
+        if len(boxes) >= K:
+            break
+        cx = minx + (c + _RNG.uniform(0.15, 0.85)) * col_w
+        cy = miny + (r + _RNG.uniform(0.15, 0.85)) * row_h
+        try:
+            inside = polygon.contains(
+                shapely_box(cx - half, cy - half, cx + half, cy + half).centroid)
+        except Exception:
+            inside = False
+        if inside:
+            boxes.append((float(cx - half), float(cy - half),
+                          float(cx + half), float(cy + half)))
+
+    # Second pass: random fill for remaining spots, enforcing min spacing = cell_size
+    remaining = K - len(boxes)
+    if remaining > 0:
+        existing_cx = np.array([(b[0]+b[2])/2 for b in boxes], dtype=np.float32)
+        existing_cy = np.array([(b[1]+b[3])/2 for b in boxes], dtype=np.float32)
+        raw_minx, raw_miny, raw_maxx, raw_maxy = polygon.bounds
+        raw_minx = max(0, raw_minx); raw_miny = max(0, raw_miny)
+        raw_maxx = min(img_w, raw_maxx); raw_maxy = min(img_h, raw_maxy)
+        min_dist2 = float(cell_size ** 2)
+        tries = 0
+        while len(boxes) < K and tries < remaining * 30:
+            cx = float(_RNG.uniform(raw_minx, raw_maxx))
+            cy = float(_RNG.uniform(raw_miny, raw_maxy))
+            # Reject if too close to an existing box
+            if len(existing_cx):
+                d2 = ((existing_cx - cx)**2 + (existing_cy - cy)**2).min()
+                if d2 < min_dist2:
+                    tries += 1
+                    continue
             try:
-                overlap = cell.intersection(polygon).area / cell.area
+                inside = polygon.contains(
+                    shapely_box(cx - half, cy - half, cx + half, cy + half).centroid)
             except Exception:
-                overlap = 0.0
-            if overlap >= CANOPY_OVERLAP_THRESH:
-                boxes.append((float(x), float(y),
-                              float(x + cell_size), float(y + cell_size)))
-            y += cell_size
-        x += cell_size
+                inside = False
+            if inside:
+                boxes.append((float(max(0, cx - half)), float(max(0, cy - half)),
+                              float(min(img_w, cx + half)), float(min(img_h, cy + half))))
+                existing_cx = np.append(existing_cx, cx)
+                existing_cy = np.append(existing_cy, cy)
+            tries += 1
+
+    # Centroid fallback for polygons that got zero boxes
+    if not boxes:
+        try:
+            c = polygon.centroid
+            cx, cy = float(c.x), float(c.y)
+            boxes.append((max(0., cx - half), max(0., cy - half),
+                          min(img_w, cx + half), min(img_h, cy + half)))
+        except Exception:
+            pass
     return boxes
 
 
@@ -173,7 +238,7 @@ def process_tile(item: dict, tile_stem: str, img_path: Path,
         itc_widths.append(xmax - xmin)
         itc_rows.append((xmin, ymin, xmax, ymax))
 
-    cell_size = max(20, int(np.percentile(itc_widths, 60))) if itc_widths else CANOPY_DEFAULT_SIZE
+    cell_size = max(20, int(np.percentile(itc_widths, 75))) if itc_widths else CANOPY_DEFAULT_SIZE
 
     # Canopy annotations (category 1) → pseudo-ITC grid
     canopy_rows = []
@@ -188,10 +253,6 @@ def process_tile(item: dict, tile_stem: str, img_path: Path,
             continue
         canopy_rows.extend(subdivide_canopy(poly, cell_size, img_w, img_h))
 
-    all_boxes = itc_rows + canopy_rows
-    if not all_boxes:
-        return [], 0, 0
-
     # Shadow vectors keyed by tcd_{image_id} in the new by-id JSON
     image_id = item.get("image_id")
     sv_key   = f"tcd_{image_id}" if image_id is not None else tile_stem
@@ -201,6 +262,25 @@ def process_tile(item: dict, tile_stem: str, img_path: Path,
     shadow_y     = sv["shadow_y"]         if sv else float("nan")
 
     img_str = str(img_path)
+
+    # Empty tile → emit a single hard-negative row with NaN bbox.
+    # train_deepforest.py detects rows with NaN xmin and re-injects these
+    # tiles into the training dataset with zero-box targets, teaching the
+    # model that some landscapes contain NO trees.
+    all_boxes = itc_rows + canopy_rows
+    if not all_boxes:
+        return [{
+            "image_path":   img_str,
+            "xmin":         float("nan"), "ymin": float("nan"),
+            "xmax":         float("nan"), "ymax": float("nan"),
+            "label":        "Tree",
+            "shadow_angle": shadow_angle,
+            "shadow_x":     shadow_x,
+            "shadow_y":     shadow_y,
+            "domain":       "TCD",
+            "fold":         fold,
+        }], 0, 0
+
     rows = [
         {
             "image_path":   img_str,
@@ -256,7 +336,7 @@ def main():
             tifs = tifs[:args.max]
         print(f"Reading from disk: {len(tifs)} tiles in {TRAIN_DIR}")
 
-        for tif_path in tqdm(tifs, desc="Building phase23 CSVs"):
+        for tif_path in tqdm(tifs, desc="Building phase26 CSVs"):
             tile_stem = tif_path.stem
             meta_path = TRAIN_DIR / f"{tile_stem}_meta.json"
             i = int(tile_stem.split("_")[-1])
@@ -275,13 +355,11 @@ def main():
                 item = json.load(f)
 
             rows, n_itc, n_pseudo = process_tile(item, tile_stem, tif_path, shadow_vecs)
-
-            if not rows:
+            all_rows.extend(rows)
+            total_itc    += n_itc
+            total_pseudo += n_pseudo
+            if n_itc == 0 and n_pseudo == 0:
                 empty_tiles += 1
-            else:
-                all_rows.extend(rows)
-                total_itc    += n_itc
-                total_pseudo += n_pseudo
 
             if i < 5 or i % 500 == 0:
                 tqdm.write(
@@ -295,7 +373,7 @@ def main():
             "image", HFImage(decode=False)
         )
 
-        for i, item in enumerate(tqdm(ds, total=args.max or 4169, desc="Building phase23 CSVs")):
+        for i, item in enumerate(tqdm(ds, total=args.max or 4169, desc="Building phase26 CSVs")):
             if args.max is not None and i >= args.max:
                 break
             tile_stem = f"tcd_tile_{i}"
@@ -328,13 +406,11 @@ def main():
                     json.dump(meta, f)
 
             rows, n_itc, n_pseudo = process_tile(item, tile_stem, img_path, shadow_vecs)
-
-            if not rows:
+            all_rows.extend(rows)
+            total_itc    += n_itc
+            total_pseudo += n_pseudo
+            if n_itc == 0 and n_pseudo == 0:
                 empty_tiles += 1
-            else:
-                all_rows.extend(rows)
-                total_itc    += n_itc
-                total_pseudo += n_pseudo
 
             if i < 5 or i % 500 == 0:
                 tqdm.write(
@@ -361,35 +437,18 @@ def main():
         print("\n[dry-run] No files written.")
         return
 
-    # Shadow-annotated fold-4 tiles move to training (shadow loss reweight not
-    # used in validation, so annotating them into val wastes the work).
-    # Replaced in val by an equal number of randomly sampled non-shadow
-    # tiles from folds 0-3 to preserve the original val set size.
-    has_shadow  = df["shadow_angle"].notna()
+    # Use the paper's exact fold split: train = folds 0–3, val = fold 4.
+    # No fold tampering — needed for direct comparability with Restor TCD paper.
+    # The 74 shadow-annotated tiles in fold 4 stay in val unused; that's fine
+    # since validation doesn't apply shadow loss reweighting anyway.
     in_val_fold = df["fold"] == VAL_FOLD
+    train_df = df[~in_val_fold].drop(columns=["fold"])
+    val_df   = df[ in_val_fold].drop(columns=["fold"])
 
-    rescued_tiles = df[in_val_fold & has_shadow]["image_path"].unique()
-    n_rescued     = len(rescued_tiles)
+    print(f"Val split: paper-faithful (fold {VAL_FOLD} only, no tampering)")
 
-    # Sample replacement tiles from non-shadow folds 0-3
-    candidate_tiles = (
-        df[~in_val_fold & ~has_shadow]["image_path"]
-        .unique()
-    )
-    rng = np.random.default_rng(42)
-    replacement_tiles = set(
-        rng.choice(candidate_tiles, size=min(n_rescued, len(candidate_tiles)), replace=False)
-    )
-
-    in_replacement = df["image_path"].isin(replacement_tiles)
-    train_df = df[~in_val_fold & ~in_replacement | (in_val_fold & has_shadow)].drop(columns=["fold"])
-    val_df   = df[(in_val_fold & ~has_shadow) | in_replacement].drop(columns=["fold"])
-
-    print(f"Shadow tiles rescued from val→train : {n_rescued}")
-    print(f"Replacement tiles pulled into val   : {len(replacement_tiles)}")
-
-    train_path = OUT_DIR / "phase23_tcd_train.csv"
-    val_path   = OUT_DIR / "phase23_tcd_val.csv"
+    train_path = OUT_DIR / "phase26_tcd_train.csv"
+    val_path   = OUT_DIR / "phase26_tcd_val.csv"
     train_df.to_csv(train_path, index=False)
     val_df.to_csv(val_path,     index=False)
 
@@ -399,9 +458,9 @@ def main():
     print(f"Val CSV   : {len(val_df):6d} rows  {n_val_tiles} tiles → {val_path.name}")
     print("\nNext:")
     print("  modal volume put canopyai-deepforest-data "
-          "phase23/phase23_tcd_train.csv phase23_tcd_train.csv")
+          "phase26/phase26_tcd_train.csv phase26_tcd_train.csv")
     print("  modal volume put canopyai-deepforest-data "
-          "phase23/phase23_tcd_val.csv phase23_tcd_val.csv")
+          "phase26/phase26_tcd_val.csv phase26_tcd_val.csv")
 
 
 if __name__ == "__main__":
