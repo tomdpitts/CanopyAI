@@ -182,13 +182,10 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
         deepforest_main.deepforest.__init__(self, config=config, **kwargs)
 
         # Override DeepForest's default COCO mAP metric (averages IoU 0.5→0.95) with
-        # IoU=0.4 to match evaluate_boxes threshold and suit aerial tree crown detection,
-        # where predictions tighter than the GT box are still valid detections.
-        # Note: self.mAP_metric (DeepForest's built-in) is intentionally left as default.
-        # It returns -1.0 for TCD because DeepForest's validation_step filters out
-        # zero-GT patches before updating the metric (our tiled val dataset produces
-        # many such patches). We monitor map_tcd instead (per-domain metric in
-        # on_validation_epoch_end which correctly accumulates all patch predictions).
+        # IoU=0.4, which better suits aerial tree crown detection where predicted boxes
+        # are often tighter than the annotated GT polygon bounds.
+        from torchmetrics.detection.mean_ap import MeanAveragePrecision as _MAP
+        self.mAP_metric = _MAP(iou_thresholds=[0.4])
 
         # Cap proposals to avoid OOM on large TCD tiles (2048×2048) where
         # uncapped NMS across thousands of anchors blows GPU memory.
@@ -288,10 +285,6 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
             except Exception as e:
                 print(f"   Warning: could not load {label} shadow lookup: {e}")
 
-        # Per-domain MAP accumulators — populated lazily from domain_lookup on first val batch
-        self._domain_map_metrics = {}   # domain -> torchmetrics.MeanAveragePrecision
-        self._domain_val_preds   = {}   # domain -> list of prediction dicts (accumulated)
-        self._domain_val_targets = {}   # domain -> list of target dicts (accumulated)
 
         # Shadow Anticipation modules
         if self.shadow_cross_attention:
@@ -985,74 +978,9 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
 
         batch  = (images, targets, *batch[2:])
 
-        # Patch model.forward to cache its output on the first call so that
-        # super().validation_step() and domain accumulation share one GPU pass.
-        _cache    = [None]
-        _orig_fwd = self.model.forward
-
-        def _caching_forward(*args, **kwargs):
-            if _cache[0] is None:
-                _cache[0] = _orig_fwd(*args, **kwargs)
-            return _cache[0]
-
-        if self.domain_lookup:
-            self.model.forward = _caching_forward
-
-        result = super().validation_step(batch, batch_idx)
-
-        if self.domain_lookup:
-            self.model.forward = _orig_fwd   # restore immediately
-
-        # Per-domain accumulation — uses cached predictions, no second GPU pass.
-        if self.domain_lookup:
-            try:
-                raw_preds = _cache[0] or []
-                for pred, target, path in zip(raw_preds, targets, image_paths):
-                    domain = self.domain_lookup.get(path)
-                    if domain is None:
-                        continue
-                    if domain not in self._domain_val_preds:
-                        self._domain_val_preds[domain]   = []
-                        self._domain_val_targets[domain] = []
-                    # torchmetrics MAP format: boxes, scores, labels
-                    self._domain_val_preds[domain].append({
-                        "boxes":  pred["boxes"].cpu(),
-                        "scores": pred["scores"].cpu(),
-                        "labels": pred["labels"].cpu(),
-                    })
-                    self._domain_val_targets[domain].append({
-                        "boxes":  target["boxes"].cpu(),
-                        "labels": target["labels"].cpu(),
-                    })
-            except Exception:
-                pass  # non-fatal — don't break training over a diagnostic
-
-        return result
+        return super().validation_step(batch, batch_idx)
 
     def on_validation_epoch_end(self):
-        """Compute and log per-domain mAP from accumulated validation predictions."""
-        if not self._domain_val_preds:
-            return
-
-        try:
-            from torchmetrics.detection.mean_ap import MeanAveragePrecision
-            for domain, preds in self._domain_val_preds.items():
-                targets = self._domain_val_targets[domain]
-                # Use IoU=0.4 to match DeepForest's evaluate_boxes threshold.
-                # COCO default (0.5-0.95 average) is too strict for aerial tree crown
-                # detection where predictions are often tighter than GT annotations.
-                metric  = MeanAveragePrecision(iou_thresholds=[0.4])
-                metric.update(preds, targets)
-                result = metric.compute()
-                map_val = result.get("map", torch.tensor(0.0)).item()
-                self.log(f"map_{domain.lower()}", map_val,
-                         prog_bar=True, on_epoch=True, sync_dist=False)
-        except Exception:
-            pass
-        finally:
-            self._domain_val_preds.clear()
-            self._domain_val_targets.clear()
-
         if hasattr(super(), "on_validation_epoch_end"):
             super().on_validation_epoch_end()
 
@@ -1122,10 +1050,10 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
             optimizer = torch.optim.SGD(params, lr=backbone_lr, momentum=0.9, weight_decay=1e-4)
 
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="max", factor=0.1, patience=5, verbose=True
+            optimizer, mode="min", factor=0.1, patience=5, verbose=True
         )
         return {
             "optimizer": optimizer,
-            "lr_scheduler": {"scheduler": scheduler, "monitor": "map",
+            "lr_scheduler": {"scheduler": scheduler, "monitor": "val_loss",
                              "interval": "epoch", "frequency": 1},
         }

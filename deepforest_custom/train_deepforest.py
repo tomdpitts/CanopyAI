@@ -153,6 +153,78 @@ except ImportError:
     from models import ShadowConditionedDeepForest
 
 
+class _TiledValDataset:
+    """Tiles each 2048×2048 val image into 400×400 patches for validation.
+    Defined at module level so it can be pickled by multiprocessing workers."""
+    def __init__(self, base_ds, patch_size=400, overlap=0.0, min_visibility=0.5):
+        import albumentations as A
+        from albumentations.pytorch import ToTensorV2
+        self.base        = base_ds
+        self.patch_size  = patch_size
+        self.step        = max(1, int(patch_size * (1 - overlap)))
+        self.min_vis     = min_visibility
+        self.collate_fn  = base_ds.collate_fn
+        self._val_t      = A.Compose(
+            [ToTensorV2()],
+            bbox_params=A.BboxParams(format="pascal_voc",
+                                     label_fields=["category_ids"],
+                                     clip=True, min_visibility=min_visibility),
+        )
+        _sample = base_ds.load_image(0)
+        self._H, self._W = _sample.shape[:2]
+        self._build_patch_list()
+
+    def _build_patch_list(self):
+        self._patches = []
+        for img_idx in range(len(self.base.image_names)):
+            for py in range(0, self._H, self.step):
+                for px in range(0, self._W, self.step):
+                    py2 = min(py + self.patch_size, self._H)
+                    px2 = min(px + self.patch_size, self._W)
+                    py1 = max(0, py2 - self.patch_size)
+                    px1 = max(0, px2 - self.patch_size)
+                    self._patches.append((img_idx, px1, py1, px2, py2))
+
+    def __len__(self):
+        return len(self._patches)
+
+    def __getitem__(self, idx):
+        img_idx, px1, py1, px2, py2 = self._patches[idx]
+        img_name = self.base.image_names[img_idx]
+        img      = self.base.load_image(img_idx)
+        patch    = img[py1:py2, px1:px2]
+
+        gt      = self.base.annotations_for_path(img_name)
+        boxes   = gt["boxes"]
+        labels  = gt["labels"]
+
+        if len(boxes):
+            cx1 = np.maximum(boxes[:, 0], px1) - px1
+            cy1 = np.maximum(boxes[:, 1], py1) - py1
+            cx2 = np.minimum(boxes[:, 2], px2) - px1
+            cy2 = np.minimum(boxes[:, 3], py2) - py1
+            bw  = boxes[:, 2] - boxes[:, 0]; bh = boxes[:, 3] - boxes[:, 1]
+            vis = np.where(bw * bh > 0,
+                           np.maximum(cx2 - cx1, 0) * np.maximum(cy2 - cy1, 0) / (bw * bh),
+                           0)
+            keep = vis >= self.min_vis
+            if keep.any():
+                patch_boxes = np.stack(
+                    [cx1[keep], cy1[keep], cx2[keep], cy2[keep]],
+                    axis=1).astype(np.float32)
+                patch_labels = labels[keep]
+            else:
+                patch_boxes, patch_labels = np.zeros((0, 4), np.float32), np.zeros(0, np.int64)
+        else:
+            patch_boxes, patch_labels = np.zeros((0, 4), np.float32), np.zeros(0, np.int64)
+
+        aug     = self._val_t(image=patch, bboxes=patch_boxes, category_ids=patch_labels)
+        image   = aug["image"]
+        boxes_t = torch.from_numpy(np.array(aug["bboxes"], dtype=np.float32)).reshape(-1, 4)
+        labels_t= torch.from_numpy(np.array(aug["category_ids"], dtype=np.int64))
+        return image, {"boxes": boxes_t, "labels": labels_t}, img_name
+
+
 def widen_first_conv_for_shadow_channel(model):
     """
     Replace backbone.body.conv1 ([64,3,7,7]) with a 4-channel version ([64,4,7,7]).
@@ -215,6 +287,7 @@ def train_deepforest(
     shadow_loss_weight=2.0,       # Multiplier for shadow-casting GT positive anchors
     won_bbox_shrink=True,         # Always apply WON bbox normalisation for consistent evaluation
     augmentations=None,           # If set (list of dicts), overrides default/wrapper augmentation logic
+    fast_dev_run=False,           # Lightning fast_dev_run: 1 train + 1 val batch then exit
 ):
     """
     Train a DeepForest model using DeepForest 2.0 config-based API.
@@ -455,77 +528,6 @@ def train_deepforest(
     # ── Tiled validation dataset ──────────────────────────────────────────────
     # Tiles each full image into CROP_SIZE × CROP_SIZE patches so validation
     # uses the same input size as training (avoids OOM on 2048×2048 tiles).
-    class _TiledValDataset:
-        def __init__(self, base_ds, patch_size=400, overlap=0.0, min_visibility=0.5):
-            import albumentations as A
-            from albumentations.pytorch import ToTensorV2
-            self.base        = base_ds
-            self.patch_size  = patch_size
-            self.step        = max(1, int(patch_size * (1 - overlap)))
-            self.min_vis     = min_visibility
-            self.collate_fn  = base_ds.collate_fn
-            self._val_t      = A.Compose(
-                [ToTensorV2()],
-                bbox_params=A.BboxParams(format="pascal_voc",
-                                         label_fields=["category_ids"],
-                                         clip=True, min_visibility=min_visibility),
-            )
-            # Assume all tiles are the same size; read one to get dims
-            _sample = base_ds.load_image(0)
-            self._H, self._W = _sample.shape[:2]
-            self._build_patch_list()
-
-        def _build_patch_list(self):
-            self._patches = []
-            for img_idx in range(len(self.base.image_names)):
-                for py in range(0, self._H, self.step):
-                    for px in range(0, self._W, self.step):
-                        py2 = min(py + self.patch_size, self._H)
-                        px2 = min(px + self.patch_size, self._W)
-                        py1 = max(0, py2 - self.patch_size)
-                        px1 = max(0, px2 - self.patch_size)
-                        self._patches.append((img_idx, px1, py1, px2, py2))
-
-        def __len__(self):
-            return len(self._patches)
-
-        def __getitem__(self, idx):
-            img_idx, px1, py1, px2, py2 = self._patches[idx]
-            img_name = self.base.image_names[img_idx]
-            img      = self.base.load_image(img_idx)
-            patch    = img[py1:py2, px1:px2]
-
-            gt      = self.base.annotations_for_path(img_name)
-            boxes   = gt["boxes"]
-            labels  = gt["labels"]
-
-            if len(boxes):
-                cx1 = np.maximum(boxes[:, 0], px1) - px1
-                cy1 = np.maximum(boxes[:, 1], py1) - py1
-                cx2 = np.minimum(boxes[:, 2], px2) - px1
-                cy2 = np.minimum(boxes[:, 3], py2) - py1
-                bw  = boxes[:, 2] - boxes[:, 0]; bh = boxes[:, 3] - boxes[:, 1]
-                vis = np.where(bw * bh > 0,
-                               np.maximum(cx2 - cx1, 0) * np.maximum(cy2 - cy1, 0) / (bw * bh),
-                               0)
-                keep = vis >= self.min_vis
-                if keep.any():
-                    patch_boxes = np.stack(
-                        [cx1[keep], cy1[keep], cx2[keep], cy2[keep]],
-                        axis=1).astype(np.float32)
-                    patch_labels = labels[keep]
-                else:
-                    patch_boxes, patch_labels = np.zeros((0, 4), np.float32), np.zeros(0, np.int64)
-            else:
-                patch_boxes, patch_labels = np.zeros((0, 4), np.float32), np.zeros(0, np.int64)
-
-            aug     = self._val_t(image=patch, bboxes=patch_boxes, category_ids=patch_labels)
-            image   = aug["image"]
-            boxes_t = torch.from_numpy(np.array(aug["bboxes"], dtype=np.float32)).reshape(-1, 4)
-            labels_t= torch.from_numpy(np.array(aug["category_ids"], dtype=np.int64))
-            return image, {"boxes": boxes_t, "labels": labels_t}, img_name
-
-    # ── end _TiledValDataset ──────────────────────────────────────────────────
 
     train_df = pd.read_csv(train_csv)
     _empty_mask = train_df["xmin"].isna() | (train_df["xmin"].astype(str).str.strip() == "")
@@ -642,15 +644,12 @@ def train_deepforest(
     # Create callbacks
     callbacks = []
 
-    # Model checkpoint callback - save best model
-    # Monitor map_tcd (per-domain metric from on_validation_epoch_end) rather than
-    # DeepForest's built-in `map` which returns -1.0 when val patches have empty GT
-    # (our tiled val dataset produces many zero-GT patches which DeepForest filters
-    # out before updating its mAP metric, leaving it with no data → -1.0 sentinel).
-    _monitor = "map_tcd"
+    # Monitor DeepForest's native `map` metric, which we've overridden to use
+    # IoU=0.4 (better suited to aerial tree crown detection than COCO's 0.5–0.95).
+    _monitor = "map"
     checkpoint_callback = ModelCheckpoint(
         dirpath=run_output_dir,
-        filename="deepforest-{epoch:02d}-{map_tcd:.2f}",
+        filename="deepforest-{epoch:02d}-{map:.2f}",
         monitor=_monitor,
         mode="max",
         save_top_k=1,
@@ -699,6 +698,7 @@ def train_deepforest(
         "check_val_every_n_epoch": 1,
         "num_sanity_val_steps": 0,
         "gradient_clip_val": 1.0,
+        "fast_dev_run": fast_dev_run,
     }
 
     if accelerator:
