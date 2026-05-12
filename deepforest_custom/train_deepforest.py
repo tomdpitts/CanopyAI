@@ -752,7 +752,22 @@ def train_deepforest(
     else:
         trainer_kwargs["accelerator"] = "cpu"
 
+    # Mixed precision: bfloat16 on CUDA only (MPS does not support autocast)
+    # Master weights stay float32; only forward/backward use reduced precision.
+    if trainer_kwargs.get("accelerator") == "gpu":
+        trainer_kwargs["precision"] = "bf16-mixed"
+
     trainer = pl.Trainer(**trainer_kwargs)
+
+    # Compile the inner detection model for optimised CUDA/Metal kernels.
+    # Compiling the full LightningModule causes issues with Lightning hooks,
+    # so we compile only the underlying RetinaNet/Faster-RCNN model.
+    try:
+        model.model = torch.compile(model.model)
+        print("   ✅ torch.compile applied to detection model")
+    except Exception as e:
+        print(f"   ⚠️  torch.compile unavailable ({e}) — running uncompiled")
+
     trainer.fit(model, ckpt_path=checkpoint_path)
 
     print("\n✅ Training complete!")
