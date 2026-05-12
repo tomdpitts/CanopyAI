@@ -323,6 +323,7 @@ def train_deepforest(
     won_bbox_shrink=True,         # Always apply WON bbox normalisation for consistent evaluation
     augmentations=None,           # If set (list of dicts), overrides default/wrapper augmentation logic
     fast_dev_run=False,           # Lightning fast_dev_run: 1 train + 1 val batch then exit
+    precision=None,               # Override Lightning precision (e.g. "16-mixed", "bf16-mixed")
 ):
     """
     Train a DeepForest model using DeepForest 2.0 config-based API.
@@ -752,21 +753,21 @@ def train_deepforest(
     else:
         trainer_kwargs["accelerator"] = "cpu"
 
-    # Mixed precision: bfloat16 on CUDA only (MPS does not support autocast)
-    # Master weights stay float32; only forward/backward use reduced precision.
-    if trainer_kwargs.get("accelerator") == "gpu":
+    # Mixed precision: explicit override wins; otherwise bf16-mixed on CUDA only.
+    if precision:
+        trainer_kwargs["precision"] = precision
+    elif trainer_kwargs.get("accelerator") == "gpu":
         trainer_kwargs["precision"] = "bf16-mixed"
 
     trainer = pl.Trainer(**trainer_kwargs)
 
-    # Compile the inner detection model for optimised CUDA/Metal kernels.
-    # Compiling the full LightningModule causes issues with Lightning hooks,
-    # so we compile only the underlying RetinaNet/Faster-RCNN model.
-    try:
-        model.model = torch.compile(model.model)
-        print("   ✅ torch.compile applied to detection model")
-    except Exception as e:
-        print(f"   ⚠️  torch.compile unavailable ({e}) — running uncompiled")
+    # torch.compile: CUDA only — MPS inductor backend is prototype and fails on backward pass.
+    if trainer_kwargs.get("accelerator") == "gpu" and torch.cuda.is_available():
+        try:
+            model.model = torch.compile(model.model)
+            print("   ✅ torch.compile applied to detection model")
+        except Exception as e:
+            print(f"   ⚠️  torch.compile unavailable ({e}) — running uncompiled")
 
     trainer.fit(model, ckpt_path=checkpoint_path)
 
@@ -855,6 +856,12 @@ def main():
         action="store_true",
         help="Run 1 train + 1 val batch then exit (sanity check).",
     )
+    parser.add_argument(
+        "--precision",
+        type=str,
+        default=None,
+        help="Lightning precision override (e.g. 16-mixed, bf16-mixed, 32).",
+    )
 
     args = parser.parse_args()
 
@@ -879,6 +886,7 @@ def main():
         shadow_loss_reweight=args.shadow_loss_reweight,
         shadow_loss_weight=args.shadow_loss_weight,
         fast_dev_run=args.fast_dev_run,
+        precision=args.precision,
     )
 
 
