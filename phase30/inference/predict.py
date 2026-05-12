@@ -1,0 +1,2224 @@
+#!/usr/bin/env python3
+
+"""
+Two-Stage Tree Detection Pipeline: DeepForest + SAM
+---------------------------------------------------
+This script implements a custom 2-stage model that:
+1. Uses DeepForest to detect trees in sparse arid landscapes
+2. Produces bounding boxes around detected trees
+3. Uses SAM (Segment Anything Model) to segment the object within each bounding box
+
+Usage:
+    python inference/foxtrot.py --image_path /path/to/tile.tif
+
+"""
+
+import sys
+from pathlib import Path
+# Allow imports from lib/ (models.py, utils.py, train_deepforest.py)
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+
+import argparse
+import os
+import json
+import tempfile
+import gc
+import shutil
+import time
+import math
+import random
+import numpy as np
+import rasterio
+from pathlib import Path
+from segment_anything import sam_model_registry, SamPredictor
+from PIL import Image
+import cv2
+import torch
+import torchvision.transforms as transforms
+from tqdm import tqdm
+from deepforest import main as deepforest_main
+from deepforest import utilities
+from shapely.geometry import Polygon
+
+# Fix MPS float64 compatibility
+torch.set_default_dtype(torch.float32)
+
+
+def load_image_from_tif(tif_path):
+    """
+    Load image from TIF file and return as RGB numpy array.
+
+    Args:
+        tif_path: Path to input TIF file
+
+    Returns:
+        image: RGB image as (H, W, 3) numpy array
+        crs: Coordinate reference system
+        transform: Geospatial transform
+        bounds: Geographic bounds
+    """
+    with rasterio.open(tif_path) as src:
+        # Read RGB bands (assuming bands 1,2,3 are RGB)
+        image = src.read([1, 2, 3])  # Shape: (3, H, W)
+        image = np.transpose(image, (1, 2, 0))  # Convert to (H, W, 3)
+
+        # Store georeferencing info
+        crs = src.crs
+        transform = src.transform
+        bounds = src.bounds
+
+        print(f"✅ Loaded image: {image.shape}")
+        print(f"   CRS: {crs}")
+        print(f"   Bounds: {bounds}")
+
+    # Normalize image to 0-255 if needed
+    if image.max() > 255:
+        image = (image / image.max() * 255).astype(np.uint8)
+
+    return image, crs, transform, bounds
+
+
+def detect_shadows(image, threshold_ratio=0.7, blur_size=51):
+    """
+    Detect shadow regions using adaptive luminance thresholding.
+
+    Args:
+        image: RGB image as numpy array (H, W, C), uint8
+        threshold_ratio: Pixels below (local_mean * ratio) are shadows
+        blur_size: Gaussian blur kernel size for local mean
+
+    Returns:
+        Binary shadow mask (H, W), uint8 with 1=shadow, 0=non-shadow
+    """
+    # Convert to LAB and extract luminance
+    lab = cv2.cvtColor(image, cv2.COLOR_RGB2LAB)
+    L = lab[:, :, 0].astype(np.float32)
+
+    # Compute local mean luminance
+    local_mean = cv2.GaussianBlur(L, (blur_size, blur_size), 0)
+
+    # Threshold: pixels darker than local mean are shadows
+    shadow_mask = (L < local_mean * threshold_ratio).astype(np.uint8)
+
+    # Morphological cleanup
+    kernel = np.ones((5, 5), np.uint8)
+    shadow_mask = cv2.morphologyEx(shadow_mask, cv2.MORPH_OPEN, kernel)
+    shadow_mask = cv2.morphologyEx(shadow_mask, cv2.MORPH_CLOSE, kernel)
+
+    return shadow_mask
+
+
+def compute_iou(box1, box2):
+    """Compute Intersection over Union between two boxes [xmin, ymin, xmax, ymax]."""
+    x1 = max(box1[0], box2[0])
+    y1 = max(box1[1], box2[1])
+    x2 = min(box1[2], box2[2])
+    y2 = min(box1[3], box2[3])
+
+    intersection = max(0, x2 - x1) * max(0, y2 - y1)
+    area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
+    area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
+    union = area1 + area2 - intersection
+
+    iou = intersection / union if union > 0 else 0
+
+    # Also compute coverage: what fraction of each box is covered by intersection
+    coverage1 = intersection / area1 if area1 > 0 else 0
+    coverage2 = intersection / area2 if area2 > 0 else 0
+
+    return iou, coverage1, coverage2
+
+
+def apply_nms(bboxes, scores, iou_threshold=0.5, coverage_threshold=0.5,
+              area_weight=0.5):
+    """
+    Apply Non-Maximum Suppression to remove overlapping detections.
+    Suppresses if IoU > iou_threshold OR if one box is >coverage_threshold
+    covered by another (handles small boxes inside larger ones).
+
+    Sort key: bbox area (largest survives). area_weight is kept for
+    backward compatibility but ignored — pure area ordering is used.
+    """
+    if len(bboxes) == 0:
+        return []
+
+    areas = np.array([(b[2]-b[0])*(b[3]-b[1]) for b in bboxes], dtype=float)
+    indices = np.argsort(areas)[::-1].tolist()
+    keep = []
+
+    while indices:
+        current = indices.pop(0)
+        keep.append(current)
+
+        remaining = []
+        for idx in indices:
+            iou, coverage_current, coverage_idx = compute_iou(
+                bboxes[current], bboxes[idx]
+            )
+            if iou < iou_threshold and coverage_idx < coverage_threshold:
+                remaining.append(idx)
+        indices = remaining
+
+    return keep
+
+
+def apply_containment_suppression(bboxes, containment_threshold=0.8):
+    """
+    Second-pass suppression: remove any box that is ≥containment_threshold
+    contained within a larger box, regardless of score order.
+
+    This catches cases where high-scoring small detections slip through NMS
+    because their IoU with a larger enclosing box is low (dominated by the
+    large box's area).
+
+    Returns indices into bboxes to keep.
+    """
+    if len(bboxes) == 0:
+        return []
+    areas = [(b[2] - b[0]) * (b[3] - b[1]) for b in bboxes]
+    to_remove = set()
+    for i in range(len(bboxes)):
+        if i in to_remove:
+            continue
+        for j in range(len(bboxes)):
+            if i == j or j in to_remove:
+                continue
+            _, cov_i, _ = compute_iou(bboxes[i], bboxes[j])
+            # box i is mostly contained within box j, and j is larger → remove i
+            if cov_i >= containment_threshold and areas[j] > areas[i]:
+                to_remove.add(i)
+                break
+    return [i for i in range(len(bboxes)) if i not in to_remove]
+
+
+
+# =============================================================================
+# Stage 0: Shadow Vector Prediction (Global Context)
+# =============================================================================
+
+
+def extract_safe_crops(image, n_crops=30, crop_size=500, margin_fraction=0.2):
+    """
+    Extract random 500x500 crops from center region of image, avoiding edges.
+
+    Args:
+        image: RGB image as (H, W, 3) numpy array
+        n_crops: Number of crops to extract
+        crop_size: Size of each crop (default 500px)
+        margin_fraction: Fraction of image to avoid at edges (default 0.2 = 20%)
+
+    Returns:
+        List of PIL Image crops
+    """
+    h, w = image.shape[:2]
+
+    # Define safe extraction zone (center, avoiding margins)
+    margin_w = int(w * margin_fraction)
+    margin_h = int(h * margin_fraction)
+
+    safe_min_col = margin_w
+    safe_max_col = w - margin_w - crop_size
+    safe_min_row = margin_h
+    safe_max_row = h - margin_h - crop_size
+
+    # Fallback if image is too small
+    if safe_max_col <= safe_min_col or safe_max_row <= safe_min_row:
+        safe_min_col = max(0, crop_size)
+        safe_max_col = max(crop_size, w - crop_size)
+        safe_min_row = max(0, crop_size)
+        safe_max_row = max(0, h - crop_size)
+
+    crops = []
+    for _ in range(n_crops):
+        if safe_max_col <= safe_min_col or safe_max_row <= safe_min_row:
+            # Image too small for safe cropping
+            break
+
+        col_off = random.randint(safe_min_col, safe_max_col)
+        row_off = random.randint(safe_min_row, safe_max_row)
+
+        crop_np = image[row_off : row_off + crop_size, col_off : col_off + crop_size]
+        crop_pil = Image.fromarray(crop_np)
+        crops.append(crop_pil)
+
+    return crops
+
+
+def predict_shadow_vector_from_crops(crops, model, device):
+    """
+    Predict shadow vector from multiple crops using the trained model.
+
+    Args:
+        crops: List of PIL Image crops (500x500)
+        model: Trained shadow regression model
+        device: torch device
+
+    Returns:
+        List of predicted vectors (N, 2) as numpy arrays
+    """
+    preprocess = transforms.Compose(
+        [
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+        ]
+    )
+
+    vectors = []
+    model.eval()
+
+    with torch.no_grad():
+        for crop in crops:
+            img_tensor = preprocess(crop).unsqueeze(0).to(device)
+            pred = model(img_tensor).cpu().squeeze().numpy()
+            vectors.append(pred)
+
+    return np.array(vectors)  # (N, 2)
+
+
+def compute_circular_mean_with_outlier_rejection(vectors, outlier_threshold_deg=45.0):
+    """
+    Compute circular mean of shadow vectors with democratic outlier rejection.
+    Majority wins, minority is ignored.
+
+    Args:
+        vectors: Array of shadow vectors (N, 2)
+        outlier_threshold_deg: Reject vectors > this many degrees from median
+
+    Returns:
+        mean_vector: (2,) array - circular mean of inliers
+        n_inliers: Number of agreeing crops
+        n_outliers: Number of rejected outliers
+        circular_std: Circular standard deviation in degrees
+    """
+    # Convert vectors to angles
+    angles = np.arctan2(vectors[:, 0], vectors[:, 1])  # radians
+    angles_deg = np.degrees(angles) % 360
+
+    # Compute circular median as robust center estimate
+    # Use mean of sin and cos for circular median approximation
+    sin_mean = np.mean(np.sin(np.radians(angles_deg)))
+    cos_mean = np.mean(np.cos(np.radians(angles_deg)))
+    median_angle = np.degrees(np.arctan2(sin_mean, cos_mean)) % 360
+
+    # Compute circular distance from median
+    def circular_distance(a1, a2):
+        """Compute minimum angular distance between two angles."""
+        diff = np.abs(a1 - a2)
+        return np.minimum(diff, 360 - diff)
+
+    distances = circular_distance(angles_deg, median_angle)
+
+    # Democratic outlier rejection: keep predictions within threshold
+    inlier_mask = distances <= outlier_threshold_deg
+    n_inliers = inlier_mask.sum()
+    n_outliers = (~inlier_mask).sum()
+
+    if n_inliers == 0:
+        # All rejected (shouldn't happen with 45° threshold, but handle it)
+        # Fall back to using all
+        inlier_mask = np.ones(len(vectors), dtype=bool)
+        n_inliers = len(vectors)
+        n_outliers = 0
+
+    # Compute circular mean of inliers
+    inlier_angles_rad = angles[inlier_mask]
+    mean_sin = np.mean(np.sin(inlier_angles_rad))
+    mean_cos = np.mean(np.cos(inlier_angles_rad))
+    mean_angle_rad = np.arctan2(mean_sin, mean_cos)
+
+    # Convert to unit vector
+    mean_vector = np.array([np.sin(mean_angle_rad), np.cos(mean_angle_rad)])
+
+    # Compute circular standard deviation (measure of spread)
+    # R = length of mean vector (1 = perfect agreement, 0 = uniform spread)
+    R = np.sqrt(mean_sin**2 + mean_cos**2)
+    circular_std = np.degrees(np.sqrt(-2 * np.log(R))) if R > 0 else 180.0
+
+    return mean_vector, n_inliers, n_outliers, circular_std
+
+
+def predict_shadow_vector(
+    image, shadow_model_path, device, n_crops=30, outlier_threshold_deg=45.0
+):
+    """
+    Stage 0: Predict global shadow direction from orthomosaic.
+
+    Uses ResNet-34 shadow regression model to predict shadow vectors from
+    multiple random crops, then computes circular mean with outlier rejection.
+
+    Args:
+        image: RGB image as (H, W, 3) numpy array
+        shadow_model_path: Path to trained shadow model (.pth)
+        device: torch device
+        n_crops: Number of crops to sample (default 30)
+        outlier_threshold_deg: Outlier rejection threshold in degrees (default 45)
+
+    Returns:
+        shadow_vector: (2,) unit vector or None if prediction failed
+        stats: Dict with prediction statistics
+    """
+    print(f"\n🌞 Stage 0: Shadow Vector Prediction...")
+    print(f"   Sampling {n_crops} random 500×500 crops...")
+
+    # Import model class (inline to avoid external dependency)
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).parent / "solar" / "shadow_regression"))
+    from train_combined import ShadowResNet34
+
+    # Load model
+    model = ShadowResNet34()
+    model.load_state_dict(torch.load(shadow_model_path, map_location=device))
+    model.to(device)
+    model.eval()
+
+    # Extract crops
+    crops = extract_safe_crops(image, n_crops=n_crops)
+
+    if len(crops) == 0:
+        print("   ⚠️  Image too small for crop extraction")
+        return None, {"error": "image_too_small"}
+
+    if len(crops) < n_crops:
+        print(f"   ⚠️  Only extracted {len(crops)}/{n_crops} crops (image small)")
+
+    # Predict on each crop
+    print(f"   Running inference on {len(crops)} crops...")
+    vectors = predict_shadow_vector_from_crops(crops, model, device)
+
+    # Compute circular mean with outlier rejection
+    mean_vector, n_inliers, n_outliers, circular_std = (
+        compute_circular_mean_with_outlier_rejection(
+            vectors, outlier_threshold_deg=outlier_threshold_deg
+        )
+    )
+
+    # Convert to angle for logging
+    shadow_angle = math.degrees(math.atan2(mean_vector[0], mean_vector[1])) % 360
+
+    # Log consensus statistics
+    consensus_pct = (n_inliers / len(crops)) * 100
+    print(f"   ✅ Shadow direction: {shadow_angle:.1f}°")
+    print(
+        f"   📊 Consensus: {n_inliers}/{len(crops)} crops ({consensus_pct:.0f}%) | "
+        f"Rejected: {n_outliers} outliers"
+    )
+    print(f"   📏 Circular std: {circular_std:.1f}°")
+
+    # Prepare stats
+    stats = {
+        "shadow_angle_deg": shadow_angle,
+        "n_crops": len(crops),
+        "n_inliers": n_inliers,
+        "n_outliers": n_outliers,
+        "consensus_pct": consensus_pct,
+        "circular_std_deg": circular_std,
+        "shadow_vector": mean_vector.tolist(),
+    }
+
+    # Quality check: warn if low consensus
+    if consensus_pct < 70:
+        print(
+            f"   ⚠️  Low consensus ({consensus_pct:.0f}%) - predictions may be unreliable"
+        )
+        stats["reliable"] = False
+    else:
+        stats["reliable"] = True
+
+    return mean_vector, stats
+
+
+def detect_trees_deepforest(
+    image,
+    model_path=None,
+    shadow_vector=None,
+    tile_size=400,
+    tile_overlap=0.50,
+    confidence_threshold=0.35,
+    debug_tile_dir=None,
+    shadow_map_path=None,      # If set, write full-image shadow map as GeoTIFF here
+    geo_meta=None,             # (crs, transform) tuple for shadow map GeoTIFF
+    shadow_input_only=False,   # Ablation F: replace RGB with shadow map × 3 channels
+    abs_luma_max=None,         # Shadow map luma ceiling; None → default (71)
+):
+    """
+    Pass 1: Run DeepForest detection on 400px tiles.
+
+    Args:
+        image: RGB image as (H, W, 3) numpy array
+        model_path: Optional path to custom DeepForest model (.pth file)
+                   Auto-detects whether it's standard or FiLM-conditioned
+        shadow_vector: (1, 2) tensor representing shadow direction for FiLM-DeepForest
+        tile_size: Size of each tile (default 400px - DeepForest's native)
+        tile_overlap: Overlap between tiles (default 0.30 = 30%)
+        confidence_threshold: Minimum confidence score for detections
+
+    Returns:
+        all_bboxes: List of bounding boxes in global coordinates [xmin, ymin, xmax, ymax]
+        all_scores: List of confidence scores
+    """
+    import warnings
+    from deepforest import main as deepforest_main
+    from deepforest import utilities
+
+    print("\n🌲 Pass 1: DeepForest Detection...")
+
+    # Determine device
+    device = torch.device("cpu")
+    if torch.backends.mps.is_available():
+        device = torch.device("mps")
+    elif torch.cuda.is_available():
+        device = torch.device("cuda")
+
+    # Auto-detect model type if path provided
+    use_film = False
+    use_shadow_channel = False
+    use_sca = False
+
+    if model_path is not None and Path(model_path).exists():
+        print(f"   🔍 Inspecting model: {Path(model_path).name}")
+        try:
+            # Load checkpoint to CPU to inspect keys
+            checkpoint = torch.load(model_path, map_location="cpu")
+            if "state_dict" in checkpoint:
+                state_dict = checkpoint["state_dict"]
+            else:
+                state_dict = checkpoint
+            keys = state_dict.keys()
+
+            # Check for legacy FiLM specific keys or SCA
+            has_film_blocks = any("film_blocks" in k for k in keys)
+            use_sca = any("shadow_anticipation" in k or "shadow_encoder" in k or "shadow_cross_attn" in k for k in keys)
+
+            if has_film_blocks:
+                print("   ⚠️  Detected legacy FiLM-conditioned model")
+
+            # Detect shadow_channel by inspecting the saved conv1 weight shape directly.
+            saved_conv1 = state_dict.get("model.backbone.body.conv1.weight", state_dict.get("backbone.body.conv1.weight"))
+            use_shadow_channel = (saved_conv1 is not None and saved_conv1.shape[1] == 4)
+
+            # shadow_input_only (ablation F) has a standard 3-channel conv1 — can't be
+            # auto-detected from keys; caller must pass shadow_input_only=True explicitly.
+            use_film = use_shadow_channel or use_sca or has_film_blocks or shadow_input_only
+
+            if shadow_input_only:
+                print("   ✨ Shadow-input-only model (ablation F: RGB replaced by shadow × 3)")
+            elif use_shadow_channel and use_sca:
+                print("   ✨ Detected ShadowChannel + ShadowCrossAttention model")
+            elif use_shadow_channel:
+                print("   ✨ Detected ShadowChannel model")
+            elif use_sca:
+                print("   ✨ Detected ShadowCrossAttention model")
+            elif has_film_blocks:
+                print("   ✨ Detected legacy FiLM-conditioned model")
+            else:
+                print("   🌲 Detected Standard DeepForest model")
+
+        except Exception as e:
+            print(f"   ⚠️  Could not inspect model keys: {e}")
+            print("   Assuming Standard DeepForest model")
+            use_film = False
+            use_shadow_channel = False
+            use_sca = False
+
+    # Check if we have shadow vector for FiLM
+    if use_film and shadow_vector is None:
+        print("   ⚠️  Shadow-conditioned model detected but no shadow vector provided/predicted.")
+        print("   ⚠️  Falling back to base shadow vector (0, 0) or similar.")
+        # We'll see if the model handles None shadow_vector or if we need to provide a dummy one
+        # ShadowConditionedDeepForest typically requires it, or has default in forward
+        # Let's verify in models.py logic -> it has a base_shadow_vector
+        pass
+
+    if use_film:
+        print("   🌞 Using Shadow-conditioned DeepForest")
+        try:
+            from models import ShadowConditionedDeepForest
+        except ImportError as e:
+            print(f"❌ Error importing Shadow Conditioned model: {e}")
+            raise
+
+        # Initialize Shadow Conditioned model
+        df_model = ShadowConditionedDeepForest(
+            shadow_angle_deg=0.0,
+            shadow_channel=use_shadow_channel,
+            shadow_cross_attention=use_sca,
+            shadow_input_only=shadow_input_only
+        )
+
+        # Load weights
+        checkpoint = torch.load(model_path, map_location="cpu")
+        if "state_dict" in checkpoint:
+            state_dict = checkpoint["state_dict"]
+        else:
+            state_dict = checkpoint
+
+        # Already inspected use_shadow_channel above
+        if use_shadow_channel:
+            print("   🔑 Checkpoint conv1 has 4 input channels — widening model first conv")
+            try:
+                from train_deepforest import widen_first_conv_for_shadow_channel
+            except ImportError:
+                from train_deepforest import widen_first_conv_for_shadow_channel
+            widen_first_conv_for_shadow_channel(df_model)
+
+        # Try loading into full model first
+        try:
+            # Load with strict=False to allow missing aux_head weights (from older checkpoints)
+            # but we should still check if major components are missing
+            missing, unexpected = df_model.load_state_dict(state_dict, strict=False)
+            
+            # Filter out aux_head from missing keys, as it's optional for inference
+            critical_missing = [k for k in missing if not k.startswith("aux_head")]
+            
+            if critical_missing:
+                # If we're missing non-aux keys, that's a real problem
+                raise RuntimeError(f"Missing critical keys: {critical_missing}")
+                
+            if "aux_head.0.weight" in missing:
+                print("   ⚠️  Loaded weights without Auxiliary Head (legacy checkpoint). This is fine for inference.")
+            else:
+                print("   ✅ Loaded full ShadowConditionedDeepForest weights")
+                
+            if use_sca:
+                df_model._inject_sca_hook()
+                
+        except RuntimeError as e:
+            print(f"   ❌ Model load failed: {e}")
+            raise e
+
+        df_model.to(device)
+        df_model.eval()
+
+        # Bug 2 fix: derive shadow_angle (float degrees) from shadow_vector parameter
+        # so the tile loop can call generate_shadow_map(tile, shadow_angle).
+        shadow_angle = None
+        shadow_norm_stats = None   # (dg_scale, dark_scale, otsu_ctr) — computed once below
+        if shadow_vector is not None:
+            import math as _math
+            sv = shadow_vector
+            if hasattr(sv, "cpu"):
+                sv = sv.squeeze().cpu().numpy()
+            sv = np.array(sv, dtype=float).flatten()
+            shadow_angle = _math.degrees(_math.atan2(float(sv[0]), float(sv[1]))) % 360
+            print(f"   🌞 Shadow angle for tile shadow maps: {shadow_angle:.1f}°")
+        else:
+            print("   ⚠️  No shadow vector — will use zero shadow map for all tiles")
+
+    else:
+        print("   🌲 Using Standard DeepForest")
+        df_model = deepforest_main.deepforest()
+        shadow_angle = None
+        shadow_norm_stats = None
+
+        if model_path and Path(model_path).exists():
+            print(f"   Loading custom weights: {model_path}")
+            df_model.model.load_state_dict(torch.load(model_path, map_location="cpu"))
+        else:
+            print("   Loading default model from Hugging Face...")
+            df_model.load_model("weecology/deepforest-tree")
+
+        df_model.model.to(device)
+        df_model.model.eval()
+        use_shadow_channel = False   # standard DF never uses shadow channel
+
+    print(f"   🖥️  Device: {device}")
+
+    # Convert image to float32
+    if image.dtype == np.uint8:
+        image_float = image.astype("float32")
+    else:
+        image_float = image
+
+    h, w = image.shape[:2]
+    stride = int(tile_size * (1 - tile_overlap))
+
+    # Calculate tile count
+    num_tiles_y = max(1, (h - tile_size) // stride + 1) if h > tile_size else 1
+    num_tiles_x = max(1, (w - tile_size) // stride + 1) if w > tile_size else 1
+    total_tiles = num_tiles_y * num_tiles_x
+
+    print(f"   Image size: {w}x{h}")
+    print(f"   Tile size: {tile_size}px, overlap: {int(tile_overlap * 100)}%")
+    print(f"   Processing {total_tiles} tiles\n")
+
+    # Suppress warnings
+    warnings.filterwarnings("ignore", message=".*image_path.*")
+    warnings.filterwarnings("ignore", message=".*root_dir.*")
+
+    all_bboxes = []
+    all_scores = []
+    tile_count = 0
+    debug_tiles_saved = 0  # track how many non-nodata debug tiles saved
+
+    # Accumulation canvas for shadow map GeoTIFF (averaged over overlapping tiles)
+    shadow_canvas = np.zeros((h, w), dtype=np.float32)
+    shadow_weight = np.zeros((h, w), dtype=np.float32)
+
+    # Pre-compute global shadow normalization stats from the FULL image before tiling.
+    # This ensures every tile (shadow_channel and SCA) uses the same normalization
+    # scale, matching the semantics of foxtrot.py's full-orthomosaic inference.
+    if shadow_angle is not None and (use_shadow_channel or use_sca):
+        try:
+            from utils import compute_shadow_normalization_stats
+        except ImportError:
+            from deepforest_custom.utils import compute_shadow_normalization_stats  # type: ignore
+        shadow_norm_stats = compute_shadow_normalization_stats(image, shadow_angle)
+        dg_s, dark_s, otsu_s = shadow_norm_stats
+        dark_s_str = f"{dark_s:.1f}" if dark_s is not None else "N/A"
+        otsu_s_str = f"{otsu_s:.3f}" if otsu_s is not None else "N/A"
+        print(f"   📊 Global shadow norm stats: dg_scale={dg_s:.1f}  dark_scale={dark_s_str}  otsu_ctr={otsu_s_str}")
+        # Make global stats available to the shadow model's _compute_shadow_map_batch
+        if use_sca:
+            df_model.norm_stats_lookup = {None: shadow_norm_stats}
+
+    # Process tiles — ensure full coverage by clamping a final tile to the image edge
+    # if the strided range leaves a gap smaller than tile_size at the boundary.
+    def _make_starts(dim):
+        starts = list(range(0, dim, stride)) if dim > tile_size else [0]
+        if dim > tile_size:
+            clamped = dim - tile_size
+            if clamped not in starts:
+                starts.append(clamped)
+        return sorted(starts)
+
+    y_starts = _make_starts(h)
+    x_starts = _make_starts(w)
+
+    for y_start in tqdm(y_starts, desc="   DF tiles"):
+        for x_start in x_starts:
+            y_end = min(y_start + tile_size, h)
+            x_end = min(x_start + tile_size, w)
+
+            # Extract tile
+            tile = image_float[y_start:y_end, x_start:x_end]
+
+            # Skip very small edge tiles
+            if tile.shape[0] < 200 or tile.shape[1] < 200:
+                continue
+
+            tile_count += 1
+
+            # Run prediction
+            try:
+                # Prepare input tensor
+                image_tensor = torch.tensor(tile).permute(2, 0, 1).float() / 255.0
+
+                # Ablation F: replace RGB entirely with shadow map × 3 channels.
+                # Isolated from all other shadow logic — shadow_input_only and
+                # use_shadow_channel are mutually exclusive.
+                if shadow_input_only:
+                    try:
+                        from utils import generate_shadow_map
+                    except ImportError:
+                        from deepforest_custom.utils import generate_shadow_map  # type: ignore
+
+                    tile_u8 = tile.astype(np.uint8) if tile.dtype != np.uint8 else tile
+                    if shadow_angle is not None:
+                        dg_s, dark_s, otsu_s = shadow_norm_stats
+                        shadow_np = generate_shadow_map(tile_u8, shadow_angle,
+                                                        dg_scale=dg_s,
+                                                        dark_scale=dark_s,
+                                                        otsu_ctr=otsu_s,
+                                                        abs_luma_max=abs_luma_max)
+                    else:
+                        shadow_np = np.zeros(tile.shape[:2], dtype=np.float32)
+                    shadow_t = torch.from_numpy(shadow_np).unsqueeze(0).float()
+                    image_tensor = shadow_t.repeat(3, 1, 1)  # [3, H, W], RGB discarded
+
+                    # Accumulate into full-image shadow canvas
+                    if shadow_map_path is not None:
+                        th, tw = shadow_np.shape
+                        shadow_canvas[y_start:y_start+th, x_start:x_start+tw] += shadow_np
+                        shadow_weight[y_start:y_start+th, x_start:x_start+tw] += 1.0
+
+                # Prepend shadow map as 4th channel if model was trained with it.
+                # Bug 3 fix: always append the 4th channel when use_shadow_channel is True,
+                # using a zero map as a safe fallback if no shadow angle is available.
+                elif use_shadow_channel:
+                    try:
+                        from utils import generate_shadow_map
+                    except ImportError:
+                        from deepforest_custom.utils import generate_shadow_map  # type: ignore
+
+                    tile_u8 = tile.astype(np.uint8) if tile.dtype != np.uint8 else tile
+                    if shadow_angle is not None:
+                        dg_s, dark_s, otsu_s = shadow_norm_stats
+                        shadow_np = generate_shadow_map(tile_u8, shadow_angle,
+                                                        dg_scale=dg_s,
+                                                        dark_scale=dark_s,
+                                                        otsu_ctr=otsu_s,
+                                                        abs_luma_max=abs_luma_max)
+                    else:
+                        # No shadow vector predicted — zero map keeps tensor shape correct
+                        shadow_np = np.zeros(tile.shape[:2], dtype=np.float32)
+                    shadow_t = torch.from_numpy(shadow_np).unsqueeze(0).float()
+                    image_tensor = torch.cat([image_tensor, shadow_t], dim=0)
+
+                    # Accumulate into full-image shadow canvas
+                    if shadow_map_path is not None:
+                        th, tw = shadow_np.shape
+                        shadow_canvas[y_start:y_start+th, x_start:x_start+tw] += shadow_np
+                        shadow_weight[y_start:y_start+th, x_start:x_start+tw] += 1.0
+
+                image_tensor = image_tensor.to(device).unsqueeze(0)  # (1, C, H, W)
+
+                # ── Debug tile visualization (first 3 content tiles) ─────────
+                # Skip nodata tiles: GeoTIFF may fill nodata with 0 OR 255.
+                # Reject tiles that are near-uniform (std < 5) across all channels,
+                # which catches both all-black and all-white nodata regions.
+                _tile_std = tile.std()
+                _is_content_tile = _tile_std > 5.0
+                if (
+                    debug_tile_dir is not None
+                    and (use_shadow_channel or shadow_input_only)
+                    and debug_tiles_saved < 3
+                    and _is_content_tile
+                ):
+                    import matplotlib
+                    matplotlib.use("Agg")
+                    import matplotlib.pyplot as plt
+                    import matplotlib.patches as mpatches
+
+                    Path(debug_tile_dir).mkdir(parents=True, exist_ok=True)
+
+                    # Reconstruct numpy arrays for plotting
+                    # tile is float32 [0..255]; clamp + cast safely for imshow
+                    tile_rgb_plot = np.clip(tile, 0, 255).astype(np.uint8)
+                    shadow_map_plot = shadow_np  # float32 H×W in [0, 1]
+
+                    fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+                    fig.suptitle(
+                        f"Tile #{tile_count}  ({x_start},{y_start})  "
+                        f"shadow_angle={'%.1f°' % shadow_angle if shadow_angle is not None else 'zero (no vector)'}",
+                        fontsize=11,
+                    )
+
+                    # Left: RGB tile with shadow direction arrow
+                    axes[0].imshow(tile_rgb_plot)
+                    axes[0].set_title("RGB tile + shadow direction")
+                    axes[0].axis("off")
+                    if shadow_angle is not None:
+                        import math as _math
+                        h_t, w_t = tile_rgb_plot.shape[:2]
+                        cx, cy = w_t / 2, h_t / 2
+                        rad = _math.radians(shadow_angle)
+                        # shadow_angle: 0=North(up), 90=East(right), CW
+                        dx =  _math.sin(rad) * (w_t * 0.35)
+                        dy = -_math.cos(rad) * (h_t * 0.35)  # y-axis flipped in image
+                        axes[0].annotate(
+                            "",
+                            xy=(cx + dx, cy + dy),
+                            xytext=(cx - dx, cy - dy),
+                            arrowprops=dict(arrowstyle="->", color="yellow", lw=2.5),
+                        )
+                        axes[0].text(
+                            cx + dx + 5, cy + dy - 5,
+                            f"{shadow_angle:.0f}°",
+                            color="yellow", fontsize=9, fontweight="bold",
+                        )
+
+                    # Right: shadow map channel (4th channel)
+                    im = axes[1].imshow(shadow_map_plot, cmap="gray", vmin=0, vmax=1)
+                    axes[1].set_title("4th channel: shadow map")
+                    axes[1].axis("off")
+                    fig.colorbar(im, ax=axes[1], fraction=0.046, pad=0.04)
+
+                    debug_path = Path(debug_tile_dir) / f"tile_{tile_count:03d}_{x_start}_{y_start}.png"
+                    fig.savefig(str(debug_path), dpi=120, bbox_inches="tight")
+                    plt.close(fig)
+                    print(f"   📸 Saved debug tile viz → {debug_path}")
+                    debug_tiles_saved += 1
+                # ─────────────────────────────────────────────────────────────
+
+                # Inference
+                with torch.no_grad():
+                    if use_sca:
+                        # Prepare shadow encoding for the cross-attention hook if needed
+                        if shadow_vector is not None:
+                            sv = shadow_vector
+                            if hasattr(sv, "cpu"):
+                                sv = sv.squeeze().cpu().numpy()
+                            # Key fix: sv_np must be [x, y] to be correctly used inside models.py,
+                            # not just flattened into a list if it already was.
+                            # It is later used as: sv = np.array([np.sin(angle), np.cos(angle)])
+                            sv_np = np.array(sv, dtype=np.float32).flatten()
+                            df_model.shadow_lookup = {None: sv_np}
+                        else:
+                            df_model.shadow_lookup = {}
+                        tile_img = [image_tensor[0, :3, :, :]]
+                        df_model._current_shadow_map = df_model._compute_shadow_map_batch(tile_img, [None])
+                        df_model._current_shadow_dir = df_model._compute_shadow_dir_batch(tile_img, [None])
+
+                    prediction = df_model.model(image_tensor)
+
+                # Post-process
+                if len(prediction[0]["boxes"]) > 0:
+                    tile_preds = utilities.format_boxes(prediction[0])
+                    tile_preds = tile_preds[tile_preds["score"] >= confidence_threshold]
+                else:
+                    tile_preds = None
+
+            except Exception as e:
+                print(f"❌ Error on tile ({x_start},{y_start}): {e}")
+                continue
+
+            if tile_preds is None or len(tile_preds) == 0:
+                continue
+
+            # Convert local boxes to global coordinates
+            for _, row in tile_preds.iterrows():
+                global_box = [
+                    row["xmin"] + x_start,
+                    row["ymin"] + y_start,
+                    row["xmax"] + x_start,
+                    row["ymax"] + y_start,
+                ]
+                all_bboxes.append(global_box)
+                all_scores.append(row["score"])
+
+    warnings.filterwarnings("default")
+
+    print(f"\n✅ DeepForest: {tile_count} tiles, {len(all_bboxes)} detections")
+
+    # ── Write shadow map GeoTIFF ─────────────────────────────────────────────
+    if shadow_map_path is not None and shadow_weight.max() > 0:
+        # Average overlapping tile contributions
+        with np.errstate(invalid="ignore"):
+            shadow_out = np.where(shadow_weight > 0, shadow_canvas / shadow_weight, 0).astype(np.float32)
+
+        import rasterio
+        from rasterio.transform import from_bounds as _from_bounds
+
+        Path(shadow_map_path).parent.mkdir(parents=True, exist_ok=True)
+        crs_out, transform_out = (geo_meta or (None, None))
+
+        profile = dict(
+            driver="GTiff",
+            dtype="float32",
+            width=w,
+            height=h,
+            count=1,
+            compress="lzw",
+        )
+        if crs_out:
+            profile["crs"] = crs_out
+        if transform_out is not None:
+            profile["transform"] = transform_out
+
+        with rasterio.open(shadow_map_path, "w", **profile) as dst:
+            dst.write(shadow_out[np.newaxis, ...])
+
+        print(f"   🗺️  Shadow map GeoTIFF → {shadow_map_path}")
+
+        # ── Companion PNG: shadow map + bounding boxes ─────────────────────
+        if all_bboxes:
+            import matplotlib.pyplot as _plt
+            import matplotlib.patches as _patches
+            from matplotlib.colors import Normalize as _Norm
+            from matplotlib.cm import ScalarMappable as _SM
+
+            dpi = 150
+            fig, ax = _plt.subplots(figsize=(w / dpi, h / dpi), dpi=dpi)
+            ax.imshow(shadow_out, cmap="gray", vmin=0, vmax=1, interpolation="nearest")
+            ax.set_axis_off()
+
+            cmap_boxes = _plt.get_cmap("RdYlGn")
+            norm = _Norm(vmin=0.35, vmax=1.0)
+            for (x1, y1, x2, y2), sc in zip(all_bboxes, all_scores):
+                color = cmap_boxes(norm(sc))
+                rect = _patches.Rectangle(
+                    (x1, y1), x2 - x1, y2 - y1,
+                    linewidth=0.6, edgecolor=color, facecolor="none", alpha=0.85,
+                )
+                ax.add_patch(rect)
+
+            viz_path = str(shadow_map_path).replace(".tif", "_viz.png")
+            _plt.savefig(viz_path, bbox_inches="tight", pad_inches=0, dpi=dpi)
+            _plt.close(fig)
+            print(f"   🖼️  Shadow map + boxes → {viz_path}")
+
+    return all_bboxes, all_scores
+
+
+def segment_trees_sam(
+    image,
+    sam_predictor,
+    bboxes,
+    scores,
+    tile_size=1024,
+    tile_overlap=0.5,
+    cache_dir=None,
+    batch_size=500,
+    sam_mode="best_tile",
+    containment_threshold=0.8,
+    bbox_pad=0.0,
+    skip_nms=False,
+):
+    """
+    Pass 2: Run SAM segmentation on 1024px tiles with batched bboxes.
+
+    Args:
+        image: RGB image as (H, W, 3) numpy array (uint8)
+        sam_predictor: Initialized SamPredictor
+        bboxes: List of bounding boxes in global coordinates
+        scores: List of confidence scores
+        tile_size: Size of SAM tiles (default 1024px - SAM's native)
+        tile_overlap: Overlap between tiles (default 0.1 = 10% prevents edge clipping)
+        cache_dir: Directory for caching masks (temp dir if None)
+        batch_size: Number of masks per cache file
+
+    Returns:
+        cache_files: List of paths to cached mask files
+        final_bboxes: List of bounding boxes (post-NMS)
+        final_scores: List of confidence scores (post-NMS)
+    """
+    print("\n🎯 Pass 2: SAM Segmentation...")
+
+    h, w = image.shape[:2]
+    stride = int(tile_size * (1 - tile_overlap))
+
+    # Create cache directory
+    if cache_dir is None:
+        cache_dir = tempfile.mkdtemp(prefix="foxtrot_cache_")
+        print(f"   Created temp cache: {cache_dir}")
+    else:
+        cache_dir = Path(cache_dir)
+        cache_dir.mkdir(exist_ok=True, parents=True)
+    cache_dir = Path(cache_dir)
+
+    # Calculate tile count
+    num_tiles_y = max(1, (h - tile_size) // stride + 1) if h > tile_size else 1
+    num_tiles_x = max(1, (w - tile_size) // stride + 1) if w > tile_size else 1
+    total_tiles = num_tiles_y * num_tiles_x
+
+    print(f"   Tile size: {tile_size}px (SAM native)")
+    print(f"   Processing {total_tiles} tiles with {len(bboxes)} boxes\n")
+
+    # Pre-compute box centers for tile assignment
+    box_centers = [((b[0] + b[2]) / 2, (b[1] + b[3]) / 2) for b in bboxes]
+
+    # Track which boxes have been processed
+    processed_boxes = set()
+    all_masks = []
+    all_processed_bboxes = []
+    all_processed_scores = []
+    all_tile_bounds = []  # Store tile bounds for sparse mask reconstruction
+    cache_files = []
+
+    total_boxes = len(bboxes)
+    tiles_with_boxes = 0
+
+    if sam_mode == "per_box":
+        # Per-box mode: for each detection, crop a tile_size×tile_size region
+        # centered on the box so SAM always sees the full crown.
+        # Group boxes that share the same crop to batch set_image() calls.
+        from collections import defaultdict as _dd
+        crop_groups = _dd(list)
+        for i, (cx, cy) in enumerate(box_centers):
+            xs = max(0, min(int(cx - tile_size // 2), max(0, w - tile_size)))
+            ys = max(0, min(int(cy - tile_size // 2), max(0, h - tile_size)))
+            crop_groups[(xs, ys)].append(i)
+        print(f"   SAM mode: per_box  ({len(crop_groups)} unique crops for {total_boxes} boxes)")
+        tile_iter = [
+            (xs, ys, min(xs + tile_size, w), min(ys + tile_size, h), idxs)
+            for (xs, ys), idxs in sorted(crop_groups.items())
+        ]
+    else:
+        # Grid mode: regular tiled scan with overlap
+        def _make_starts(dim):
+            starts = list(range(0, dim, stride)) if dim > tile_size else [0]
+            if dim > tile_size and starts[-1] + tile_size < dim:
+                starts.append(dim - tile_size)
+            return starts
+        y_starts = _make_starts(h)
+        x_starts = _make_starts(w)
+        overlap_pct = tile_overlap * 100
+
+        all_tiles = [
+            (xs, ys, min(xs + tile_size, w), min(ys + tile_size, h))
+            for ys in y_starts for xs in x_starts
+        ]
+
+        if sam_mode == "best_tile":
+            # Assign each box to the tile where the largest fraction of the box is contained
+            print(f"   SAM mode: best_tile  tile_overlap={overlap_pct:.0f}%")
+            from collections import defaultdict as _dd
+            tile_to_boxes = _dd(list)
+            for i, box in enumerate(bboxes):
+                bw = box[2] - box[0]; bh = box[3] - box[1]
+                box_area = bw * bh
+                best_tile, best_frac = None, -1.0
+                for tile in all_tiles:
+                    xs, ys, xe, ye = tile
+                    ix0 = max(box[0], xs); iy0 = max(box[1], ys)
+                    ix1 = min(box[2], xe); iy1 = min(box[3], ye)
+                    frac = (max(0, ix1-ix0) * max(0, iy1-iy0)) / box_area if box_area > 0 else 0
+                    if frac > best_frac:
+                        best_frac, best_tile = frac, tile
+                if best_tile is not None:
+                    tile_to_boxes[best_tile].append(i)
+                    processed_boxes.add(i)
+            tile_iter = [
+                (xs, ys, xe, ye, idxs)
+                for (xs, ys, xe, ye), idxs in tile_to_boxes.items()
+                if idxs
+            ]
+        else:
+            # Default grid: assign box to first tile whose region contains the box centre
+            print(f"   SAM mode: grid  tile_overlap={overlap_pct:.0f}%")
+            tile_iter = []
+            for xs, ys, xe, ye in all_tiles:
+                idxs = []
+                for i, (cx, cy) in enumerate(box_centers):
+                    if i not in processed_boxes and xs <= cx < xe and ys <= cy < ye:
+                        idxs.append(i)
+                        processed_boxes.add(i)
+                if idxs:
+                    tile_iter.append((xs, ys, xe, ye, idxs))
+
+    for x_start, y_start, x_end, y_end, tile_box_indices in tqdm(tile_iter, desc="   SAM tiles"):
+        # Re-add to processed_boxes for per_box mode (grid mode already populated it above)
+        if sam_mode == "per_box":
+            processed_boxes.update(tile_box_indices)
+
+        if not tile_box_indices:
+            continue
+
+        tiles_with_boxes += 1
+
+        # Extract tile at NATIVE 1024px (no padding/resizing)
+        tile_rgb = image[y_start:y_end, x_start:x_end]
+
+        # Progress logging
+        pct = len(processed_boxes) / total_boxes * 100
+        print(
+            f"   Tile ({x_start},{y_start}): {len(tile_box_indices)} boxes "
+            f"| {len(processed_boxes)}/{total_boxes} total ({pct:.0f}%)"
+        )
+
+        # Set SAM image (expensive - done once per tile)
+        sam_predictor.set_image(tile_rgb)
+
+        # Convert global boxes to tile-relative coordinates, with optional padding
+        local_boxes = []
+        padded_global_boxes = []
+        for i in tile_box_indices:
+            box = bboxes[i]
+            bw = box[2] - box[0]
+            bh = box[3] - box[1]
+            pad_x = bw * bbox_pad
+            pad_y = bh * bbox_pad
+            local_box = [
+                max(0, box[0] - x_start - pad_x),
+                max(0, box[1] - y_start - pad_y),
+                min(tile_rgb.shape[1], box[2] - x_start + pad_x),
+                min(tile_rgb.shape[0], box[3] - y_start + pad_y),
+            ]
+            local_boxes.append(local_box)
+            padded_global_boxes.append([
+                max(0, box[0] - pad_x),
+                max(0, box[1] - pad_y),
+                min(w, box[2] + pad_x),
+                min(h, box[3] + pad_y),
+            ])
+
+        # Transform boxes for SAM
+        transformed_boxes = sam_predictor.transform.apply_boxes_torch(
+            torch.as_tensor(
+                local_boxes, device=sam_predictor.device, dtype=torch.float32
+            ),
+            tile_rgb.shape[:2],
+        )
+
+        # Run SAM batch prediction with multiple mask options
+        try:
+            masks, iou_preds, _ = sam_predictor.predict_torch(
+                point_coords=None,
+                point_labels=None,
+                boxes=transformed_boxes,
+                multimask_output=True,  # Get 3 mask candidates per box
+            )
+            # masks: (N, 3, tile_H, tile_W)
+            all_masks_np = masks.cpu().numpy()
+        except Exception as e:
+            print(f"⚠️  SAM failed on tile ({x_start}, {y_start}): {e}")
+            continue
+
+        # For each box, select the mask with best overlap with bbox
+        tile_h, tile_w = tile_rgb.shape[:2]
+        mask_h, mask_w = all_masks_np.shape[2], all_masks_np.shape[3]
+        scale_x = mask_w / tile_w
+        scale_y = mask_h / tile_h
+
+        for mask_idx, (box_idx, local_box) in enumerate(
+            zip(tile_box_indices, local_boxes)
+        ):
+            x1 = int(local_box[0] * scale_x)
+            y1 = int(local_box[1] * scale_y)
+            x2 = int(local_box[2] * scale_x)
+            y2 = int(local_box[3] * scale_y)
+
+            # Clamp to mask bounds
+            y1_c, x1_c = max(0, y1), max(0, x1)
+            y2_c, x2_c = min(mask_h, y2), min(mask_w, x2)
+
+            # Select mask with highest overlap with bbox
+            best_mask = None
+            best_overlap = -1
+            for m_idx in range(all_masks_np.shape[1]):
+                candidate = all_masks_np[mask_idx, m_idx]
+                overlap = candidate[y1_c:y2_c, x1_c:x2_c].sum()
+                if overlap > best_overlap:
+                    best_overlap = overlap
+                    best_mask = candidate
+
+            if best_mask is None or best_overlap == 0:
+                continue
+
+            # Isolate only the connected component that overlaps with bbox
+            # (finetuned model predicts multiple trees, we want just the one)
+            mask_uint8 = best_mask.astype(np.uint8)
+            num_labels, labels = cv2.connectedComponents(mask_uint8)
+
+            # Find which component overlaps with bbox
+            bbox_labels = labels[y1_c:y2_c, x1_c:x2_c]
+            overlapping_labels = set(bbox_labels.flatten()) - {0}
+
+            if not overlapping_labels:
+                continue
+
+            # Keep only the largest overlapping component
+            best_label = None
+            best_size = 0
+            for lbl in overlapping_labels:
+                size = (labels == lbl).sum()
+                if size > best_size:
+                    best_size = size
+                    best_label = lbl
+
+            # Create filtered mask with only the selected component
+            filtered_mask = labels == best_label
+
+            all_masks.append(filtered_mask)
+            all_processed_bboxes.append(bboxes[box_idx])
+            all_processed_scores.append(scores[box_idx])
+            all_tile_bounds.append((y_start, y_end, x_start, x_end, h, w))
+
+        # Flush to disk periodically
+        if len(all_masks) >= batch_size:
+            batch_file = cache_dir / f"batch_{len(cache_files):04d}.npz"
+            # Create object array for variable-shaped masks
+            masks_arr = np.empty(len(all_masks), dtype=object)
+            for i, m in enumerate(all_masks):
+                masks_arr[i] = m
+            np.savez_compressed(
+                batch_file,
+                masks=masks_arr,
+                bboxes=np.array(all_processed_bboxes, dtype=np.float32),
+                bounds=np.array(all_tile_bounds, dtype=np.int32),
+            )
+            cache_files.append(batch_file)
+            mb = batch_file.stat().st_size / (1024**2)
+            print(f"   💾 Cached {len(all_masks)} masks ({mb:.1f}MB)")
+            all_masks = []
+            all_processed_bboxes = []
+            all_tile_bounds = []
+
+    # Flush remaining
+    if len(all_masks) > 0:
+        batch_file = cache_dir / f"batch_{len(cache_files):04d}.npz"
+        masks_arr = np.empty(len(all_masks), dtype=object)
+        for i, m in enumerate(all_masks):
+            masks_arr[i] = m
+        np.savez_compressed(
+            batch_file,
+            masks=masks_arr,
+            bboxes=np.array(all_processed_bboxes, dtype=np.float32),
+            bounds=np.array(all_tile_bounds, dtype=np.int32),
+        )
+        cache_files.append(batch_file)
+        mb = batch_file.stat().st_size / (1024**2)
+        print(f"   💾 Cached final {len(all_masks)} masks ({mb:.1f}MB)")
+
+    # Results summary
+    # Check for unprocessed boxes (edge cases)
+    unprocessed = len(bboxes) - len(processed_boxes)
+    if unprocessed > 0:
+        print(f"   ⚠️  {unprocessed} boxes not processed (outside tile bounds)")
+
+    print(f"\n✅ SAM: {len(processed_boxes)} trees segmented")
+    print(f"   Results cached in {len(cache_files)} files")
+
+    # Load bboxes for NMS
+    all_bboxes_loaded = []
+    for cf in cache_files:
+        with np.load(cf) as data:
+            all_bboxes_loaded.extend(data["bboxes"].tolist())
+
+    # Apply NMS (skip if requested)
+    if skip_nms:
+        print(f"\n⚠️  SAM-stage NMS skipped: keeping all {len(all_bboxes_loaded)} detections")
+        keep_indices = list(range(len(all_bboxes_loaded)))
+    else:
+        print("\n🔄 Applying NMS (IoU=0.5, coverage=0.5)...")
+        keep_indices = apply_nms(
+            all_bboxes_loaded,
+            all_processed_scores,
+            iou_threshold=0.5,
+            coverage_threshold=0.5,
+        )
+        removed = len(all_bboxes_loaded) - len(keep_indices)
+        print(f"   Removed {removed} overlapping detections")
+
+        if containment_threshold:
+            nms_bboxes = [all_bboxes_loaded[i] for i in keep_indices]
+            nms_scores = [all_processed_scores[i] for i in keep_indices]
+            keep2 = apply_containment_suppression(nms_bboxes, containment_threshold)
+            before = len(keep_indices)
+            keep_indices = [keep_indices[i] for i in keep2]
+            print(f"   Containment suppression (thr={containment_threshold}): "
+                  f"removed {before - len(keep_indices)} nested boxes")
+
+    keep_set = set(keep_indices)
+    print(f"   Keeping {len(keep_indices)} unique trees")
+
+    # Filter results
+    final_bboxes = [all_bboxes_loaded[i] for i in keep_indices]
+    final_scores = [all_processed_scores[i] for i in keep_indices]
+
+    # Stream sparse masks to new cache files (memory-efficient)
+    # Build mapping from global index to position in final output
+    keep_order = {idx: pos for pos, idx in enumerate(keep_indices)}
+
+    print("   Filtering and re-caching sparse masks...")
+
+    # Streaming approach: read and write in batches
+    new_cache_files = []
+    current_batch_masks = []
+    current_batch_bboxes = []
+    current_batch_bounds = []
+    masks_written = 0
+
+    global_idx = 0
+    for cf in cache_files:
+        with np.load(cf, allow_pickle=True) as data:
+            masks = data["masks"]
+            bounds = data["bounds"]
+            for local_idx in range(len(masks)):
+                if global_idx in keep_set:
+                    pos = keep_order[global_idx]
+                    current_batch_masks.append((pos, masks[local_idx]))
+                    current_batch_bboxes.append((pos, final_bboxes[pos]))
+                    current_batch_bounds.append((pos, bounds[local_idx]))
+
+                    # Flush batch when full
+                    if len(current_batch_masks) >= batch_size:
+                        # Sort by position within batch
+                        current_batch_masks.sort(key=lambda x: x[0])
+                        current_batch_bboxes.sort(key=lambda x: x[0])
+                        current_batch_bounds.sort(key=lambda x: x[0])
+
+                        batch_file = cache_dir / f"nms_{len(new_cache_files):04d}.npz"
+                        masks_arr = np.empty(len(current_batch_masks), dtype=object)
+                        for i, (_, m) in enumerate(current_batch_masks):
+                            masks_arr[i] = m
+                        np.savez_compressed(
+                            batch_file,
+                            masks=masks_arr,
+                            bboxes=np.array(
+                                [b for _, b in current_batch_bboxes], dtype=np.float32
+                            ),
+                            bounds=np.array(
+                                [b for _, b in current_batch_bounds], dtype=np.int32
+                            ),
+                        )
+                        new_cache_files.append(batch_file)
+                        masks_written += len(current_batch_masks)
+                        print(
+                            f"   💾 Saved batch {len(new_cache_files)}: "
+                            f"{masks_written}/{len(keep_indices)}"
+                        )
+                        current_batch_masks = []
+                        current_batch_bboxes = []
+                        current_batch_bounds = []
+
+                global_idx += 1
+
+    # Flush remaining
+    if current_batch_masks:
+        current_batch_masks.sort(key=lambda x: x[0])
+        current_batch_bboxes.sort(key=lambda x: x[0])
+        current_batch_bounds.sort(key=lambda x: x[0])
+
+        batch_file = cache_dir / f"nms_{len(new_cache_files):04d}.npz"
+        masks_arr = np.empty(len(current_batch_masks), dtype=object)
+        for i, (_, m) in enumerate(current_batch_masks):
+            masks_arr[i] = m
+        np.savez_compressed(
+            batch_file,
+            masks=masks_arr,
+            bboxes=np.array([b for _, b in current_batch_bboxes], dtype=np.float32),
+            bounds=np.array([b for _, b in current_batch_bounds], dtype=np.int32),
+        )
+        new_cache_files.append(batch_file)
+        masks_written += len(current_batch_masks)
+        print(f"   💾 Saved final batch: {masks_written}/{len(keep_indices)}")
+
+    # Clear old cache files
+    for old_file in cache_files:
+        old_file.unlink(missing_ok=True)
+
+    return new_cache_files, final_bboxes, final_scores
+
+
+def load_masks_from_cache(cache_files):
+    """
+    Generator to load masks from cache files one at a time.
+    Reconstructs full-image masks from sparse format on-demand.
+
+    Args:
+        cache_files: List of cache file paths
+
+    Yields:
+        (mask, bbox): Full-size binary mask array and its paired bbox [x1,y1,x2,y2].
+                      Bbox is read from the cache file so it is always correctly
+                      aligned with the mask (they were sorted together during NMS).
+    """
+    for cache_file in cache_files:
+        with np.load(cache_file, allow_pickle=True) as data:
+            masks  = data["masks"]
+            bounds = data["bounds"]
+            bboxes = data["bboxes"]
+            for local_mask, bound, det_bbox in zip(masks, bounds, bboxes):
+                y_start, y_end, x_start, x_end, h, w = bound
+                full_mask = np.zeros((h, w), dtype=bool)
+                full_mask[y_start:y_end, x_start:x_end] = local_mask
+                yield full_mask, det_bbox.tolist()
+
+
+def mask_to_polygon(mask, simplify_tolerance=1.0):
+    """
+    Convert binary mask to polygon coordinates.
+
+    Args:
+        mask: Binary mask (H, W)
+        simplify_tolerance: Tolerance for polygon simplification
+
+    Returns:
+        Polygon coordinates or None if conversion fails
+    """
+    mask_uint8 = mask.astype(np.uint8) * 255
+    contours, _ = cv2.findContours(
+        mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+
+    if not contours:
+        return None
+
+    # Use the largest contour
+    largest_contour = max(contours, key=cv2.contourArea)
+
+    # Check minimum area
+    area = cv2.contourArea(largest_contour)
+    if area < 50:  # Minimum 50 pixels
+        return None
+
+    # Convert contour to polygon
+    if len(largest_contour) < 3:
+        return None
+
+    # Reshape contour to polygon coordinates
+    coords = largest_contour.reshape(-1, 2).tolist()
+
+    # Close the polygon
+    if coords[0] != coords[-1]:
+        coords.append(coords[0])
+
+    # Create Shapely polygon and simplify
+    poly = Polygon(coords)
+    if simplify_tolerance > 0:
+        poly = poly.simplify(simplify_tolerance, preserve_topology=True)
+
+    return poly
+
+
+def save_results(
+    cache_files, bboxes, deepforest_scores, output_dir, tif_stem, crs=None,
+    poly_containment_threshold=0.9,
+):
+    """
+    Save segmentation results as GeoJSON and visualization.
+    Loads masks from cache to minimize memory usage.
+
+    Args:
+        cache_files: List of cache file paths containing masks
+        bboxes: List of bounding boxes
+        deepforest_scores: DeepForest confidence scores
+        output_dir: Output directory path
+        tif_stem: Stem name of input TIF file
+        crs: Coordinate reference system
+        poly_containment_threshold: Remove any polygon whose area is >=this
+            fraction covered by the union of all larger polygons (default 0.9).
+            Set to 0 to disable.
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Build polygon list from all masks first so we can run containment on polygons.
+    from shapely.strtree import STRtree as _STRtree
+    from shapely.validation import make_valid as _make_valid
+
+    mask_generator = load_masks_from_cache(cache_files)
+    raw = []  # (polygon, score, det_bbox)
+    for i, score in enumerate(deepforest_scores):
+        mask, bbox = next(mask_generator)
+        polygon = mask_to_polygon(mask)
+        raw.append((polygon, float(score), list(bbox)))
+
+    # Polygon-level containment suppression: remove small polygons whose area
+    # is >=poly_containment_threshold covered by a single larger polygon.
+    if poly_containment_threshold > 0:
+        valid_polys = [
+            (p if p.is_valid else _make_valid(p)) if p is not None else None
+            for p, _, _ in raw
+        ]
+        areas = [p.area if p is not None else 0.0 for p in valid_polys]
+        to_remove = set()
+        # Build STRtree over all non-None polys for fast candidate lookup
+        idx_map = [i for i, p in enumerate(valid_polys) if p is not None]
+        if idx_map:
+            tree = _STRtree([valid_polys[i] for i in idx_map])
+            for i, p in enumerate(valid_polys):
+                if p is None or i in to_remove:
+                    continue
+                candidates = tree.query(p, predicate="intersects")
+                for c in candidates:
+                    j = idx_map[c]
+                    if j == i or j in to_remove:
+                        continue
+                    if areas[j] <= areas[i]:
+                        continue
+                    inter = p.intersection(valid_polys[j]).area
+                    if areas[i] > 0 and inter / areas[i] >= poly_containment_threshold:
+                        to_remove.add(i)
+                        break
+        if to_remove:
+            print(f"   Polygon containment suppression (thr={poly_containment_threshold}): "
+                  f"removed {len(to_remove)} nested polygons")
+        raw = [(p, s, b) for k, (p, s, b) in enumerate(raw) if k not in to_remove]
+
+    # Convert to GeoJSON features
+    features = []
+    for i, (polygon, score, det_bbox) in enumerate(raw):
+        if polygon is None:
+            continue
+        feature = {
+            "type": "Feature",
+            "id": i,
+            "properties": {
+                "tree_id": i,
+                "deepforest_score": score,
+                "area_pixels": float(polygon.area),
+                "det_bbox": det_bbox,
+            },
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": [list(polygon.exterior.coords)],
+            },
+        }
+        features.append(feature)
+
+    # Create GeoJSON FeatureCollection
+    geojson = {
+        "type": "FeatureCollection",
+        "features": features,
+        "crs": {
+            "type": "name",
+            "properties": {"name": str(crs) if crs else "EPSG:4326"},
+        },
+    }
+
+    # Save GeoJSON
+    output_geojson_path = output_dir / f"{tif_stem}_canopyai.geojson"
+    print(f"\n💾 Saving GeoJSON to {output_geojson_path}...")
+    with open(output_geojson_path, "w") as f:
+        json.dump(geojson, f, indent=2)
+
+    print(f"✅ Saved {len(features)} tree segmentations")
+
+    return output_geojson_path, features
+
+
+def _process_mask_batch(args):
+    """Worker function to extract contours from a batch of masks."""
+    masks, bounds, smooth_masks = args
+    results = []
+    for local_mask, bound in zip(masks, bounds):
+        y_start, y_end, x_start, x_end, h, w = bound
+        mask_uint8 = local_mask.astype(np.uint8) * 255
+
+        # Optional smoothing
+        if smooth_masks:
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+            mask_uint8 = cv2.morphologyEx(mask_uint8, cv2.MORPH_CLOSE, kernel)
+            mask_uint8 = cv2.morphologyEx(mask_uint8, cv2.MORPH_OPEN, kernel)
+
+        contours, _ = cv2.findContours(
+            mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+
+        # Offset contours to global coordinates
+        offset_contours = []
+        for cnt in contours:
+            offset_cnt = cnt.copy()
+            offset_cnt[:, :, 0] += x_start
+            offset_cnt[:, :, 1] += y_start
+            offset_contours.append(offset_cnt)
+
+        results.append(offset_contours)
+    return results
+
+
+def create_visualization(
+    image, cache_files, bboxes, scores, output_dir, tif_stem, smooth_masks=False
+):
+    """
+    Create visualization showing both bounding boxes and segmentation masks.
+    Uses parallel processing for contour extraction.
+
+    Args:
+        image: RGB image
+        cache_files: List of cache file paths containing masks
+        bboxes: List of bounding boxes
+        scores: List of confidence scores
+        output_dir: Output directory
+        tif_stem: Stem name of input TIF file
+        smooth_masks: Apply morphological smoothing to noisy masks
+    """
+    import multiprocessing as mp
+    import platform
+
+    # Use 'spawn' on macOS to avoid fork issues (audio glitches, resource copying)
+    if platform.system() == "Darwin":
+        ctx = mp.get_context("spawn")
+    else:
+        ctx = mp.get_context("fork")
+
+    print("\n🎨 Creating visualization...")
+
+    vis_image = image.copy()
+
+    # Colors
+    polygon_color = (11, 89, 214)  # Steel blue for SAM polygon contours
+
+    # Confidence colour map: red (low) → yellow → green (high), range [0.35, 1.0]
+    import matplotlib.cm as _cm
+    import matplotlib.colors as _mcolors
+    _cmap = _cm.get_cmap("RdYlGn")
+    _cnorm = _mcolors.Normalize(vmin=0.35, vmax=1.0)
+
+    def _score_color_rgb(sc):
+        r, g, b, _ = _cmap(_cnorm(sc))
+        return (int(r * 255), int(g * 255), int(b * 255))  # RGB (image array is RGB)
+
+    # Font settings for confidence labels
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.4
+    font_thickness = 1
+
+    # First pass: Draw all bboxes and labels (fast)
+    print("   Drawing bounding boxes...")
+    for bbox, score in zip(bboxes, scores):
+        xmin, ymin, xmax, ymax = [int(c) for c in bbox]
+        bbox_color = _score_color_rgb(score)
+        cv2.rectangle(vis_image, (xmin, ymin), (xmax, ymax), bbox_color, 1)
+
+        # Draw confidence label above bbox
+        conf_text = f"{score * 100:.0f}%"
+        text_size = cv2.getTextSize(conf_text, font, font_scale, font_thickness)[0]
+        text_x = xmin
+        text_y = max(ymin - 4, text_size[1] + 2)
+
+        # Background rectangle for text readability
+        cv2.rectangle(
+            vis_image,
+            (text_x - 1, text_y - text_size[1] - 2),
+            (text_x + text_size[0] + 1, text_y + 2),
+            (0, 0, 0),
+            -1,
+        )
+        cv2.putText(
+            vis_image,
+            conf_text,
+            (text_x, text_y),
+            font,
+            font_scale,
+            bbox_color,
+            font_thickness,
+        )
+
+    # Second pass: Extract contours in parallel from cache files.
+    # Each cache file becomes a work unit (avoids full-image reconstruction)
+    n_workers = mp.cpu_count()
+    print(f"   Extracting contours in parallel ({n_workers} workers)...")
+
+    work_units = []
+    for cache_file in cache_files:
+        with np.load(cache_file, allow_pickle=True) as data:
+            masks = list(data["masks"])
+            bounds = data["bounds"].tolist()
+            work_units.append((masks, bounds, smooth_masks))
+
+    # Process in parallel
+    all_contours = []
+    with ctx.Pool(processes=mp.cpu_count()) as pool:
+        batch_results = pool.map(_process_mask_batch, work_units)
+        for batch in batch_results:
+            all_contours.extend(batch)
+
+    # Third pass: Draw all contours (fast, single-threaded)
+    print(f"   Drawing {len(all_contours)} mask contours...")
+    for contours in all_contours:
+        cv2.drawContours(vis_image, contours, -1, polygon_color, 1)
+
+    # Save visualization
+    vis_output_path = output_dir / f"{tif_stem}_canopyai_visualization.png"
+    cv2.imwrite(str(vis_output_path), cv2.cvtColor(vis_image, cv2.COLOR_RGB2BGR))
+
+    print(f"✅ Saved visualization to {vis_output_path}")
+
+    return vis_output_path
+
+
+def main(args):
+    """
+    Main pipeline execution.
+    """
+    tif_path = Path(args.image_path)
+
+    if not tif_path.exists():
+        raise FileNotFoundError(f"❌ Image not found: {tif_path}")
+
+    print(f"\n{'=' * 60}")
+    print("🚀 Unified DeepForest + SAM Pipeline (Per-Tile)")
+    print(f"{'=' * 60}")
+    print(f"Input: {tif_path}")
+    print(f"Output: {args.output_dir}")
+    print(f"Batch size: {args.batch_size}")
+    print(f"{'=' * 60}\n")
+
+    # Load image
+    print("📁 Loading image...")
+    image, crs, transform, bounds = load_image_from_tif(tif_path)
+
+    # Initialize SAM first (needed by unified function)
+    print(f"\n🔧 Loading SAM model from {args.sam_checkpoint}...")
+    if not Path(args.sam_checkpoint).exists():
+        raise FileNotFoundError(
+            f"❌ SAM checkpoint not found: {args.sam_checkpoint}\n"
+            "Download: https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth"  # noqa: E501
+        )
+
+    sam = sam_model_registry[args.sam_model](checkpoint=args.sam_checkpoint)
+
+    # Optional: Load finetuned decoder weights
+    if args.sam_finetuned_decoder:
+        print(f"🎯 Loading finetuned decoder from {args.sam_finetuned_decoder}...")
+        if not Path(args.sam_finetuned_decoder).exists():
+            raise FileNotFoundError(
+                f"❌ Finetuned decoder not found: {args.sam_finetuned_decoder}"
+            )
+        state = torch.load(args.sam_finetuned_decoder, map_location="cpu")
+        sam.mask_decoder.load_state_dict(state["mask_decoder"])
+        if "prompt_encoder" in state:
+            sam.prompt_encoder.load_state_dict(state["prompt_encoder"])
+        mode = state.get("mode", "unknown")
+        iou = state.get("best_iou", state.get("final_iou", "?"))
+        print(f"   Mode: {mode}, IoU: {iou}")
+
+    # Auto-detect device
+    if args.device == "auto":
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif torch.backends.mps.is_available():
+            device = "mps"
+        else:
+            device = "cpu"
+    else:
+        device = args.device
+
+    print(f"🖥️  Using device: {device}")
+    sam.to(device=device)
+
+    # Compile SAM for faster inference (PyTorch 2.0+)
+    try:
+        sam = torch.compile(sam)
+        print("⚡ SAM compiled for faster inference")
+    except Exception as e:
+        print(f"⚠️  torch.compile() not available: {e}")
+
+    sam_predictor = SamPredictor(sam)
+
+    # Stage 0: Shadow Vector Prediction (Optional)
+    shadow_vector = None
+    shadow_vector_tensor = None
+    shadow_stats = None
+    if args.shadow_model:
+        try:
+            shadow_vector, shadow_stats = predict_shadow_vector(
+                image,
+                args.shadow_model,
+                device,
+                n_crops=args.shadow_n_crops,
+                outlier_threshold_deg=args.shadow_outlier_threshold,
+            )
+            # Convert to tensor for FiLM model
+            shadow_vector_tensor = (
+                torch.from_numpy(shadow_vector).float().to(device).unsqueeze(0)
+            )  # (1, 2)
+        except Exception as e:
+            print(f"   ⚠️  Shadow prediction failed: {e}")
+            print("   Continuing without shadow context...")
+            shadow_vector = None
+            shadow_vector_tensor = None
+
+    # Track timing for each stage
+    timings = {}
+    pipeline_start = time.time()
+
+    # Pass 1: DeepForest detection at native 400px tiles
+    df_start = time.time()
+    all_bboxes, all_scores = detect_trees_deepforest(
+        image,
+        model_path=args.deepforest_model,
+        shadow_vector=shadow_vector_tensor,
+        tile_size=args.df_tile_size,
+        confidence_threshold=args.deepforest_confidence,
+        debug_tile_dir=str(Path(args.output_dir) / "debug_tiles") if args.debug_tiles else None,
+        shadow_map_path=(
+            str(Path(args.output_dir) / (Path(args.image_path).stem + "_shadow_map.tif"))
+            if args.save_shadow_map else None
+        ),
+        geo_meta=(crs, transform) if args.save_shadow_map else None,
+        shadow_input_only=args.shadow_input_only,
+        abs_luma_max=args.abs_luma_max,
+    )
+    timings["DeepForest"] = time.time() - df_start
+
+    if len(all_bboxes) == 0:
+        print("\n❌ No trees detected by DeepForest. Writing empty GeoJSON.")
+        _write_empty_geojson(args.output_dir, tif_path.stem)
+        return
+
+    # Apply NMS immediately to remove duplicates
+    if args.skip_nms:
+        print(f"\n⚠️  NMS skipped (--skip_nms): keeping all {len(all_bboxes)} detections")
+        valid_bboxes = all_bboxes
+        valid_scores = all_scores
+    else:
+        print(f"\n🔄 Applying NMS to {len(all_bboxes)} detections...")
+        keep_indices = apply_nms(
+            all_bboxes, all_scores, iou_threshold=0.5, coverage_threshold=0.5,
+            area_weight=args.area_weight,
+        )
+        valid_bboxes = [all_bboxes[i] for i in keep_indices]
+        valid_scores = [all_scores[i] for i in keep_indices]
+        removed = len(all_bboxes) - len(valid_bboxes)
+        print(f"   Removed {removed} overlapping detections")
+        print(f"   Keeping {len(valid_bboxes)} unique trees")
+
+    # Debug: limit to single box
+    if args.debug_single_box and len(valid_bboxes) > 0:
+        print("\n⚠️  DEBUG: Limiting to single bbox")
+        valid_bboxes = valid_bboxes[:1]
+        valid_scores = valid_scores[:1]
+
+    # Pass 2: SAM segmentation
+    sam_start = time.time()
+    cache_files, valid_bboxes, valid_scores = segment_trees_sam(
+        image,
+        sam_predictor,
+        valid_bboxes,
+        valid_scores,
+        tile_size=args.sam_tile_size,
+        tile_overlap=args.sam_tile_overlap,
+        cache_dir=args.cache_dir,
+        batch_size=args.batch_size,
+        sam_mode=args.sam_mode,
+        containment_threshold=0 if args.skip_nms else args.containment_threshold,
+        bbox_pad=args.bbox_pad,
+        skip_nms=args.skip_nms,
+    )
+    timings["SAM"] = time.time() - sam_start
+
+    if len(valid_bboxes) == 0:
+        print("\n❌ No trees detected or segmented. Writing empty GeoJSON.")
+        _write_empty_geojson(args.output_dir, tif_path.stem)
+        return
+
+    # Optional: VLM shadow filtering
+    if args.vlm_shadow_filter:
+        from vlm_shadow_filter import filter_shadows
+
+        shadow_indices = filter_shadows(image, valid_bboxes, valid_scores)
+
+        if shadow_indices:
+            # Remove shadows from results
+            print(f"   Removing {len(shadow_indices)} shadow detections...")
+            keep_mask = np.ones(len(valid_bboxes), dtype=bool)
+            keep_mask[shadow_indices] = False
+            keep_indices = np.where(keep_mask)[0].tolist()
+
+            # Filter bboxes and scores
+            valid_bboxes = [valid_bboxes[i] for i in keep_indices]
+            valid_scores = [valid_scores[i] for i in keep_indices]
+
+            # Reload and filter masks from cache
+            all_masks = []
+            for cf in cache_files:
+                with np.load(cf) as data:
+                    all_masks.extend(list(data["masks"]))
+            filtered_masks = [all_masks[i] for i in keep_indices]
+
+            # Clear old cache and save filtered
+            for old_file in cache_files:
+                old_file.unlink(missing_ok=True)
+            cache_files = []
+            if filtered_masks:
+                cache_dir = (
+                    Path(args.cache_dir) if args.cache_dir else Path(tempfile.mkdtemp())
+                )
+                batch_file = cache_dir / "vlm_filtered_batch.npz"
+                np.savez_compressed(
+                    batch_file,
+                    masks=np.array(filtered_masks, dtype=bool),
+                    bboxes=np.array(valid_bboxes, dtype=np.float32),
+                )
+                cache_files = [batch_file]
+
+            print(f"   ✅ {len(valid_bboxes)} trees remaining after shadow removal")
+
+    # Save results (loads masks from cache)
+    save_start = time.time()
+    output_geojson_path, features = save_results(
+        cache_files, valid_bboxes, valid_scores, args.output_dir, tif_path.stem, crs,
+        poly_containment_threshold=0 if args.skip_nms else args.poly_containment_threshold,
+    )
+    timings["Save GeoJSON"] = time.time() - save_start
+
+    # Create visualization (loads masks from cache)
+    vis_start = time.time()
+    if not getattr(args, 'no_viz', False):
+        vis_path = create_visualization(
+            image,
+            cache_files,
+            valid_bboxes,
+            valid_scores,
+            Path(args.output_dir),
+            tif_path.stem,
+            smooth_masks=args.smooth_masks,
+        )
+        timings["Visualization"] = time.time() - vis_start
+    else:
+        vis_path = "(skipped)"
+        print("🎨 Visualization skipped (--no_viz)")
+
+    # Cleanup cache if using temp directory
+    if args.cache_dir is None and cache_files:
+        cache_dir = cache_files[0].parent
+        print(f"\n🧹 Cleaning up temp cache: {cache_dir}")
+        shutil.rmtree(cache_dir, ignore_errors=True)
+
+    # Calculate total time
+    total_time = time.time() - pipeline_start
+
+    # Print summary with timings
+    print(f"\n{'=' * 60}")
+    print("✅ Pipeline Complete!")
+    print(f"{'=' * 60}")
+    print(f"Trees detected & segmented: {len(valid_bboxes)}")
+    print(f"Valid features saved:       {len(features)}")
+    print("\n⏱️  Timing:")
+    for stage, duration in timings.items():
+        if duration >= 60:
+            print(f"  {stage:20s} {duration / 60:5.1f} min")
+        else:
+            print(f"  {stage:20s} {duration:5.1f} s")
+    print(f"  {'─' * 28}")
+    if total_time >= 60:
+        print(f"  {'TOTAL':20s} {total_time / 60:5.1f} min")
+    else:
+        print(f"  {'TOTAL':20s} {total_time:5.1f} s")
+    print("\nOutputs:")
+    print(f"  📄 GeoJSON:      {output_geojson_path}")
+    print(f"  🖼️  Visualization: {vis_path}")
+    print(f"{'=' * 60}\n")
+
+
+def parse_args():
+    """Parse command line arguments."""
+    ap = argparse.ArgumentParser(
+        description="Two-Stage Tree Detection: DeepForest + SAM",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+
+    ap.add_argument(
+        "--image_path",
+        type=str,
+        required=True,
+        help="Path to input TIF file",
+    )
+
+    ap.add_argument(
+        "--output_dir",
+        type=str,
+        default="foxtrot_output",
+        help="Output directory for results (default: foxtrot_output)",
+    )
+
+    ap.add_argument(
+        "--sam_checkpoint",
+        type=str,
+        default="sam_vit_b_01ec64.pth",
+        help="Path to SAM checkpoint (default: sam_vit_b_01ec64.pth)",
+    )
+
+    ap.add_argument(
+        "--sam_model",
+        type=str,
+        default="vit_b",
+        choices=["vit_b", "vit_l", "vit_h"],
+        help="SAM model type (default: vit_b)",
+    )
+
+    ap.add_argument(
+        "--sam_finetuned_decoder",
+        type=str,
+        default=None,
+        help="Path to finetuned SAM decoder weights (.pth). "
+        "If provided, loads finetuned mask decoder and prompt encoder.",
+    )
+
+    ap.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        choices=["auto", "cuda", "cpu", "mps"],
+        help="Device to run inference on (default: auto)",
+    )
+
+    ap.add_argument(
+        "--deepforest_confidence",
+        type=float,
+        default=0.35,
+        help="Minimum confidence threshold for DeepForest detections (default: 0.35)",
+    )
+
+    ap.add_argument(
+        "--abs_luma_max",
+        type=float,
+        default=None,
+        help="Shadow map luma ceiling: pixels brighter than this cannot be shadows. "
+        "None → default (71). Higher values (e.g. 130-150) for sandy/bright soils.",
+    )
+
+    ap.add_argument(
+        "--deepforest_model",
+        type=str,
+        default=None,
+        help="Path to custom DeepForest model (.pth file). "
+        "Can be either a standard DeepForest model or a FiLM-conditioned model "
+        "(auto-detected). If not provided, uses default pretrained model.",
+    )
+
+    ap.add_argument(
+        "--shadow_input_only",
+        action="store_true",
+        default=False,
+        help="Ablation F: model was trained with RGB replaced by shadow map × 3 channels. "
+        "Cannot be auto-detected from checkpoint; must be passed explicitly.",
+    )
+
+    ap.add_argument(
+        "--batch_size",
+        type=int,
+        default=50,
+        help="Number of trees to process per batch (default: 50). "
+        "Lower values use less memory but may be slower",
+    )
+
+    ap.add_argument(
+        "--df_tile_size",
+        type=int,
+        default=400,
+        help="DeepForest tile size in pixels (default: 400). "
+        "DeepForest works best at 400px tiles.",
+    )
+
+    ap.add_argument(
+        "--sam_tile_size",
+        type=int,
+        default=1024,
+        help="SAM tile size in pixels (default: 1024). "
+        "SAM internally uses 1024x1024, so this matches its native resolution.",
+    )
+
+    ap.add_argument(
+        "--sam_tile_overlap",
+        type=float,
+        default=0.2,
+        help="SAM tile overlap as fraction (default: 0.2 = 20%%). "
+        "With best_tile assignment, overlap mainly ensures tiles exist for edge boxes.",
+    )
+
+    ap.add_argument(
+        "--sam_mode",
+        type=str,
+        default="best_tile",
+        choices=["grid", "per_box", "best_tile"],
+        help="SAM tiling mode: 'best_tile' (default) assigns each box to the tile "
+             "where it is most contained, avoiding prompt clamping at tile edges.",
+    )
+
+    ap.add_argument(
+        "--containment_threshold",
+        type=float,
+        default=0.8,
+        help="Post-NMS containment pass: remove any box that is ≥this fraction "
+             "contained within a larger box (default 0.8). Set to 0 to disable.",
+    )
+
+    ap.add_argument(
+        "--poly_containment_threshold",
+        type=float,
+        default=0.9,
+        help="Post-SAM polygon containment pass: remove any polygon whose area "
+             "is ≥this fraction covered by a single larger polygon (default 0.9). "
+             "Set to 0 to disable.",
+    )
+
+    ap.add_argument(
+        "--skip_nms",
+        action="store_true",
+        help="Skip all NMS passes (detection-stage and SAM-stage). "
+             "Passes all raw detections to SAM. Useful for debugging.",
+    )
+
+    ap.add_argument(
+        "--bbox_pad",
+        type=float,
+        default=0.0,
+        help="Expand each detection bbox by this fraction of its width/height "
+             "before passing to SAM as a prompt (default 0.25 = 25%%). "
+             "Helps SAM see beyond clipped detection edges. Set to 0 to disable.",
+    )
+
+    ap.add_argument(
+        "--area_weight",
+        type=float,
+        default=0.5,
+        help="Area bias in NMS ranking: sort key = score * (area/median_area)^area_weight. "
+             "Larger values prefer bigger boxes over higher-scoring clipped ones (default 0.5).",
+    )
+
+    ap.add_argument(
+        "--cache_dir",
+        type=str,
+        default=None,
+        help="Directory for caching masks. "
+        "If not provided, uses a temporary directory that is cleaned up after",
+    )
+
+    # Stage 0: Shadow Vector Prediction
+    ap.add_argument(
+        "--shadow_model",
+        type=str,
+        default=None,
+        help="Path to fine-tuned ResNet-34 shadow prediction model (.pth). "
+        "If provided, predicts global shadow direction before detection. "
+        "This enables future FiLM-conditioned training of oscar50.",
+    )
+
+    ap.add_argument(
+        "--shadow_n_crops",
+        type=int,
+        default=30,
+        help="Number of random crops for shadow prediction (default: 30). "
+        "More crops = more robust but slower.",
+    )
+
+    ap.add_argument(
+        "--shadow_outlier_threshold",
+        type=float,
+        default=45.0,
+        help="Outlier rejection threshold in degrees (default: 45). "
+        "Crops with predictions > this far from median are ignored.",
+    )
+
+    ap.add_argument(
+        "--vlm_shadow_filter",
+        action="store_true",
+        help="Use VLM (Moondream 2) to filter shadow false positives. "
+        "Requires: pip install moondream",
+    )
+
+    ap.add_argument(
+        "--shadow_negative_prompts",
+        action="store_true",
+        help="Detect shadows and inject as negative points to SAM, "
+        "excluding shadow regions from tree masks.",
+    )
+
+    ap.add_argument(
+        "--smooth_masks",
+        action="store_true",
+        help="Apply morphological smoothing to mask contours. "
+        "Reduces jagged edges from finetuned models.",
+    )
+
+    ap.add_argument(
+        "--debug_single_box",
+        action="store_true",
+        help="Debug: limit to single bbox to inspect SAM output.",
+    )
+
+    ap.add_argument(
+        "--no_viz",
+        action="store_true",
+        help="Skip visualization output (useful for batch/evaluation runs).",
+    )
+
+    ap.add_argument(
+        "--debug_tiles",
+        action="store_true",
+        help="Save side-by-side RGB + shadow-map visualizations of the first 3 "
+        "processed tiles to <output_dir>/debug_tiles/. Only active when a "
+        "shadow-channel model is loaded.",
+    )
+
+    ap.add_argument(
+        "--save_shadow_map",
+        action="store_true",
+        help="Write the full-image shadow probability map as a georeferenced GeoTIFF "
+        "(<output_dir>/<image_stem>_shadow_map.tif). Load this alongside the "
+        "prediction GeoJSON in QGIS to inspect shadow signal at FP/FN locations. "
+        "Only active when a shadow-channel model is used.",
+    )
+
+    return ap.parse_args()
+
+
+def _write_empty_geojson(output_dir, tif_stem):
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    path = out / f"{tif_stem}_canopyai.geojson"
+    with open(path, "w") as f:
+        json.dump({"type": "FeatureCollection", "features": []}, f)
+    print(f"💾 Empty GeoJSON written to {path}")
+
+
+if __name__ == "__main__":
+    os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+    args = parse_args()
+    main(args)

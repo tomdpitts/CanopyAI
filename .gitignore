@@ -74,6 +74,6 @@ Prediction_*.json
 
 *.claude*
 *visualize*
-phase30/
+
 *train.csv
 *val.csv

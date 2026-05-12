@@ -1,0 +1,33 @@
+# Core ML
+torch==2.3.0
+torchvision==0.18.0
+pytorch-lightning>=2.1.0,<3.0.0
+
+# DeepForest
+deepforest==2.0.0
+
+# Geospatial
+rasterio
+geopandas
+shapely
+pycocotools
+
+# Vision / data
+opencv-python
+pillow
+albumentations>=2.0.0
+
+# Data / numerics
+pandas
+numpy
+tqdm
+
+# HuggingFace (TCD dataset download)
+datasets
+huggingface_hub
+
+# Metrics
+torchmetrics
+
+# Inference pipeline (foxtrot.py)
+segment-anything
