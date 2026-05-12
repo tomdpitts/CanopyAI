@@ -306,6 +306,10 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
         self._cls_loss_patched = False
         self._current_shadow_gt_weights = None  # list of (N_gt_i,) tensors, set per training step
 
+        # MPS manual fp16 — set by MPSHalfPrecisionCallback in train_deepforest.py
+        self.mps_fp16 = False
+        self._mps_loss_scale = 512.0  # updated each step by the callback
+
         if self.shadow_loss_reweight:
             print(f"   ✅ Shadow Loss Reweight: ENABLED  weight={self.shadow_loss_weight}x for shadow-casting GT boxes")
         else:
@@ -946,6 +950,11 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
         elif self.shadow_channel:
             images = self._prepend_shadow_channel(images, image_paths)
 
+        # Backbone is fp16; cast images so the first conv gets the right dtype.
+        # Targets stay fp32 — the detection head runs in fp32.
+        if self.mps_fp16:
+            images = [img.half() for img in images]
+
         batch = (images, targets, *batch[2:])
         return super().training_step(batch, batch_idx)
 
@@ -976,8 +985,10 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
         elif self.shadow_channel:
             images = self._prepend_shadow_channel(images, image_paths)
 
-        batch  = (images, targets, *batch[2:])
+        if self.mps_fp16:
+            images = [img.half() for img in images]
 
+        batch = (images, targets, *batch[2:])
         return super().validation_step(batch, batch_idx)
 
     def on_validation_epoch_end(self):

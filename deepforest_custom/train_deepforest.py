@@ -297,6 +297,214 @@ def widen_first_conv_for_shadow_channel(model):
     print("   ✅ First conv widened to 4 channels (shadow map channel zero-initialised)")
 
 
+class _FP32Guard(torch.autograd.Function):
+    """
+    fp16 → fp32 in the forward pass; fp32 gradient → fp16 in the backward pass.
+
+    Insert this at boundaries where an op requires fp32 inputs (BatchNorm,
+    focal loss) but its upstream produced fp16 activations.  The backward pass
+    automatically propagates fp16-sized gradients back through the fp16 subgraph.
+    """
+    @staticmethod
+    def forward(ctx, x):
+        return x.float()
+
+    @staticmethod
+    def backward(ctx, grad):
+        return grad.half()
+
+
+class _FP16Guard(torch.autograd.Function):
+    """
+    fp32 → fp16 in the forward pass; fp16 gradient → fp32 in the backward pass.
+
+    Insert this after a forced-fp32 op (BatchNorm) to hand fp16 activations
+    back to the next fp16 layer while correctly routing gradients.
+    """
+    @staticmethod
+    def forward(ctx, x):
+        return x.half()
+
+    @staticmethod
+    def backward(ctx, grad):
+        return grad.float()
+
+
+class MPSHalfPrecisionCallback(pl.Callback):
+    """
+    Manual fp16 mixed precision for Apple MPS.
+
+    MPS has no torch.autocast support, so mixed precision is implemented with
+    explicit dtype boundary functions (_FP32Guard / _FP16Guard) placed at every
+    point where a backward kernel requires float32:
+
+      Backbone convolutions  → fp16  (fast; MPS supports fp16 conv backward)
+      BatchNorm layers       → fp32  (wrapped by _FP32Guard / _FP16Guard hooks)
+      FPN convolutions       → fp16
+      Detection head         → fp32  (focal loss / smooth-L1 backward need fp32)
+
+    A forward hook on the detection head casts fp16 FPN features → fp32 before
+    the head sees them.  The corresponding backward automatically casts fp32
+    head-gradients back to fp16 for the FPN backward pass.
+
+    The optimizer always steps on fp32 master weights (copied back to fp16
+    afterwards) to avoid precision loss in momentum / Adam state.
+    """
+
+    _NORM_TYPES = (
+        nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d,
+        nn.SyncBatchNorm, nn.GroupNorm, nn.LayerNorm,
+    )
+
+    def __init__(self):
+        self._master: dict[str, torch.Tensor] = {}
+        self._overflow = False
+        self._hooks: list = []
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    def on_fit_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        # Save fp32 master weights before any dtype change
+        self._master = {
+            name: param.detach().float().clone()
+            for name, param in pl_module.named_parameters()
+        }
+
+        # Full model → fp16
+        pl_module.half()
+
+        # Resolve the inner torchvision RetinaNet
+        inner = pl_module.model
+        if hasattr(inner, "model"):
+            inner = inner.model
+
+        # ── BatchNorm boundaries (backbone body) ──────────────────────
+        # BN backward on MPS requires float32.  For every BN layer in the
+        # ResNet body, cast fp16 input → fp32 before the forward pass and
+        # fp32 output → fp16 after, with matching gradient casts in backward.
+        body = None
+        if hasattr(inner, "backbone") and hasattr(inner.backbone, "body"):
+            body = inner.backbone.body
+
+        n_bn = 0
+        if body is not None:
+            for m in body.modules():
+                if isinstance(m, self._NORM_TYPES):
+                    m.float()   # keep BN params / running stats in fp32
+                    self._hooks.append(
+                        m.register_forward_pre_hook(self._norm_pre_hook)
+                    )
+                    self._hooks.append(
+                        m.register_forward_hook(self._norm_post_hook)
+                    )
+                    n_bn += 1
+
+        # ── Detection head → fp32 ─────────────────────────────────────
+        # sigmoid_focal_loss and smooth_l1_loss backward kernels require fp32
+        # on MPS.  Keep the entire head (including its GroupNorm layers) in
+        # fp32 and cast the fp16 FPN feature maps to fp32 at the head boundary.
+        head = getattr(inner, "head", None)
+        if head is not None:
+            head.float()
+            self._hooks.append(
+                head.register_forward_pre_hook(self._head_pre_hook)
+            )
+
+        pl_module._mps_loss_scale = 1.0   # no loss scaling (loss is fp32)
+        print(
+            f"[MPSHalf] backbone fp16 | {n_bn} BN layers → fp32 with dtype guards"
+            f" | detection head → fp32"
+        )
+
+    # ------------------------------------------------------------------
+    # Hook implementations
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _norm_pre_hook(module, args):
+        """Cast fp16 activation → fp32 before BatchNorm."""
+        if args and isinstance(args[0], torch.Tensor) and args[0].dtype == torch.float16:
+            return (_FP32Guard.apply(args[0]),) + args[1:]
+        return args
+
+    @staticmethod
+    def _norm_post_hook(module, args, output):
+        """Cast fp32 BatchNorm output → fp16 for the next conv."""
+        if isinstance(output, torch.Tensor) and output.dtype == torch.float32:
+            return _FP16Guard.apply(output)
+        return output
+
+    @staticmethod
+    def _head_pre_hook(module, args):
+        """Cast fp16 FPN feature maps → fp32 before the detection head."""
+        if not args:
+            return args
+        features = args[0]
+        def _cast(t):
+            return _FP32Guard.apply(t) if isinstance(t, torch.Tensor) and t.dtype == torch.float16 else t
+        if isinstance(features, dict):
+            features = {k: _cast(v) for k, v in features.items()}
+        elif isinstance(features, (list, tuple)):
+            features = type(features)(_cast(f) for f in features)
+        return (features,) + args[1:]
+
+    # ------------------------------------------------------------------
+    # Optimizer step: always update fp32 master weights
+    # ------------------------------------------------------------------
+
+    def on_before_optimizer_step(
+        self, trainer: pl.Trainer, pl_module: pl.LightningModule, optimizer
+    ) -> None:
+        # Detect overflow in fp16 gradients (can still happen in FPN backward)
+        overflow = any(
+            not torch.isfinite(p.grad).all()
+            for p in pl_module.parameters()
+            if p.grad is not None
+        )
+        if overflow:
+            self._overflow = True
+            for p in pl_module.parameters():
+                p.grad = None
+            for name, p in pl_module.named_parameters():
+                p.data.copy_(self._master[name])
+            print("[MPSHalf] Overflow in fp16 gradients — step skipped")
+            return
+
+        self._overflow = False
+
+        # Copy fp16 gradients into fp32 master params for the optimizer
+        for name, p in pl_module.named_parameters():
+            if p.grad is not None:
+                self._master[name].grad = p.grad.detach().float()
+
+        # Restore fp32 weights so the optimizer steps in fp32
+        for name, p in pl_module.named_parameters():
+            p.data.copy_(self._master[name])
+
+    def on_train_batch_end(
+        self, trainer: pl.Trainer, pl_module: pl.LightningModule, outputs, batch, batch_idx
+    ) -> None:
+        if not self._overflow:
+            # Store updated fp32 weights back into master
+            for name, p in pl_module.named_parameters():
+                self._master[name].data.copy_(p.data.float())
+        # Restore model to fp16 for the next forward pass
+        pl_module.half()
+        # Re-apply fp32 to norm layers and head (half() clobbers them)
+        inner = pl_module.model
+        if hasattr(inner, "model"):
+            inner = inner.model
+        if hasattr(inner, "backbone") and hasattr(inner.backbone, "body"):
+            for m in inner.backbone.body.modules():
+                if isinstance(m, self._NORM_TYPES):
+                    m.float()
+        head = getattr(inner, "head", None)
+        if head is not None:
+            head.float()
+
+
 def train_deepforest(
     train_csv,
     val_csv=None,
@@ -753,8 +961,14 @@ def train_deepforest(
     else:
         trainer_kwargs["accelerator"] = "cpu"
 
-    # Mixed precision: explicit override wins; otherwise bf16-mixed on CUDA only.
-    if precision:
+    # Mixed precision.
+    # "16-mps": manual fp16 via MPSHalfPrecisionCallback — MPS has no autocast,
+    # so dtype boundaries are inserted explicitly around BN and the detection head.
+    if precision == "16-mps":
+        model.mps_fp16 = True
+        callbacks.append(MPSHalfPrecisionCallback())
+        print("   ✅ MPS fp16: backbone/FPN in fp16 | BN + head in fp32")
+    elif precision:
         trainer_kwargs["precision"] = precision
     elif trainer_kwargs.get("accelerator") == "gpu":
         trainer_kwargs["precision"] = "bf16-mixed"
