@@ -608,7 +608,15 @@ def detect_trees_deepforest(
 
         if model_path and Path(model_path).exists():
             print(f"   Loading custom weights: {model_path}")
-            df_model.model.load_state_dict(torch.load(model_path, map_location="cpu"))
+            _raw = torch.load(model_path, map_location="cpu")
+            if isinstance(_raw, dict) and "state_dict" in _raw:
+                _sd = _raw["state_dict"]
+                # Lightning checkpoints prefix weights with "model." - strip it
+                if _sd and all(k.startswith("model.") for k in _sd):
+                    _sd = {k[len("model."):]: v for k, v in _sd.items()}
+            else:
+                _sd = _raw
+            df_model.model.load_state_dict(_sd, strict=False)
         else:
             print("   Loading default model from Hugging Face...")
             df_model.load_model("weecology/deepforest-tree")

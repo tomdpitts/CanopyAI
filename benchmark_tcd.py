@@ -219,16 +219,29 @@ def run_detectree2(tcd_dir, out_dir, skip_existing=False, tile_filter=None, num_
     return all(c == 0 for c in codes)
 
 
+def _progress_suffix(times: list, total: int) -> str:
+    """Return a compact timing string: elapsed, avg, and ETA."""
+    import datetime
+    elapsed = times[-1]
+    avg     = sum(times) / len(times)
+    remaining = avg * (total - len(times))
+    eta = datetime.datetime.now() + datetime.timedelta(seconds=remaining)
+    return f"  {elapsed:5.1f}s | avg {avg:5.1f}s | ETA {eta:%H:%M:%S}"
+
+
 def run_inference(model_spec, mtype, tcd_dir, out_dir, shadow_model, abs_luma_max=None,
                   skip_existing=False, tile_filter=None):
     if mtype == "detectree2":
         return run_detectree2(tcd_dir, out_dir, skip_existing, tile_filter)
 
+    import time
     tifs = sorted(Path(tcd_dir).glob("*.tif"))
     if tile_filter is not None:
         tifs = [t for t in tifs if t.stem in tile_filter]
     ok = 0
     skipped = 0
+    times = []
+    pending = [t for t in tifs if not (skip_existing and (Path(out_dir) / f"{t.stem}_canopyai.geojson").exists())]
     for tif in tifs:
         out_file = Path(out_dir) / f"{tif.stem}_canopyai.geojson"
         if skip_existing and out_file.exists():
@@ -236,11 +249,14 @@ def run_inference(model_spec, mtype, tcd_dir, out_dir, shadow_model, abs_luma_ma
             ok += 1
             continue
         print(f"    {tif.name} ... ", end="", flush=True)
+        t0 = time.monotonic()
         if mtype == "segformer":
             success = run_segformer(tif, out_dir)
         else:
             success = run_foxtrot(model_spec, mtype, tif, out_dir, shadow_model, abs_luma_max)
-        print("✓" if success else "✗")
+        times.append(time.monotonic() - t0)
+        suffix = _progress_suffix(times, len(pending))
+        print(("✓" if success else "✗") + suffix)
         ok += success
     if skipped:
         print(f"  {skipped} tiles skipped (already exist)")
