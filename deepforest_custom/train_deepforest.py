@@ -230,6 +230,36 @@ class _TiledValDataset:
         return image, {"boxes": boxes_t, "labels": labels_t}, img_name
 
 
+class _SingleCropValDataset:
+    """One centre-crop per val image — fast, deterministic, good enough for early stopping.
+    Defined at module level so multiprocessing workers can pickle it."""
+    def __init__(self, base_ds, patch_size=400, min_visibility=0.5):
+        import albumentations as A
+        from albumentations.pytorch import ToTensorV2
+        self.base       = base_ds
+        self.collate_fn = base_ds.collate_fn
+        self._val_t     = A.Compose(
+            [A.RandomCrop(patch_size, patch_size), ToTensorV2()],
+            bbox_params=A.BboxParams(format="pascal_voc", label_fields=["category_ids"],
+                                     clip=True, min_visibility=min_visibility),
+        )
+
+    def __len__(self):
+        return len(self.base.image_names)
+
+    def __getitem__(self, idx):
+        img_name = self.base.image_names[idx]
+        img      = self.base.load_image(idx)
+        gt       = self.base.annotations_for_path(img_name)
+        boxes    = gt["boxes"] if len(gt["boxes"]) else np.zeros((0, 4), np.float32)
+        labels   = gt["labels"] if len(gt["labels"]) else np.zeros(0, np.int64)
+        aug      = self._val_t(image=img, bboxes=boxes, category_ids=labels)
+        image    = aug["image"]
+        boxes_t  = torch.from_numpy(np.array(aug["bboxes"], dtype=np.float32)).reshape(-1, 4)
+        labels_t = torch.from_numpy(np.array(aug["category_ids"], dtype=np.int64))
+        return image, {"boxes": boxes_t, "labels": labels_t}, img_name
+
+
 def widen_first_conv_for_shadow_channel(model):
     """
     Replace backbone.body.conv1 ([64,3,7,7]) with a 4-channel version ([64,4,7,7]).
@@ -541,6 +571,9 @@ def train_deepforest(
     from deepforest.datasets.training import BoxDataset
     from torch.utils.data import DataLoader
 
+    # pin_memory is a CUDA-only feature — disable on MPS and CPU to avoid overhead
+    pin_memory = torch.cuda.is_available()
+
     if _empty_image_paths:
         print(f"\n🔲 Found {len(_empty_image_paths)} confirmed-empty (hard-negative) images — "
               f"will be injected into dataset after CSV loading")
@@ -563,8 +596,8 @@ def train_deepforest(
                 batch_size=dl.batch_size,
                 shuffle=True,
                 collate_fn=ds.collate_fn,
-                num_workers=4,
-                pin_memory=True,
+                num_workers=8,
+                pin_memory=pin_memory,
                 persistent_workers=True,
             )
 
@@ -605,14 +638,14 @@ def train_deepforest(
                 dl  = _orig_val_dataloader(self_model)
                 ds  = dl.dataset
                 ds.image_names = np.append(ds.image_names, _val_empty_paths)
-                tiled_ds = _TiledValDataset(ds, patch_size=CROP_SIZE, min_visibility=MIN_VIS)
+                tiled_ds = _SingleCropValDataset(ds, patch_size=CROP_SIZE, min_visibility=MIN_VIS)
                 return DataLoader(
                     tiled_ds,
                     batch_size=dl.batch_size,
                     shuffle=False,
                     collate_fn=ds.collate_fn,
-                    num_workers=4,
-                    pin_memory=True,
+                    num_workers=8,
+                    pin_memory=pin_memory,
                     persistent_workers=True,
                 )
 
@@ -624,10 +657,10 @@ def train_deepforest(
             _orig_vl = model.val_dataloader.__func__
             def _val_dataloader_tiled(self_model):
                 dl = _orig_vl(self_model)
-                tiled_ds = _TiledValDataset(dl.dataset, patch_size=CROP_SIZE, min_visibility=MIN_VIS)
+                tiled_ds = _SingleCropValDataset(dl.dataset, patch_size=CROP_SIZE, min_visibility=MIN_VIS)
                 return DataLoader(tiled_ds, batch_size=dl.batch_size, shuffle=False,
                                   collate_fn=dl.dataset.collate_fn,
-                                  num_workers=4, pin_memory=True, persistent_workers=True)
+                                  num_workers=8, pin_memory=pin_memory, persistent_workers=True)
             model.val_dataloader = types.MethodType(_val_dataloader_tiled, model)
 
         print(f"\n📊 Loading validation data from {val_csv}...")
@@ -700,7 +733,7 @@ def train_deepforest(
         "enable_checkpointing": True,
         "callbacks": callbacks,
         "logger": logger,
-        "check_val_every_n_epoch": 1,
+        "check_val_every_n_epoch": 3,
         "num_sanity_val_steps": 0,
         "gradient_clip_val": 1.0,
         "fast_dev_run": fast_dev_run,

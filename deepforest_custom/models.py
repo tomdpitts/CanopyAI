@@ -1054,6 +1054,6 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
         )
         return {
             "optimizer": optimizer,
-            "lr_scheduler": {"scheduler": scheduler, "monitor": "val_loss",
+            "lr_scheduler": {"scheduler": scheduler, "monitor": "train_loss",
                              "interval": "epoch", "frequency": 1},
         }
