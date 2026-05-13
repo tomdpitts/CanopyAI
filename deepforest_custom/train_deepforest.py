@@ -395,13 +395,27 @@ class MPSHalfPrecisionCallback(pl.Callback):
                 import deepforest_custom.mps_ops as mps_ops
                 n_bn = mps_ops.patch_batchnorm_for_fp16(body)
             except Exception as e:
-                # Fall back to Python hook approach if kernel unavailable
                 print(f"[MPSHalf] kernel patch failed ({e}), falling back to Python hooks")
+
+            # FrozenBatchNorm2d (used by torchvision RetinaNet backbone) mixes
+            # fp16 tensors with its fp32 eps constant, causing an MPSGraph
+            # type-verification crash at runtime.  Keep FBN in fp32 with the
+            # same Python boundary hooks used for regular BN.
+            try:
+                from torchvision.ops.misc import FrozenBatchNorm2d as _FBN
+            except ImportError:
+                _FBN = None
+
+            if _FBN is not None:
                 for m in body.modules():
-                    if isinstance(m, self._NORM_TYPES):
+                    if isinstance(m, _FBN):
                         m.float()
-                        self._hooks.append(m.register_forward_pre_hook(self._norm_pre_hook))
-                        self._hooks.append(m.register_forward_hook(self._norm_post_hook))
+                        self._hooks.append(
+                            m.register_forward_pre_hook(self._norm_pre_hook)
+                        )
+                        self._hooks.append(
+                            m.register_forward_hook(self._norm_post_hook)
+                        )
                         n_bn += 1
 
         # ── Detection head → fp32 ─────────────────────────────────────
@@ -415,7 +429,7 @@ class MPSHalfPrecisionCallback(pl.Callback):
 
         pl_module._mps_loss_scale = 1.0
         print(
-            f"[MPSHalf] backbone fp16 | {n_bn} BN modules patched with MPSGraph kernel"
+            f"[MPSHalf] backbone fp16 | {n_bn} norm layers → fp32 (kernel + FBN hooks)"
             f" | detection head → fp32"
         )
 
@@ -494,8 +508,8 @@ class MPSHalfPrecisionCallback(pl.Callback):
         if not self._overflow:
             for name, p in pl_module.named_parameters():
                 self._master[name].data.copy_(p.data.float())
-        # Restore model to fp16; re-apply fp32 to head (half() clobbers it).
-        # BN layers are patched via forward() override so their dtype doesn't matter.
+        # Restore model to fp16; re-apply fp32 to head and FrozenBatchNorm2d
+        # (pl_module.half() clobbers them).
         pl_module.half()
         inner = pl_module.model
         if hasattr(inner, "model"):
@@ -503,6 +517,14 @@ class MPSHalfPrecisionCallback(pl.Callback):
         head = getattr(inner, "head", None)
         if head is not None:
             head.float()
+        if hasattr(inner, "backbone") and hasattr(inner.backbone, "body"):
+            try:
+                from torchvision.ops.misc import FrozenBatchNorm2d as _FBN
+                for m in inner.backbone.body.modules():
+                    if isinstance(m, _FBN):
+                        m.float()
+            except ImportError:
+                pass
 
 
 def train_deepforest(

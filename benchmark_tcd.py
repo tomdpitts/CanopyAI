@@ -909,7 +909,7 @@ def main():
 
     # ── Step 3: Output ────────────────────────────────────────────────────────
     print_table(model_results, model_area_results, model_n_tiles, args.iop_thresh)
-    print_biome_table(model_biome_results, args.iop_thresh, use_groups=True)
+    # print_biome_table(model_biome_results, args.iop_thresh, use_groups=True)
     plot_pr_curves(model_results, args.iop_thresh, args.pr_save)
 
     # Save summary
