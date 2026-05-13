@@ -588,6 +588,15 @@ def train_deepforest(
         model.config.validation.csv_file = None
         print("   No validation file provided")
 
+    # deepforest's default ReduceLROnPlateau monitors val_loss, which is only
+    # logged on val epochs.  Combined with check_val_every_n_epoch=3 below,
+    # that means val_loss isn't available at the end of epochs 0/1 and the
+    # scheduler crashes.  Monitor train_loss_epoch instead — always present.
+    try:
+        model.config.validation.lr_plateau_target = "train_loss_epoch"
+    except Exception:
+        pass
+
     # Hard-negative support: NaN xmin rows → empty-image targets
     train_df    = pd.read_csv(train_csv)
     _empty_mask = train_df["xmin"].isna() | (train_df["xmin"].astype(str).str.strip() == "")
