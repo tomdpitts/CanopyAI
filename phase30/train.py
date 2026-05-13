@@ -31,8 +31,20 @@ if __name__ == "__main__":
     p.add_argument("--val-csv",      required=True,  help="Path to validation CSV")
     p.add_argument("--checkpoint",   required=True,  help="Starting checkpoint (.pth or .ckpt)")
     p.add_argument("--output-dir",   default="checkpoints", help="Where to save checkpoints")
-    p.add_argument("--batch-size",   type=int, default=32,  help="Batch size (32 for A100-40GB)")
-    p.add_argument("--fast-dev-run", action="store_true",   help="1 train + 1 val batch then exit")
+    p.add_argument("--run-name",     default="phase30_tcd_L2", help="Output subfolder name")
+    p.add_argument("--batch-size",   type=int,   default=32,     help="Batch size (32 for A100-40GB)")
+    p.add_argument("--lr",           type=float, default=0.0001, help="Learning rate")
+    p.add_argument("--epochs",       type=int,   default=50,     help="Max epochs")
+    p.add_argument("--patience",     type=int,   default=10,     help="Early-stop patience")
+    p.add_argument("--fast-dev-run", action="store_true",        help="1 train + 1 val batch then exit")
+    # Canopy positive policy (binary: presence of --canopy-polygons turns it on)
+    p.add_argument("--canopy-polygons", default=None,
+                   help="Path to phase30_tcd_canopy_polygons.json. When set, "
+                        "anchors with IoP≥0.4 against a canopy polygon are treated "
+                        "as positives (cls target=1, regression suppressed).")
+    p.add_argument("--canopy-loss-scale", type=float, default=1.0,
+                   help="Dampener for summed canopy cls contribution. "
+                        "1.0 = full positive, 0.0 = iscrowd-like ignore.")
     args = p.parse_args()
 
     train_deepforest(
@@ -40,15 +52,16 @@ if __name__ == "__main__":
         val_csv=args.val_csv,
         checkpoint=args.checkpoint,
         output_dir=args.output_dir,
-        run_name="phase30_tcd_L2",
-        epochs=50,
+        run_name=args.run_name,
+        epochs=args.epochs,
         batch_size=args.batch_size,
-        lr=0.001,
-        patience=10,
+        lr=args.lr,
+        patience=args.patience,
         shadow_loss_reweight=True,
         shadow_loss_weight=2.0,
+        canopy_polygons_path=args.canopy_polygons,
+        canopy_loss_scale=args.canopy_loss_scale,
         augmentations=TCD_AUGMENTATIONS_COLOUR,
         accelerator="gpu",
-        won_bbox_shrink=True,
         fast_dev_run=args.fast_dev_run,
     )

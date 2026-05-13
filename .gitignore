@@ -77,3 +77,4 @@ Prediction_*.json
 
 *train.csv
 *val.csv
+phase30/phase30_tcd_canopy_polygons.json

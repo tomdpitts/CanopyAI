@@ -1,194 +1,64 @@
+import json
+from pathlib import Path
+
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-import cv2
 from deepforest import main as deepforest_main
 
-import albumentations as A
-from albumentations.pytorch import ToTensorV2
-
 try:
-    from .utils import generate_shadow_map, generate_luma_darkness_map   # package import
+    from .utils import generate_shadow_map
 except ImportError:
-    from utils import generate_shadow_map, generate_luma_darkness_map   # script import
+    from utils import generate_shadow_map
 
-
-# ---------------------------------------------------------------------------
-# Shadow Anticipation
-# ---------------------------------------------------------------------------
-
-class ShadowAnticipation(nn.Module):
-    """
-    Geometrically-explicit shadow feature injection at layer2 (H/8) and
-    layer3 (H/16).
-
-    Replaces ShadowCrossAttention. Instead of learning a Q-K attention
-    mechanism to find crown-shadow correspondences (which requires too much
-    data to converge and cannot represent variable tree heights with a single
-    scalar), this module directly implements the geometric reasoning:
-
-        "If there is shadow at position p + d * shadow_dir_image,
-         there is likely a tree crown at position p."
-
-    For each spatial position the shadow map is sampled at a range of offsets
-    d ∈ offsets_px covering the expected range of tree heights. This produces
-    a multi-channel 'crown evidence' feature map. A zero-initialised 1×1 conv
-    mixes the evidence into the backbone feature channels.
-
-    Gradient chain:  loss → FPN → layer residual → gate × conv(evidence)
-    Two hops to the parameters — vastly shorter than cross-attention.
-    No dir_scale, no Q-K embedding, no learned geometry.
-
-    offsets_px covers ~3–18 m trees at ~50° sun elevation (0.1 m/px):
-        shadow_px ≈ height / tan(elevation)
-        3 m → 25 px, 5 m → 42 px, 8 m → 67 px,
-        12 m → 101 px, 15 m → 126 px, 18 m → 151 px
-    """
-
-    DEFAULT_OFFSETS = (12, 20, 30, 42, 55, 67)  # red/orange zone: 12–67px (~1.4–8m at 50°)
-
-    def __init__(self, offsets_px=None, l2_channels=512, l3_channels=1024):
-        super().__init__()
-        self.offsets_px = tuple(offsets_px or self.DEFAULT_OFFSETS)
-        n = len(self.offsets_px)
-
-        # Layer2 injection: n evidence channels → 512 (zero-init → identity at init)
-        self.l2_conv = nn.Conv2d(n, l2_channels, kernel_size=1)
-        nn.init.zeros_(self.l2_conv.weight)
-        nn.init.zeros_(self.l2_conv.bias)
-        self.gate_l2 = nn.Parameter(torch.ones(1) * 0.01)
-
-        # Layer3 injection: n evidence channels → 1024 (zero-init → identity at init)
-        self.l3_conv = nn.Conv2d(n, l3_channels, kernel_size=1)
-        nn.init.zeros_(self.l3_conv.weight)
-        nn.init.zeros_(self.l3_conv.bias)
-        self.gate_l3 = nn.Parameter(torch.ones(1) * 0.01)
-
-    def _warp_stack(self, shadow_map, shadow_dir):
-        """
-        For each offset d, warp shadow_map so that output[p] = shadow_map[p + d*dir].
-        Returns (B, n_offsets, H, W).
-
-        shadow_map:  (B, 1, H, W)  in [0, 1]
-        shadow_dir:  (B, 2)  (sin_az, cos_az) — geographic convention
-        """
-        B, _, H, W = shadow_map.shape
-        dev   = shadow_map.device
-        dtype = shadow_map.dtype
-
-        # Convert to image coordinates: x-right, y-down → flip y component
-        sdx = shadow_dir[:, 0]        # (B,)  x
-        sdy = -shadow_dir[:, 1]       # (B,)  y  (cos_az flipped)
-
-        # Base identity grid — computed once, reused for all offsets
-        theta     = torch.eye(2, 3, device=dev, dtype=dtype).unsqueeze(0).expand(B, -1, -1)
-        base_grid = F.affine_grid(theta, (B, 1, H, W), align_corners=True)  # (B, H, W, 2)
-
-        slices = []
-        for d in self.offsets_px:
-            # Shift in normalised [-1,1] coords so output[h,w] samples input[h+dy, w+dx]
-            dx_n = sdx * d * 2.0 / max(W - 1, 1)   # (B,)
-            dy_n = sdy * d * 2.0 / max(H - 1, 1)   # (B,)
-            shift = torch.stack([dx_n, dy_n], dim=-1)[:, None, None, :]  # (B,1,1,2)
-
-            warped = F.grid_sample(
-                shadow_map, base_grid + shift,
-                mode='bilinear', padding_mode='zeros', align_corners=True
-            )  # (B, 1, H, W)
-            slices.append(warped)
-
-        return torch.cat(slices, dim=1)  # (B, n_offsets, H, W)
-
-    def forward_l2(self, rgb_feat, shadow_map, shadow_dir):
-        """
-        rgb_feat:   (B, 512,  H/8,  W/8)   — ResNet layer2 output
-        shadow_map: (B, 1,    H,    W)      — full-resolution shadow probability
-        shadow_dir: (B, 2)
-        Returns:    (B, 512,  H/8,  W/8)    — zero-perturbation at init
-        """
-        evidence = self._warp_stack(shadow_map, shadow_dir)            # (B, n, H, W)
-        _, _, Hf, Wf = rgb_feat.shape
-        evidence = F.interpolate(evidence, size=(Hf, Wf),
-                                 mode='bilinear', align_corners=False)  # (B, n, H/8, W/8)
-        return rgb_feat + self.gate_l2 * self.l2_conv(evidence)
-
-    def forward_l3(self, rgb_feat, shadow_map, shadow_dir):
-        """
-        rgb_feat:   (B, 1024, H/16, W/16)  — ResNet layer3 output
-        shadow_map: (B, 1,    H,    W)      — full-resolution shadow probability
-        shadow_dir: (B, 2)
-        Returns:    (B, 1024, H/16, W/16)   — zero-perturbation at init
-        """
-        evidence = self._warp_stack(shadow_map, shadow_dir)            # (B, n, H, W)
-        _, _, Hf, Wf = rgb_feat.shape
-        evidence = F.interpolate(evidence, size=(Hf, Wf),
-                                 mode='bilinear', align_corners=False)  # (B, n, H/16, W/16)
-        return rgb_feat + self.gate_l3 * self.l3_conv(evidence)
-
-
-
-
-# ---------------------------------------------------------------------------
-# Main model class
-# ---------------------------------------------------------------------------
 
 class ShadowConditionedDeepForest(deepforest_main.deepforest):
     """
-    DeepForest fine-tuned with optional shadow awareness.
+    DeepForest fine-tuned with shadow loss reweighting and (optionally) a
+    polygon-precise canopy positive policy.
 
-    Two orthogonal shadow mechanisms, independently togglable:
+    Shadow reweighting:
+        For GT boxes in images that have a shadow_x/shadow_y annotation, the
+        focal loss is upweighted for boxes where shadow evidence is detected
+        downstream of the crown.
 
-    1. shadow_channel=True  — shadow probability map is prepended as a 4th
-       input channel to conv1 (widen_first_conv_for_shadow_channel must be
-       called after weight loading in train_deepforest.py).
-
-    2. shadow_cross_attention=True — ShadowAnticipation is hooked into ResNet
-       layer2 (H/8) and layer3 (H/16). For each backbone position p, the shadow
-       map is sampled at p + d*shadow_dir for a range of offsets d covering 3–18 m
-       trees. This directly implements the geometric reasoning "shadow at expected
-       offset → crown here" without learned Q-K attention or dir_scale.
-
-    Both mechanisms can be combined (Run D in the ablation study).
+    Canopy positive policy (active when ``canopy_polygons_path`` is supplied):
+        Anchors whose intersection-over-anchor-area against the canopy
+        polygons exceeds ``CANOPY_IOP_THRESH`` (0.7) are treated as normal
+        positive examples for the classification focal loss (cls target=1,
+        no per-anchor reweight), and their regression contribution is
+        suppressed — there is no precise crown box to regress to.  The
+        summed canopy contribution can optionally be dampened by
+        ``canopy_loss_scale`` (≤1.0) to stop large canopy polygons from
+        outvoting ITC anchors.
     """
+
+    CANOPY_IOP_THRESH = 0.7
 
     def __init__(
         self,
-        shadow_angle_deg=215.0,
         train_csv=None,
         val_csv=None,
-        freeze_backbone=False,
-        shadow_channel=False,
-        shadow_cross_attention=False,
-        shadow_luma_only=False,   # ablation: replace directional shadow map with luma darkness map
-        shadow_input_only=False,  # ablation F: replace RGB entirely with shadow map (tiled ×3)
-        shadow_proposals=False,   # inject shadow-derived proposals alongside RPN output
-        shadow_proposals_iso=False,  # ablation: scramble shadow direction (random angle per image)
-        shadow_loss_reweight=False,  # phase17: upweight focal loss for shadow-casting GT boxes
-        shadow_loss_weight=2.0,      # multiplier applied to positive anchors of shadow-casting GTs
+        shadow_loss_reweight=False,
+        shadow_loss_weight=2.0,
+        canopy_polygons_path=None,
+        canopy_loss_scale=1.0,
         config=None,
         **kwargs,
     ):
-        self.shadow_channel = shadow_channel
-        self.shadow_cross_attention = shadow_cross_attention
-        self.shadow_luma_only = shadow_luma_only
-        self.shadow_input_only = shadow_input_only
-        self.shadow_proposals = shadow_proposals
-        self.shadow_proposals_iso = shadow_proposals_iso
         self.shadow_loss_reweight = shadow_loss_reweight
-        self.shadow_loss_weight = shadow_loss_weight
+        self.shadow_loss_weight   = shadow_loss_weight
 
-        # Initialize DeepForest (LightningModule)
+        self.canopy_enabled    = canopy_polygons_path is not None
+        self.canopy_loss_scale = float(canopy_loss_scale)
+
         deepforest_main.deepforest.__init__(self, config=config, **kwargs)
 
-        # Override DeepForest's default COCO mAP metric (averages IoU 0.5→0.95) with
-        # IoU=0.4, which better suits aerial tree crown detection where predicted boxes
-        # are often tighter than the annotated GT polygon bounds.
+        # Override mAP to IoU=0.4 (better for aerial tree crown detection than COCO 0.5–0.95)
         from torchmetrics.detection.mean_ap import MeanAveragePrecision as _MAP
         self.mAP_metric = _MAP(iou_thresholds=[0.4])
 
-        # Cap proposals to avoid OOM on large TCD tiles (2048×2048) where
-        # uncapped NMS across thousands of anchors blows GPU memory.
+        # Cap proposals to avoid OOM on 2048×2048 TCD tiles
         try:
             inner = self.model.model if hasattr(self.model, "model") else self.model
             if hasattr(inner, "rpn"):
@@ -199,50 +69,8 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
         except Exception:
             pass
 
-        self.freeze_backbone = freeze_backbone
-        if freeze_backbone:
-            # Freeze only the ResNet body — NOT the FPN or detection head.
-            # The FPN and head must remain trainable so they can adapt to the modified
-            # layer3 features that SCA produces. Freezing everything blocks all gradient
-            # signal to SCA and prevents any learning.
-            frozen = False
-            try:
-                if hasattr(self.model, "backbone") and hasattr(self.model.backbone, "body"):
-                    body = self.model.backbone.body
-                elif (hasattr(self.model, "model") and
-                      hasattr(self.model.model, "backbone") and
-                      hasattr(self.model.model.backbone, "body")):
-                    body = self.model.model.backbone.body
-                else:
-                    body = None
-
-                if body is not None:
-                    for param in body.parameters():
-                        param.requires_grad = False
-                    print("   ❄️  Froze ResNet body only (FPN + detection head remain trainable)")
-                    frozen = True
-            except Exception as e:
-                print(f"   ⚠️  Could not resolve ResNet body for freezing: {e}")
-
-            if not frozen:
-                # Fallback: freeze everything (old behaviour)
-                for param in self.model.parameters():
-                    param.requires_grad = False
-                print("   ❄️  Fallback: froze entire model.model (could not resolve body)")
-
-        # Store base shadow angle for fallback
-        self.shadow_angle_deg = shadow_angle_deg
-        shadow_angle_rad = np.radians(shadow_angle_deg)
-        self.base_shadow_vector = torch.tensor(
-            [np.sin(shadow_angle_rad), np.cos(shadow_angle_rad)], dtype=torch.float32
-        )
-
         # Per-image shadow lookup: image_path -> np.array([shadow_x, shadow_y])
         self.shadow_lookup = {}
-        # Per-image global normalization stats: image_path -> (dg_scale, dark_scale, otsu_ctr)
-        self.norm_stats_lookup = {}
-        # Per-image domain lookup: image_path -> domain string (e.g. "BRU", "WON")
-        self.domain_lookup = {}
         for csv_path, label in [(train_csv, "train"), (val_csv, "val")]:
             if csv_path is None:
                 continue
@@ -250,552 +78,113 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
                 import pandas as pd
                 df = pd.read_csv(csv_path)
                 if "shadow_x" in df.columns and "shadow_y" in df.columns:
-                    import pandas as _pd
                     before = len(self.shadow_lookup)
                     for _, row in df.drop_duplicates("image_path").iterrows():
                         sx, sy = row["shadow_x"], row["shadow_y"]
-                        if _pd.isna(sx) or _pd.isna(sy):
-                            continue   # tile has no shadow annotation — trains as baseline
+                        if pd.isna(sx) or pd.isna(sy):
+                            continue
                         self.shadow_lookup[row["image_path"]] = np.array(
                             [float(sx), float(sy)], dtype=np.float32
                         )
-                    n_loaded = len(self.shadow_lookup) - before
+                    n_loaded  = len(self.shadow_lookup) - before
                     n_skipped = df["image_path"].nunique() - n_loaded
                     print(f"   Loaded {n_loaded} shadow vectors from {label} CSV "
                           f"({n_skipped} skipped — no shadow annotation)")
                 else:
-                    print(f"   No shadow_x/shadow_y in {label} CSV — will use angle fallback")
-                if all(c in df.columns for c in ["dg_scale", "dark_scale", "otsu_ctr"]):
-                    before = len(self.norm_stats_lookup)
-                    for _, row in df.drop_duplicates("image_path").iterrows():
-                        import pandas as _pd
-                        self.norm_stats_lookup[row["image_path"]] = (
-                            float(row["dg_scale"]) if _pd.notna(row["dg_scale"]) else None,
-                            float(row["dark_scale"]) if _pd.notna(row["dark_scale"]) else None,
-                            float(row["otsu_ctr"]) if _pd.notna(row["otsu_ctr"]) else None,
-                        )
-                    print(f"   Loaded {len(self.norm_stats_lookup)-before} shadow norm stats from {label} CSV")
-                else:
-                    print(f"   No dg_scale/dark_scale/otsu_ctr in {label} CSV — shadow maps will use per-tile stats")
-                if "domain" in df.columns:
-                    for _, row in df.drop_duplicates("image_path").iterrows():
-                        self.domain_lookup[row["image_path"]] = str(row["domain"]).upper()
-                    domains_found = sorted(set(self.domain_lookup.values()))
-                    print(f"   Loaded domain labels from {label} CSV: {domains_found}")
+                    print(f"   No shadow_x/shadow_y in {label} CSV — loss reweighting inactive")
             except Exception as e:
                 print(f"   Warning: could not load {label} shadow lookup: {e}")
 
+        self._cls_loss_patched          = False
+        self._head_loss_patched         = False
+        self._transform_capture_patched = False
+        self._current_shadow_gt_weights = None
+        self._current_canopy_polygons   = None   # list[list[np.ndarray(V,2)]] per batch
+        self._current_image_sizes_pre   = None   # list[(H,W)] pre-transform sizes
+        self._current_image_sizes_post  = None   # list[(H,W)] post-transform sizes
 
-        # Shadow Anticipation modules
-        if self.shadow_cross_attention:
-            self.shadow_anticipation = ShadowAnticipation()
-            print("   ✅ Shadow Anticipation: ENABLED (layer2/H8 + layer3/H16, identity at init)")
-        else:
-            print("   Shadow Anticipation: DISABLED")
-
-        # Flag to track hook registration
-        self._sca_hook_injected = False
-        self._current_shadow_map = None  # (B, 1, H, W) raw shadow maps, set per forward pass
-        self._current_shadow_dir = None  # (B, 2) shadow direction vectors, set per forward pass
-
-        # Shadow proposal injection state
-        self._shadow_proposal_hook_injected = False
-        self._current_shadow_proposals = None  # list of (N_i, 4) tensors, set per forward pass
-
-        # Shadow loss reweighting state
-        self._cls_loss_patched = False
-        self._current_shadow_gt_weights = None  # list of (N_gt_i,) tensors, set per training step
+        # Canopy polygons lookup: {tile_basename: [np.ndarray(V,2), ...]}.
+        # Loaded from JSON written by build_phase30_csvs.py.
+        self.canopy_polygons = {}
+        if self.canopy_enabled:
+            cp_path = Path(canopy_polygons_path)
+            if not cp_path.exists():
+                raise FileNotFoundError(f"canopy_polygons file not found: {cp_path}")
+            raw = json.loads(cp_path.read_text())
+            n_polys = 0
+            for key, flat_list in raw.items():
+                polys = []
+                for flat in flat_list:
+                    arr = np.asarray(flat, dtype=np.float32).reshape(-1, 2)
+                    if len(arr) >= 3:
+                        polys.append(arr)
+                if polys:
+                    self.canopy_polygons[key] = polys
+                    n_polys += len(polys)
+            print(f"   Loaded {n_polys} canopy polygons across "
+                  f"{len(self.canopy_polygons)} tiles from {cp_path.name}")
 
         if self.shadow_loss_reweight:
-            print(f"   ✅ Shadow Loss Reweight: ENABLED  weight={self.shadow_loss_weight}x for shadow-casting GT boxes")
+            print(f"   ✅ Shadow Loss Reweight: ENABLED  weight={self.shadow_loss_weight}x")
         else:
             print("   Shadow Loss Reweight: DISABLED")
 
-        if self.shadow_proposals:
-            iso_note = "  [ISO ablation — direction scrambled]" if shadow_proposals_iso else ""
-            print(f"   ✅ Shadow Proposals: ENABLED  box={self._SP_CROWN_BOX}px  step_back={self._SP_STEP_BACK}px{iso_note}")
+        if self.canopy_enabled:
+            print(f"   ✅ Canopy Positive Policy: ENABLED  "
+                  f"iop_thresh={self.CANOPY_IOP_THRESH}  "
+                  f"scale={self.canopy_loss_scale}")
         else:
-            print("   Shadow Proposals: DISABLED")
-
-        # Shadow channel flag is serialised in checkpoint for inference detection
-        self.shadow_channel = shadow_channel
+            print("   Canopy Positive Policy: DISABLED")
 
     # ------------------------------------------------------------------
-    # Shadow map computation helpers
+    # Shadow map
     # ------------------------------------------------------------------
 
-    # Per-domain luma ceiling for shadow map generation.
-    # WON: arid sandy terrain — shadows on pale soil have higher luma than BRU.
-    # BRU: darker soil/vegetation — default threshold (71) is appropriate.
-    _SHADOW_ABS_LUMA_MAX = {"WON": 150, "BRU": 71}
-    _SHADOW_ABS_LUMA_MAX_DEFAULT = 71
-
-    def _compute_shadow_map(self, img_t, shadow_vector, norm_stats=None, domain=None):
-        """
-        Compute a single shadow probability map for one [3,H,W] float image tensor.
-
-        - Uses the shadow_x/shadow_y vector to derive the angle.
-        - norm_stats: (dg_scale, dark_scale, otsu_ctr) pre-computed from the full source
-          orthomosaic so that normalization is globally consistent across tiles.
-          When None, falls back to per-tile stats (not recommended for training).
-        - domain: 'WON' or 'BRU' — selects per-domain abs_luma_max.
-        Returns a [1, H, W] float32 tensor in [0, 1].
-        """
-        img_np = (img_t.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-        luma_max = self._SHADOW_ABS_LUMA_MAX.get(
-            str(domain).upper() if domain else "",
-            self._SHADOW_ABS_LUMA_MAX_DEFAULT,
-        )
-
-        if self.shadow_luma_only:
-            # Ablation: direction-free darkness map — no shadow vector used.
-            # Isolates the contribution of the directional shadow angle.
-            shadow_np = generate_luma_darkness_map(img_np, abs_luma_max=luma_max)
-        else:
-            angle = float(np.degrees(np.arctan2(shadow_vector[0], shadow_vector[1])))
-            if norm_stats is not None:
-                dg_scale, dark_scale, otsu_ctr = norm_stats
-                shadow_np = generate_shadow_map(img_np, angle,
-                                                dg_scale=dg_scale,
-                                                dark_scale=dark_scale,
-                                                otsu_ctr=otsu_ctr,
-                                                abs_luma_max=luma_max)
-            else:
-                shadow_np = generate_shadow_map(img_np, angle, abs_luma_max=luma_max)
+    def _compute_shadow_map(self, img_t, shadow_vector):
+        """Compute shadow probability map for one [3,H,W] float tensor. Returns [1,H,W]."""
+        img_np    = (img_t.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+        angle_deg = float(np.degrees(np.arctan2(float(shadow_vector[0]), float(shadow_vector[1]))))
+        shadow_np = generate_shadow_map(img_np, angle_deg)
         return torch.from_numpy(shadow_np).unsqueeze(0)   # [1, H, W]
-
-    def _prepend_shadow_channel(self, images, image_paths):
-        """
-        Prepend a shadow probability map as a 4th channel.
-        Images: list of [3, H, W] float tensors in [0,1].
-        Returns: list of [4, H, W] float tensors.
-        """
-        result = []
-        for img_t, path in zip(images, image_paths):
-            sv = self.shadow_lookup.get(path)
-            if sv is None:
-                shadow_t = torch.zeros(1, img_t.shape[1], img_t.shape[2],
-                                       dtype=img_t.dtype, device=img_t.device)
-            else:
-                norm_stats = self.norm_stats_lookup.get(path) or self.norm_stats_lookup.get(None)
-                domain = self.domain_lookup.get(path)
-                shadow_t = self._compute_shadow_map(img_t, sv, norm_stats=norm_stats, domain=domain)
-                shadow_t = shadow_t.to(img_t.device, dtype=img_t.dtype)
-            result.append(torch.cat([img_t, shadow_t], dim=0))  # [4, H, W]
-        return result
-
-    def _replace_with_shadow_input(self, images, image_paths):
-        """
-        Ablation F: discard RGB entirely, replace each image with the shadow map
-        tiled 3× across channels.  Input to backbone is still (3, H, W) so no
-        architecture change is needed.
-        """
-        result = []
-        for img_t, path in zip(images, image_paths):
-            sv = self.shadow_lookup.get(path)
-            if sv is None:
-                shadow_t = torch.zeros(1, img_t.shape[1], img_t.shape[2],
-                                       dtype=img_t.dtype, device=img_t.device)
-            else:
-                norm_stats = self.norm_stats_lookup.get(path) or self.norm_stats_lookup.get(None)
-                domain = self.domain_lookup.get(path)
-                shadow_t = self._compute_shadow_map(img_t, sv, norm_stats=norm_stats, domain=domain)
-                shadow_t = shadow_t.to(img_t.device, dtype=img_t.dtype)
-            result.append(shadow_t.repeat(3, 1, 1))  # [3, H, W]
-        return result
-
-    def _compute_shadow_dir_batch(self, images, image_paths):
-        """
-        Return (B, 2) float32 tensor of normalised shadow direction unit vectors
-        (sin_az, cos_az) for each image in the batch, sourced from shadow_lookup
-        or the angle fallback.
-        """
-        device = images[0].device
-        dirs = []
-        for path in image_paths:
-            sv = self.shadow_lookup.get(path)
-            if sv is None:
-                angle_rad = np.radians(self.shadow_angle_deg)
-                sv = np.array([np.sin(angle_rad), np.cos(angle_rad)], dtype=np.float32)
-            sv = np.array(sv, dtype=np.float32)
-            sv = sv / (np.linalg.norm(sv) + 1e-8)
-            dirs.append(torch.from_numpy(sv))
-        return torch.stack(dirs).to(device)  # (B, 2)
-
-    def _compute_shadow_map_batch(self, images, image_paths):
-        """
-        Compute raw shadow probability maps for a batch.
-        Returns tensor (B, 1, H, W) float32 in [0, 1] on the same device as images.
-        All maps are resized to match the first image's spatial dimensions.
-        """
-        device = images[0].device
-        target_h, target_w = images[0].shape[1], images[0].shape[2]
-        shadow_maps = []
-        for img_t, path in zip(images, image_paths):
-            sv = self.shadow_lookup.get(path)
-            if sv is None:
-                sv = np.array([np.sin(np.radians(self.shadow_angle_deg)),
-                               np.cos(np.radians(self.shadow_angle_deg))], dtype=np.float32)
-            norm_stats = self.norm_stats_lookup.get(path) or self.norm_stats_lookup.get(None)
-            domain = self.domain_lookup.get(path)
-            shadow_t = self._compute_shadow_map(img_t, sv, norm_stats=norm_stats, domain=domain)  # [1, H_i, W_i]
-            if shadow_t.shape[1] != target_h or shadow_t.shape[2] != target_w:
-                shadow_t = F.interpolate(
-                    shadow_t.unsqueeze(0), size=(target_h, target_w),
-                    mode="bilinear", align_corners=False
-                ).squeeze(0)
-            shadow_maps.append(shadow_t)
-        return torch.stack(shadow_maps).to(device)  # (B, 1, H, W)
-
-    # ------------------------------------------------------------------
-    # Hook injection for Shadow Cross-Attention
-    # ------------------------------------------------------------------
-
-    def _inject_sca_hook(self):
-        """Register forward hooks on ResNet layer2 and layer3 for shadow anticipation."""
-        if self._sca_hook_injected:
-            return
-
-        def layer2_hook(module, input, output):
-            if self._current_shadow_map is not None and self._current_shadow_dir is not None:
-                return self.shadow_anticipation.forward_l2(
-                    output, self._current_shadow_map, self._current_shadow_dir
-                )
-            return output
-
-        def layer3_hook(module, input, output):
-            if self._current_shadow_map is not None and self._current_shadow_dir is not None:
-                return self.shadow_anticipation.forward_l3(
-                    output, self._current_shadow_map, self._current_shadow_dir
-                )
-            return output
-
-        try:
-            body = None
-            if hasattr(self.model, "backbone") and hasattr(self.model.backbone, "body"):
-                body = self.model.backbone.body
-            elif (hasattr(self.model, "model") and
-                  hasattr(self.model.model, "backbone") and
-                  hasattr(self.model.model.backbone, "body")):
-                body = self.model.model.backbone.body
-
-            hooked = []
-            if body is not None:
-                if hasattr(body, "layer2"):
-                    body.layer2.register_forward_hook(layer2_hook)
-                    hooked.append("layer2 (H/8)")
-                if hasattr(body, "layer3"):
-                    body.layer3.register_forward_hook(layer3_hook)
-                    hooked.append("layer3 (H/16)")
-            if hooked:
-                print(f"   ✅ Shadow Anticipation hooks injected on {', '.join(hooked)}")
-            else:
-                print("   ⚠️  Could not find layer2/layer3 to inject shadow hooks")
-        except Exception as e:
-            print(f"   ⚠️  Shadow hook injection failed: {e}")
-
-        self._sca_hook_injected = True
-
-    # ------------------------------------------------------------------
-    # Lightning lifecycle hooks
-    # ------------------------------------------------------------------
-
-    def on_train_start(self):
-        if self.shadow_cross_attention and not self._sca_hook_injected:
-            self._inject_sca_hook()
-        if self.shadow_proposals and not self._shadow_proposal_hook_injected:
-            self._inject_shadow_proposal_hook()
-        if self.shadow_loss_reweight and not self._cls_loss_patched:
-            self._patch_retinanet_cls_loss()
-        if hasattr(super(), "on_train_start"):
-            super().on_train_start()
-
-    def on_validation_start(self):
-        if self.shadow_cross_attention and not self._sca_hook_injected:
-            self._inject_sca_hook()
-        if self.shadow_proposals and not self._shadow_proposal_hook_injected:
-            self._inject_shadow_proposal_hook()
-        if hasattr(super(), "on_validation_start"):
-            super().on_validation_start()
-
-    def on_predict_start(self):
-        if self.shadow_cross_attention and not self._sca_hook_injected:
-            self._inject_sca_hook()
-        if self.shadow_proposals and not self._shadow_proposal_hook_injected:
-            self._inject_shadow_proposal_hook()
-        if hasattr(super(), "on_predict_start"):
-            super().on_predict_start()
-
-    def on_train_epoch_end(self):
-        """Log Shadow Anticipation diagnostic scalars once per epoch."""
-        if self.shadow_cross_attention:
-            sa = self.shadow_anticipation
-
-            # Gate values: grow from 0.01 as the anticipation residuals become useful.
-            self.log("sca/gate_l2", sa.gate_l2.item(), prog_bar=True)
-            self.log("sca/gate_l3", sa.gate_l3.item(), prog_bar=False)
-
-            # Gradient norms: confirm the gradient chain is live at layer2 and layer3.
-            # Both should be non-zero from epoch 1 (very short chain: loss→FPN→gate×conv).
-            g_l2 = sa.gate_l2.grad
-            g_l3 = sa.gate_l3.grad
-            w_l2 = sa.l2_conv.weight.grad
-            w_l3 = sa.l3_conv.weight.grad
-            self.log("sca/grad_gate_l2",   g_l2.norm().item() if g_l2 is not None else 0.0, prog_bar=False)
-            self.log("sca/grad_gate_l3",   g_l3.norm().item() if g_l3 is not None else 0.0, prog_bar=False)
-            self.log("sca/grad_l2_conv",   w_l2.norm().item() if w_l2 is not None else 0.0, prog_bar=False)
-            self.log("sca/grad_l3_conv",   w_l3.norm().item() if w_l3 is not None else 0.0, prog_bar=False)
-
-        if hasattr(super(), "on_train_epoch_end"):
-            super().on_train_epoch_end()
-
-    # ------------------------------------------------------------------
-    # Shadow proposal injection constants (at 0.1 m/px)
-    # ------------------------------------------------------------------
-    _SP_BLOB_THRESH = 0.35   # shadow_map binarisation threshold
-    _SP_SPECKLE_MIN = 200    # min blob area in px² — filters noise
-    _SP_NEAR_PCT    = 0.10   # bottom-10% projection = near-end pixels
-    _SP_CROWN_BOX   = 90     # fixed proposal box side length (px = 9 m)
-    _SP_STEP_BACK   = 12     # step from near-end centroid against shadow dir (px)
-
-    # ------------------------------------------------------------------
-    # WON bbox normalisation
-    # ------------------------------------------------------------------
-
-    # WON annotations were drawn to include the cast shadow as well as the crown,
-    # making them substantially larger than equivalent BRU annotations which are
-    # tight to the canopy only. This inconsistency confuses both the detector and
-    # the ShadowAnticipation module (which expects the shadow to lie OUTSIDE the box).
-    #
-    # We correct for this at training/validation time by shrinking WON boxes to
-    # WON_BBOX_AREA_FRACTION of their original area, preserving aspect ratio and
-    # centre. This is applied in code only — the source CSVs are NOT modified so
-    # the transform is fully reversible and auditable.
-    #
-    # 0.50 → sides scaled by √0.5 ≈ 0.707  (chosen by visual inspection)
-    WON_BBOX_AREA_FRACTION = 0.50
-
-    def _maybe_shrink_won_targets(self, targets, image_paths):
-        """
-        For WON images, shrink bbox coordinates to WON_BBOX_AREA_FRACTION of
-        their original area, keeping aspect ratio and centre unchanged.
-
-        targets:     list of dicts with "boxes" key, each (N, 4) tensor [x1,y1,x2,y2]
-        image_paths: list of str (or None) aligned with targets
-
-        Returns a new list of target dicts — originals are not mutated.
-        """
-        if not self.domain_lookup:
-            return targets  # no domain info loaded, skip
-
-        scale = self.WON_BBOX_AREA_FRACTION ** 0.5  # ≈ 0.707
-        result = []
-        for target, path in zip(targets, image_paths):
-            if self.domain_lookup.get(path, "").upper() != "WON":
-                result.append(target)
-                continue
-
-            boxes = target["boxes"]  # (N, 4)
-            cx = (boxes[:, 0] + boxes[:, 2]) / 2
-            cy = (boxes[:, 1] + boxes[:, 3]) / 2
-            hw = (boxes[:, 2] - boxes[:, 0]) * scale / 2  # half-width
-            hh = (boxes[:, 3] - boxes[:, 1]) * scale / 2  # half-height
-            new_boxes = torch.stack(
-                [cx - hw, cy - hh, cx + hw, cy + hh], dim=1
-            )
-            result.append({**target, "boxes": new_boxes})
-
-        return result
-
-    # ------------------------------------------------------------------
-    # Shadow proposal injection
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _shadow_blobs_to_proposals(shadow_map_np, shadow_angle_deg, img_h, img_w):
-        """
-        Threshold shadow_map → connected components → one proposal box per blob.
-
-        The near end of each blob (closest to the crown, i.e. smallest projection
-        onto the shadow direction vector) is found via the bottom _SP_NEAR_PCT
-        percentile of per-pixel projections.  The proposal centre is placed
-        _SP_STEP_BACK pixels upstream of that near-end centroid.
-
-        Returns (N, 4) float32 numpy array of [x1, y1, x2, y2] boxes,
-        or an empty (0, 4) array when no blobs pass the area threshold.
-        """
-        ang = np.radians(shadow_angle_deg)
-        dx  =  np.sin(ang)   # shadow direction in image coords, rightward
-        dy  = -np.cos(ang)   # shadow direction in image coords, downward
-
-        cls = ShadowConditionedDeepForest
-        binary = (shadow_map_np >= cls._SP_BLOB_THRESH).astype(np.uint8)
-        n, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
-
-        proposals = []
-        half = cls._SP_CROWN_BOX // 2
-
-        for lab in range(1, n):   # 0 = background
-            if stats[lab, cv2.CC_STAT_AREA] < cls._SP_SPECKLE_MIN:
-                continue
-
-            ys, xs = np.where(labels == lab)
-            projections = xs * dx + ys * dy
-            threshold   = np.percentile(projections, cls._SP_NEAR_PCT * 100)
-            near_mask   = projections <= threshold
-            near_cx = xs[near_mask].mean()
-            near_cy = ys[near_mask].mean()
-
-            crown_cx = near_cx - cls._SP_STEP_BACK * dx
-            crown_cy = near_cy - cls._SP_STEP_BACK * dy
-
-            x1 = max(0,     int(crown_cx - half))
-            y1 = max(0,     int(crown_cy - half))
-            x2 = min(img_w, int(crown_cx + half))
-            y2 = min(img_h, int(crown_cy + half))
-
-            if x2 > x1 and y2 > y1:
-                proposals.append([float(x1), float(y1), float(x2), float(y2)])
-
-        if proposals:
-            return np.array(proposals, dtype=np.float32)
-        return np.zeros((0, 4), dtype=np.float32)
-
-    def _compute_shadow_proposals_batch(self, images, image_paths, shadow_maps_batch=None):
-        """
-        Compute shadow-derived crown proposals for a batch.
-
-        Reuses shadow_maps_batch (B, 1, H, W) if already computed (e.g. for
-        shadow_cross_attention), avoiding a redundant shadow map computation.
-
-        Returns a list of (N_i, 4) float32 CPU tensors, one per image.
-        """
-        result = []
-        for i, (img_t, path) in enumerate(zip(images, image_paths)):
-            H, W = img_t.shape[1], img_t.shape[2]
-
-            # ── Shadow map ────────────────────────────────────────────────
-            if shadow_maps_batch is not None:
-                sm_np = shadow_maps_batch[i, 0].cpu().numpy()
-            else:
-                sv = self.shadow_lookup.get(path)
-                if sv is None:
-                    sv = np.array([np.sin(np.radians(self.shadow_angle_deg)),
-                                   np.cos(np.radians(self.shadow_angle_deg))], dtype=np.float32)
-                norm_stats = self.norm_stats_lookup.get(path)
-                domain     = self.domain_lookup.get(path)
-                sm_t = self._compute_shadow_map(img_t, sv, norm_stats=norm_stats, domain=domain)
-                sm_np = sm_t[0].cpu().numpy()
-
-            # ── Shadow angle (or scrambled for iso ablation) ───────────────
-            sv = self.shadow_lookup.get(path)
-            if sv is not None:
-                sv = np.array(sv, dtype=np.float32)
-                angle_deg = float(np.degrees(np.arctan2(sv[0], sv[1])))
-            else:
-                angle_deg = self.shadow_angle_deg
-
-            if self.shadow_proposals_iso:
-                angle_deg = np.random.uniform(0, 360)
-
-            proposals_np = self._shadow_blobs_to_proposals(sm_np, angle_deg, H, W)
-            result.append(torch.from_numpy(proposals_np))
-
-        return result
-
-    def _inject_shadow_proposal_hook(self):
-        """
-        Register a forward hook that appends shadow proposals to the RPN output.
-        Only applicable to two-stage detectors (Faster R-CNN).  RetinaNet and
-        other single-stage detectors have no RPN — the hook is skipped with a
-        warning and shadow_proposals is disabled for this run.
-        """
-        if self._shadow_proposal_hook_injected:
-            return
-
-        # Resolve the inner model (may be wrapped in a Hub object)
-        inner = self.model
-        if not hasattr(inner, "rpn") and hasattr(inner, "model"):
-            inner = inner.model
-
-        if not hasattr(inner, "rpn"):
-            print(
-                "   ⚠️  Shadow proposal injection requires a two-stage detector (Faster R-CNN). "
-                f"Current model ({type(self.model).__name__}) has no RPN — "
-                "shadow_proposals disabled for this run."
-            )
-            self.shadow_proposals = False
-            self._shadow_proposal_hook_injected = True
-            return
-
-        def rpn_hook(module, input, output):
-            if self._current_shadow_proposals is None:
-                return output
-            proposals, losses = output
-            augmented = []
-            for img_props, shadow_props in zip(proposals, self._current_shadow_proposals):
-                if shadow_props.shape[0] > 0:
-                    combined = torch.cat(
-                        [img_props, shadow_props.to(img_props.device, dtype=img_props.dtype)],
-                        dim=0,
-                    )
-                else:
-                    combined = img_props
-                augmented.append(combined)
-            return augmented, losses
-
-        inner.rpn.register_forward_hook(rpn_hook)
-        self._shadow_proposal_hook_injected = True
-        print("   ✅ Shadow proposal hook injected on RPN")
 
     # ------------------------------------------------------------------
     # Shadow loss reweighting
     # ------------------------------------------------------------------
 
-    # Shadow probe fractions of ray-box intersection distance (exact edge in shadow direction).
-    # 3 inside crown (< 1.0×edge), 3 outside (> 1.0×edge).
     _SLR_PROBE_FRACTIONS = (0.26, 0.54, 0.80, 1.12, 1.52, 2.0)
-    _SLR_PROBE_MIN_PX    = 5      # minimum probe distance in px (floor for tiny boxes)
-    _SLR_SHADOW_THRESH   = 0.35   # min shadow_map value to count as shadow evidence
-    _SLR_PROBE_RADIUS    = 2      # half-side of neighbourhood patch sampled at each probe
+    _SLR_PROBE_MIN_PX    = 5
+    _SLR_SHADOW_THRESH   = 0.35
+    _SLR_PROBE_RADIUS    = 2
 
     def _compute_shadow_gt_weights(self, images, image_paths, targets):
         """
-        For each GT box in each image, probe the shadow map at the expected
-        shadow location (GT_crown_centre + d * shadow_dir) for a range of
-        shadow lengths d.  If any probe exceeds _SLR_SHADOW_THRESH the GT box
-        is deemed shadow-casting and receives weight = shadow_loss_weight.
-        Non-shadow GT boxes receive weight = 1.0.
-
-        Returns a list (one per image) of float32 tensors of shape (N_gt,).
+        For each GT box probe the shadow map downstream of the crown.
+        Returns a list of (N_gt,) float32 weight tensors.
+        Boxes in images without a shadow vector get weight 1.0 (no reweighting).
         """
         result = []
         for img_t, path, target in zip(images, image_paths, targets):
-            boxes = target["boxes"]   # (N_gt, 4) [x1, y1, x2, y2]
-            N_gt  = boxes.shape[0]
+            boxes   = target["boxes"]
+            N_gt    = boxes.shape[0]
             weights = torch.ones(N_gt, dtype=torch.float32)
 
             if N_gt == 0:
                 result.append(weights)
                 continue
 
-            # Shadow direction in image coords
             sv = self.shadow_lookup.get(path)
             if sv is None:
                 result.append(weights)
                 continue
-            sv   = np.array(sv, dtype=np.float32)
-            sv   = sv / (np.linalg.norm(sv) + 1e-8)
-            sdx  =  float(sv[0])   # sin_az → rightward
-            sdy  = -float(sv[1])   # -cos_az → downward  (image y convention)
 
-            angle_deg   = float(np.degrees(np.arctan2(sv[0], sv[1])))
-            norm_stats  = self.norm_stats_lookup.get(path)
-            domain      = self.domain_lookup.get(path)
-            shadow_t    = self._compute_shadow_map(img_t, sv,
-                                                   norm_stats=norm_stats, domain=domain)
-            sm_np = shadow_t[0].cpu().numpy()   # (H, W)
-            H, W  = sm_np.shape
+            sv  = np.array(sv, dtype=np.float32)
+            sv  = sv / (np.linalg.norm(sv) + 1e-8)
+            sdx =  float(sv[0])
+            sdy = -float(sv[1])
+
+            shadow_t = self._compute_shadow_map(img_t, sv)
+            sm_np    = shadow_t[0].cpu().numpy()
+            H, W     = sm_np.shape
 
             cx = ((boxes[:, 0] + boxes[:, 2]) / 2).cpu().numpy()
             cy = ((boxes[:, 1] + boxes[:, 3]) / 2).cpu().numpy()
@@ -804,69 +193,135 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
 
             r = self._SLR_PROBE_RADIUS
             for i in range(N_gt):
-                # Ray-box intersection: exact distance from crown centre to box
-                # edge in the shadow direction — direction-invariant boundary.
+                # Ray-box intersection: exact distance from crown centre to box edge
                 t_x = ((float(bw[i]) / 2) / abs(sdx)) if abs(sdx) > 1e-6 else float("inf")
                 t_y = ((float(bh[i]) / 2) / abs(sdy)) if abs(sdy) > 1e-6 else float("inf")
-                edge_dist = max(min(t_x, t_y), self._SLR_PROBE_MIN_PX)
+                edge_dist   = max(min(t_x, t_y), self._SLR_PROBE_MIN_PX)
                 probe_dists = [max(f * edge_dist, self._SLR_PROBE_MIN_PX)
                                for f in self._SLR_PROBE_FRACTIONS]
                 for d in probe_dists:
-                    px = int(round(cx[i] + d * sdx))
-                    py = int(round(cy[i] + d * sdy))
-                    # Sample max over (2r+1)×(2r+1) neighbourhood — robust to
-                    # single-pixel misses at shadow edges and direction noise.
+                    px  = int(round(cx[i] + d * sdx))
+                    py  = int(round(cy[i] + d * sdy))
                     y0c = max(py - r, 0);  y1c = min(py + r + 1, H)
                     x0c = max(px - r, 0);  x1c = min(px + r + 1, W)
                     if y1c > y0c and x1c > x0c:
                         if sm_np[y0c:y1c, x0c:x1c].max() >= self._SLR_SHADOW_THRESH:
                             weights[i] = self.shadow_loss_weight
-                            break   # one hit is enough
+                            break
 
             result.append(weights)
         return result
 
-    def _patch_retinanet_cls_loss(self):
-        """
-        Monkey-patch the RetinaNet classification head's compute_loss to apply
-        per-anchor weights derived from shadow GT evidence.
+    # ------------------------------------------------------------------
+    # Canopy region handling
+    # ------------------------------------------------------------------
 
-        The patch switches focal loss from reduction='sum' to reduction='none',
-        multiplies per-anchor losses by the shadow weights, then sums.
-        Weights are read from self._current_shadow_gt_weights at call time,
-        so they are set fresh each training step before the forward pass.
+    def _build_canopy_integral(self, polygons, post_h, post_w, scale_w, scale_h):
+        """Rasterise polygons (pre-transform pixel coords) into a (post_h,post_w)
+        uint8 mask scaled by (scale_w, scale_h), then return the (H+1, W+1)
+        integral image as a float32 numpy array.  Returns None if no polygons
+        or rasterisation fails.
         """
+        if not polygons:
+            return None
+        from PIL import Image, ImageDraw
+        try:
+            img = Image.new("L", (post_w, post_h), 0)
+            drw = ImageDraw.Draw(img)
+            for verts in polygons:
+                if len(verts) < 3:
+                    continue
+                pts = [(float(v[0]) * scale_w, float(v[1]) * scale_h) for v in verts]
+                drw.polygon(pts, fill=1)
+            mask = np.asarray(img, dtype=np.int64)
+        except Exception:
+            return None
+        if mask.sum() == 0:
+            return None
+        integral = np.zeros((post_h + 1, post_w + 1), dtype=np.float32)
+        integral[1:, 1:] = mask.cumsum(0).cumsum(1).astype(np.float32)
+        return integral
+
+    @staticmethod
+    def _anchor_iop_from_integral(anchors, integral_t, post_h, post_w):
+        """Vectorised intersection-over-anchor-area via the integral image
+        summed-area-table trick.  ``anchors`` is (N,4) on device in post-
+        transform pixel coords.  Returns (N,) float tensor in [0,1].
+        """
+        x1 = anchors[:, 0].clamp(0, post_w).long()
+        y1 = anchors[:, 1].clamp(0, post_h).long()
+        x2 = anchors[:, 2].clamp(0, post_w).long()
+        y2 = anchors[:, 3].clamp(0, post_h).long()
+        A = integral_t[y2, x2]
+        B = integral_t[y2, x1]
+        C = integral_t[y1, x2]
+        D = integral_t[y1, x1]
+        canopy_area = A - B - C + D
+        anchor_w = (anchors[:, 2] - anchors[:, 0]).clamp(min=1.0)
+        anchor_h = (anchors[:, 3] - anchors[:, 1]).clamp(min=1.0)
+        anchor_area = anchor_w * anchor_h
+        return (canopy_area / anchor_area).clamp(0.0, 1.0)
+
+    # ------------------------------------------------------------------
+    # Transform capture (record post-resize image sizes for canopy IoP)
+    # ------------------------------------------------------------------
+
+    def _patch_transform_capture(self):
+        """Record pre/post-resize image sizes for the current batch so the
+        head loss patch can scale canopy polygons into anchor coordinates.
+        """
+        if self._transform_capture_patched:
+            return
+        inner = self.model
+        if hasattr(inner, "model"):
+            inner = inner.model
+        if not hasattr(inner, "transform"):
+            return
+        transform = inner.transform
+        orig_forward = transform.forward
+        model_ref    = self
+
+        def patched_forward(images, targets=None):
+            pre = [(int(img.shape[-2]), int(img.shape[-1])) for img in images]
+            image_list, targets_out = orig_forward(images, targets)
+            post = [(int(h), int(w)) for h, w in image_list.image_sizes]
+            model_ref._current_image_sizes_pre  = pre
+            model_ref._current_image_sizes_post = post
+            return image_list, targets_out
+
+        transform.forward = patched_forward
+        self._transform_capture_patched = True
+
+    def _patch_retinanet_cls_loss(self):
+        """Monkey-patch RetinaNet focal loss to apply per-GT shadow weights."""
         if self._cls_loss_patched:
             return
 
-        # Resolve classification head through possible Hub wrapper
         inner = self.model
         if hasattr(inner, "model"):
             inner = inner.model
         if not hasattr(inner, "head") or not hasattr(inner.head, "classification_head"):
             print("   ⚠️  Cannot find RetinaNet classification_head — shadow loss reweight disabled")
             self.shadow_loss_reweight = False
-            self._cls_loss_patched = True
+            self._cls_loss_patched    = True
             return
 
-        cls_head      = inner.head.classification_head
-        original_loss = cls_head.compute_loss
-        model_ref     = self   # closure reference
+        cls_head  = inner.head.classification_head
+        model_ref = self
 
         def patched_compute_loss(targets, head_outputs, matched_idxs):
             from torchvision.ops import sigmoid_focal_loss
 
             losses     = []
-            cls_logits = head_outputs["cls_logits"]  # list of (total_anchors, C) per image
-            gt_weights = model_ref._current_shadow_gt_weights  # list of (N_gt,) per image, or None
+            cls_logits = head_outputs["cls_logits"]
+            gt_weights = model_ref._current_shadow_gt_weights
 
             for img_idx, (targets_per_image, cls_logits_per_image, matched_idxs_per_image) in enumerate(
                 zip(targets, cls_logits, matched_idxs)
             ):
                 foreground_idxs = matched_idxs_per_image >= 0
                 num_foreground  = foreground_idxs.sum()
-                # Exclude anchors in the between-thresholds ignore band (identical to original)
-                valid_idxs = matched_idxs_per_image != cls_head.BETWEEN_THRESHOLDS
+                valid_idxs      = matched_idxs_per_image != cls_head.BETWEEN_THRESHOLDS
 
                 gt_classes_target = torch.zeros_like(cls_logits_per_image)
                 gt_classes_target[
@@ -874,23 +329,21 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
                     targets_per_image["labels"][matched_idxs_per_image[foreground_idxs]],
                 ] = 1.0
 
-                # Per-anchor focal loss (reduction="none" so we can apply weights)
                 per_anchor_loss = sigmoid_focal_loss(
                     cls_logits_per_image[valid_idxs],
                     gt_classes_target[valid_idxs],
                     reduction="none",
-                ).sum(dim=-1)   # (num_valid_anchors,)
+                ).sum(dim=-1)
 
-                # Per-anchor weight: 1.0 everywhere, shadow_loss_weight for shadow-casting GT anchors
                 anchor_weights = torch.ones(
                     valid_idxs.sum(), dtype=per_anchor_loss.dtype, device=per_anchor_loss.device
                 )
                 if gt_weights is not None and img_idx < len(gt_weights):
-                    w               = gt_weights[img_idx].to(per_anchor_loss.device)  # (N_gt,)
-                    fg_in_valid     = foreground_idxs[valid_idxs]   # bool mask within valid anchors
-                    matched_gt      = matched_idxs_per_image[valid_idxs][fg_in_valid]
-                    valid_match     = matched_gt < len(w)
-                    fg_valid_pos    = fg_in_valid.nonzero(as_tuple=True)[0]
+                    w            = gt_weights[img_idx].to(per_anchor_loss.device)
+                    fg_in_valid  = foreground_idxs[valid_idxs]
+                    matched_gt   = matched_idxs_per_image[valid_idxs][fg_in_valid]
+                    valid_match  = matched_gt < len(w)
+                    fg_valid_pos = fg_in_valid.nonzero(as_tuple=True)[0]
                     anchor_weights[fg_valid_pos[valid_match]] = w[matched_gt[valid_match]]
 
                 losses.append(
@@ -904,35 +357,201 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
         print(f"   ✅ RetinaNet cls loss patched — shadow GT weight={self.shadow_loss_weight}x")
 
     # ------------------------------------------------------------------
-    # Training / Validation steps
+    # Unified head loss patch (shadow + canopy)
     # ------------------------------------------------------------------
+
+    def _patch_retinanet_head_loss(self):
+        """Replace RetinaNetHead.compute_loss with a unified version that
+        applies shadow GT weighting AND polygon-precise canopy positive
+        handling.  Operates at the head level (not classification_head) so
+        it has access to ``anchors`` for per-anchor IoP computation.
+        """
+        if self._head_loss_patched:
+            return
+
+        inner = self.model
+        if hasattr(inner, "model"):
+            inner = inner.model
+        if not hasattr(inner, "head") or not hasattr(inner.head, "classification_head"):
+            print("   ⚠️  Cannot find RetinaNet head — canopy policy disabled")
+            self.canopy_enabled    = False
+            self._head_loss_patched = True
+            return
+
+        head      = inner.head
+        cls_head  = head.classification_head
+        reg_head  = head.regression_head
+        model_ref = self
+        iop_thr   = self.CANOPY_IOP_THRESH
+
+        def patched_head_compute_loss(targets, head_outputs, anchors, matched_idxs):
+            from torchvision.ops import sigmoid_focal_loss
+
+            cls_logits_all = head_outputs["cls_logits"]
+            bbox_reg_all   = head_outputs["bbox_regression"]
+            cls_losses     = []
+            reg_losses     = []
+
+            shadow_gt_weights  = model_ref._current_shadow_gt_weights
+            canopy_polys_batch = model_ref._current_canopy_polygons
+            sizes_pre          = model_ref._current_image_sizes_pre  or []
+            sizes_post         = model_ref._current_image_sizes_post or []
+            canopy_on          = model_ref.canopy_enabled
+
+            for img_idx, (targets_per_image, cls_logits_per_image,
+                          bbox_reg_per_image, anchors_per_image,
+                          matched_idxs_per_image) in enumerate(zip(
+                targets, cls_logits_all, bbox_reg_all, anchors, matched_idxs
+            )):
+                device    = cls_logits_per_image.device
+                N_anchors = anchors_per_image.shape[0]
+
+                foreground_idxs = matched_idxs_per_image >= 0
+                num_foreground  = int(foreground_idxs.sum().item())
+                valid_idxs      = matched_idxs_per_image != cls_head.BETWEEN_THRESHOLDS
+
+                # ----- Per-anchor canopy IoP & positive mask -----
+                canopy_positive_mask = torch.zeros(N_anchors, dtype=torch.bool, device=device)
+
+                if (canopy_on and canopy_polys_batch is not None
+                        and img_idx < len(canopy_polys_batch)
+                        and canopy_polys_batch[img_idx]
+                        and img_idx < len(sizes_pre) and img_idx < len(sizes_post)):
+                    pre_h, pre_w  = sizes_pre[img_idx]
+                    post_h, post_w = sizes_post[img_idx]
+                    scale_w = post_w / max(1, pre_w)
+                    scale_h = post_h / max(1, pre_h)
+                    integral = model_ref._build_canopy_integral(
+                        canopy_polys_batch[img_idx], post_h, post_w, scale_w, scale_h
+                    )
+                    if integral is not None:
+                        integral_t = torch.from_numpy(integral).to(device)
+                        iop = model_ref._anchor_iop_from_integral(
+                            anchors_per_image, integral_t, post_h, post_w
+                        )
+                        canopy_positive_mask = iop >= iop_thr
+
+                # ===== Classification loss =====
+                # canopy_loss_scale == 0 short-circuits to iscrowd semantics:
+                # canopy anchors are dropped from cls + denominator entirely.
+                canopy_acts_as_ignore = (
+                    model_ref.canopy_loss_scale == 0.0 and canopy_positive_mask.any()
+                )
+                if canopy_acts_as_ignore:
+                    effective_valid = valid_idxs & ~canopy_positive_mask
+                else:
+                    effective_valid = valid_idxs
+
+                gt_classes_target = torch.zeros_like(cls_logits_per_image)
+                gt_classes_target[
+                    foreground_idxs,
+                    targets_per_image["labels"][matched_idxs_per_image[foreground_idxs]],
+                ] = 1.0
+                # Treat canopy-positive anchors as positives for the (single) tree
+                # class — unless scale=0.0, in which case they're ignored above.
+                if canopy_positive_mask.any() and not canopy_acts_as_ignore:
+                    gt_classes_target[canopy_positive_mask, 0] = 1.0
+
+                per_anchor_loss = sigmoid_focal_loss(
+                    cls_logits_per_image[effective_valid],
+                    gt_classes_target[effective_valid],
+                    reduction="none",
+                ).sum(dim=-1)
+
+                anchor_weights = torch.ones_like(per_anchor_loss)
+
+                # Shadow weights for foreground anchors
+                if shadow_gt_weights is not None and img_idx < len(shadow_gt_weights):
+                    w           = shadow_gt_weights[img_idx].to(device)
+                    fg_in_valid = foreground_idxs[effective_valid]
+                    matched_gt  = matched_idxs_per_image[effective_valid][fg_in_valid]
+                    valid_match = matched_gt < len(w)
+                    fg_valid_pos = fg_in_valid.nonzero(as_tuple=True)[0]
+                    anchor_weights[fg_valid_pos[valid_match]] = w[matched_gt[valid_match]]
+
+                # Canopy contribution can be dampened by canopy_loss_scale (≤1.0)
+                # to stop large polygons from outvoting ITC anchors.
+                if canopy_acts_as_ignore:
+                    n_canopy_pos = 0  # excluded from both numerator and denominator
+                    total_loss   = (per_anchor_loss * anchor_weights).sum()
+                else:
+                    positive_in_valid = canopy_positive_mask[effective_valid]
+                    n_canopy_pos      = int(positive_in_valid.sum().item())
+
+                    if n_canopy_pos > 0 and model_ref.canopy_loss_scale != 1.0:
+                        non_canopy = ~positive_in_valid
+                        non_canopy_sum = (per_anchor_loss[non_canopy] *
+                                          anchor_weights[non_canopy]).sum()
+                        canopy_sum     = (per_anchor_loss[positive_in_valid] *
+                                          anchor_weights[positive_in_valid]).sum()
+                        total_loss = non_canopy_sum + canopy_sum * model_ref.canopy_loss_scale
+                    else:
+                        total_loss = (per_anchor_loss * anchor_weights).sum()
+
+                norm = max(1, num_foreground + n_canopy_pos)
+                cls_losses.append(total_loss / norm)
+
+                # ===== Regression loss =====
+                if num_foreground == 0:
+                    reg_losses.append(cls_logits_per_image.new_zeros(()))
+                    continue
+
+                fg_idxs_pos = foreground_idxs.nonzero(as_tuple=True)[0]
+                # Suppress regression for foreground anchors that are also canopy-
+                # positive: pseudo-canopy GT boxes are not precise crown targets.
+                if canopy_on and canopy_positive_mask.any():
+                    keep = ~canopy_positive_mask[fg_idxs_pos]
+                    fg_idxs_pos = fg_idxs_pos[keep]
+
+                if fg_idxs_pos.numel() == 0:
+                    reg_losses.append(cls_logits_per_image.new_zeros(()))
+                    continue
+
+                matched_gt_boxes  = targets_per_image["boxes"][
+                    matched_idxs_per_image[fg_idxs_pos]
+                ]
+                anchors_fg        = anchors_per_image[fg_idxs_pos]
+                reg_pred_fg       = bbox_reg_per_image[fg_idxs_pos]
+                target_regression = reg_head.box_coder.encode_single(
+                    matched_gt_boxes, anchors_fg
+                )
+                reg_loss_img = F.l1_loss(
+                    reg_pred_fg, target_regression, reduction="sum"
+                ) / max(1, num_foreground)
+                reg_losses.append(reg_loss_img)
+
+            N_batch = max(1, len(targets))
+            return {
+                "classification":  sum(cls_losses) / N_batch,
+                "bbox_regression": sum(reg_losses) / N_batch,
+            }
+
+        head.compute_loss        = patched_head_compute_loss
+        self._head_loss_patched  = True
+        # When the head patch is active, classification_head.compute_loss is no
+        # longer invoked, so the shadow-only cls patch is unnecessary.
+        self._cls_loss_patched   = True
+        print(f"   ✅ RetinaNet head loss patched — canopy={self.canopy_enabled}  "
+              f"shadow={self.shadow_loss_reweight}")
+
+    # ------------------------------------------------------------------
+    # Lightning overrides
+    # ------------------------------------------------------------------
+
+    def on_train_start(self):
+        if self.canopy_enabled:
+            self._patch_transform_capture()
+            self._patch_retinanet_head_loss()
+        elif self.shadow_loss_reweight and not self._cls_loss_patched:
+            self._patch_retinanet_cls_loss()
+        if hasattr(super(), "on_train_start"):
+            super().on_train_start()
 
     def training_step(self, batch, batch_idx):
         images      = batch[0]
         targets     = batch[1]
         image_paths = batch[2] if len(batch) > 2 else [None] * len(images)
 
-        # Normalise WON bbox sizes before loss computation
-        targets = self._maybe_shrink_won_targets(targets, image_paths)
-
-        # Compute raw shadow maps and direction vectors (read by layer2/layer3 hooks)
-        if self.shadow_cross_attention:
-            self._current_shadow_map = self._compute_shadow_map_batch(images, image_paths)
-            self._current_shadow_dir = self._compute_shadow_dir_batch(images, image_paths)
-        else:
-            self._current_shadow_map = None
-            self._current_shadow_dir = None
-
-        # Shadow proposal injection — reuse shadow maps if already computed
-        if self.shadow_proposals:
-            self._current_shadow_proposals = self._compute_shadow_proposals_batch(
-                images, image_paths, shadow_maps_batch=self._current_shadow_map
-            )
-        else:
-            self._current_shadow_proposals = None
-
-        # Shadow loss reweighting — compute per-GT weights before forward pass
-        # (the patched cls head reads self._current_shadow_gt_weights during forward)
         if self.shadow_loss_reweight:
             self._current_shadow_gt_weights = self._compute_shadow_gt_weights(
                 images, image_paths, targets
@@ -940,120 +559,12 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
         else:
             self._current_shadow_gt_weights = None
 
-        # Replace RGB with shadow map (ablation F) or prepend as 4th channel
-        if self.shadow_input_only:
-            images = self._replace_with_shadow_input(images, image_paths)
-        elif self.shadow_channel:
-            images = self._prepend_shadow_channel(images, image_paths)
+        if self.canopy_enabled:
+            self._current_canopy_polygons = [
+                t.get("canopy_polygons", []) if isinstance(t, dict) else []
+                for t in targets
+            ]
+        else:
+            self._current_canopy_polygons = None
 
-        batch = (images, targets, *batch[2:])
         return super().training_step(batch, batch_idx)
-
-    def validation_step(self, batch, batch_idx):
-        images      = batch[0]
-        targets     = batch[1]
-        image_paths = batch[2] if len(batch) > 2 else [None] * len(images)
-
-        # Normalise WON bbox sizes before metric computation (same transform as training)
-        targets = self._maybe_shrink_won_targets(targets, image_paths)
-
-        if self.shadow_cross_attention:
-            self._current_shadow_map = self._compute_shadow_map_batch(images, image_paths)
-            self._current_shadow_dir = self._compute_shadow_dir_batch(images, image_paths)
-        else:
-            self._current_shadow_map = None
-            self._current_shadow_dir = None
-
-        if self.shadow_proposals:
-            self._current_shadow_proposals = self._compute_shadow_proposals_batch(
-                images, image_paths, shadow_maps_batch=self._current_shadow_map
-            )
-        else:
-            self._current_shadow_proposals = None
-
-        if self.shadow_input_only:
-            images = self._replace_with_shadow_input(images, image_paths)
-        elif self.shadow_channel:
-            images = self._prepend_shadow_channel(images, image_paths)
-
-        batch  = (images, targets, *batch[2:])
-
-        return super().validation_step(batch, batch_idx)
-
-    def on_validation_epoch_end(self):
-        if hasattr(super(), "on_validation_epoch_end"):
-            super().on_validation_epoch_end()
-
-    def predict_step(self, batch, batch_idx, dataloader_idx=0):
-        if isinstance(batch, (list, tuple)) and len(batch) > 2:
-            images      = batch[0]
-            image_paths = batch[2]
-        elif isinstance(batch, list):
-            images      = batch
-            image_paths = [None] * len(images)
-        else:
-            images      = list(batch)
-            image_paths = [None] * len(images)
-
-        if self.shadow_cross_attention:
-            self._current_shadow_map = self._compute_shadow_map_batch(images, image_paths)
-            self._current_shadow_dir = self._compute_shadow_dir_batch(images, image_paths)
-        else:
-            self._current_shadow_map = None
-            self._current_shadow_dir = None
-
-        if self.shadow_proposals:
-            self._current_shadow_proposals = self._compute_shadow_proposals_batch(
-                images, image_paths, shadow_maps_batch=self._current_shadow_map
-            )
-        else:
-            self._current_shadow_proposals = None
-
-        if self.shadow_channel:
-            prepended = self._prepend_shadow_channel(images, image_paths)
-            if isinstance(batch, (list, tuple)) and len(batch) > 2:
-                batch = (prepended, batch[1], *batch[2:])
-            else:
-                batch = prepended
-
-        return super().predict_step(batch, batch_idx, dataloader_idx)
-
-    # ------------------------------------------------------------------
-    # Optimizer
-    # ------------------------------------------------------------------
-
-    def configure_optimizers(self):
-        backbone_lr = self.config.train.lr if self.config else 0.001
-        sca_lr      = backbone_lr * 10   # SCA modules need to adapt faster than pretrained backbone
-
-        if self.freeze_backbone:
-            extra = []
-            if self.shadow_cross_attention:
-                extra += list(self.shadow_anticipation.parameters())
-            params = [{"params": extra, "lr": sca_lr}]
-            print(f"   Optimizer: Adam  sca_lr={sca_lr} (backbone FROZEN, ShadowAnticipation only)")
-        else:
-            params = [{"params": self.model.parameters(), "lr": backbone_lr}]
-            if self.shadow_cross_attention:
-                params += [
-                    {"params": self.shadow_anticipation.parameters(), "lr": sca_lr},
-                ]
-                print(f"   Optimizer: SGD  backbone_lr={backbone_lr}  sca_lr={sca_lr} (10x backbone)")
-            else:
-                print(f"   Optimizer: SGD  backbone_lr={backbone_lr}")
-
-        if self.freeze_backbone and self.shadow_cross_attention:
-            # Stage 2: Adam for shadow-only training (short gradient chain, benefits from
-            # per-parameter adaptive LR)
-            optimizer = torch.optim.Adam(params, lr=sca_lr, weight_decay=1e-4)
-        else:
-            optimizer = torch.optim.SGD(params, lr=backbone_lr, momentum=0.9, weight_decay=1e-4)
-
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="min", factor=0.1, patience=5, verbose=True
-        )
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": {"scheduler": scheduler, "monitor": "val_loss",
-                             "interval": "epoch", "frequency": 1},
-        }
