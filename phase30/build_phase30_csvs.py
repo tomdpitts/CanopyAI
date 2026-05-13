@@ -193,11 +193,36 @@ def subdivide_canopy(polygon: Polygon, cell_size: int, img_w: int, img_h: int) -
     return boxes
 
 
+def _polygon_to_coord_lists(geom) -> list:
+    """Flatten a Shapely Polygon/MultiPolygon exterior into [x1,y1,x2,y2,...] lists.
+    MultiPolygon parts are emitted as separate entries.  Returns [] for empty input.
+    """
+    if geom is None or geom.is_empty:
+        return []
+    if geom.geom_type == "Polygon":
+        parts = [geom]
+    elif geom.geom_type == "MultiPolygon":
+        parts = list(geom.geoms)
+    else:
+        return []
+    out = []
+    for g in parts:
+        if g.is_empty:
+            continue
+        coords = np.asarray(g.exterior.coords, dtype=np.float32)
+        if len(coords) < 3:
+            continue
+        out.append([float(v) for v in coords.flatten()])
+    return out
+
+
 def process_tile(item: dict, tile_stem: str, img_path: Path,
-                 shadow_vecs: dict) -> tuple[list, int, int]:
+                 shadow_vecs: dict) -> tuple[list, int, int, list]:
     """
     Extract training rows for one tile.
-    Returns (rows, n_itc, n_pseudo_canopy).
+    Returns (rows, n_itc, n_pseudo_canopy, canopy_polygons_flat).
+    canopy_polygons_flat is a list of [x1,y1,x2,y2,...] vertex lists in full-tile
+    pixel space, one per cat=1 polygon component (after parse_polygon/buffer fix).
     """
     raw = item.get("coco_annotations") or []
     if isinstance(raw, str):
@@ -229,8 +254,9 @@ def process_tile(item: dict, tile_stem: str, img_path: Path,
 
     cell_size = max(20, int(np.percentile(itc_widths, 75))) if itc_widths else CANOPY_DEFAULT_SIZE
 
-    # Canopy annotations (category 1) → pseudo-ITC grid
-    canopy_rows = []
+    # Canopy annotations (category 1) → pseudo-ITC grid + raw polygons (for canopy_mode)
+    canopy_rows         = []
+    canopy_polygons_raw = []
     for ann in anns:
         if ann.get("category_id") != CANOPY_CAT:
             continue
@@ -241,6 +267,7 @@ def process_tile(item: dict, tile_stem: str, img_path: Path,
         if poly is None or poly.is_empty or poly.area < (cell_size ** 2) * 0.25:
             continue
         canopy_rows.extend(subdivide_canopy(poly, cell_size, img_w, img_h))
+        canopy_polygons_raw.extend(_polygon_to_coord_lists(poly))
 
     # Shadow vectors keyed by tcd_{image_id} in the new by-id JSON
     image_id = item.get("image_id")
@@ -268,7 +295,7 @@ def process_tile(item: dict, tile_stem: str, img_path: Path,
             "shadow_y":     shadow_y,
             "domain":       "TCD",
             "fold":         fold,
-        }], 0, 0
+        }], 0, 0, canopy_polygons_raw
 
     rows = [
         {
@@ -284,7 +311,7 @@ def process_tile(item: dict, tile_stem: str, img_path: Path,
         }
         for b in all_boxes
     ]
-    return rows, len(itc_rows), len(canopy_rows)
+    return rows, len(itc_rows), len(canopy_rows), canopy_polygons_raw
 
 
 # ---------------------------------------------------------------------------
@@ -315,6 +342,7 @@ def main():
     total_pseudo = 0
     missing_tif  = 0
     empty_tiles  = 0
+    canopy_polys_by_tile: dict[str, list] = {}   # tile basename → list of flat coord lists
 
     if args.from_disk:
         tifs = sorted(
@@ -343,10 +371,12 @@ def main():
             with open(meta_path) as f:
                 item = json.load(f)
 
-            rows, n_itc, n_pseudo = process_tile(item, tile_stem, tif_path, shadow_vecs)
+            rows, n_itc, n_pseudo, canopy_polys = process_tile(item, tile_stem, tif_path, shadow_vecs)
             all_rows.extend(rows)
             total_itc    += n_itc
             total_pseudo += n_pseudo
+            if canopy_polys:
+                canopy_polys_by_tile[tif_path.name] = canopy_polys
             if n_itc == 0 and n_pseudo == 0:
                 empty_tiles += 1
 
@@ -394,10 +424,12 @@ def main():
                 with open(meta_path, "w") as f:
                     json.dump(meta, f)
 
-            rows, n_itc, n_pseudo = process_tile(item, tile_stem, img_path, shadow_vecs)
+            rows, n_itc, n_pseudo, canopy_polys = process_tile(item, tile_stem, img_path, shadow_vecs)
             all_rows.extend(rows)
             total_itc    += n_itc
             total_pseudo += n_pseudo
+            if canopy_polys:
+                canopy_polys_by_tile[img_path.name] = canopy_polys
             if n_itc == 0 and n_pseudo == 0:
                 empty_tiles += 1
 
@@ -441,10 +473,19 @@ def main():
     train_df.to_csv(train_path, index=False)
     val_df.to_csv(val_path,     index=False)
 
+    # Canopy polygons companion file (keyed by tile basename) — full-tile pixel space.
+    # Consumed by ShadowConditionedDeepForest when --canopy-mode is set.
+    canopy_path = OUT_DIR / "phase30_tcd_canopy_polygons.json"
+    with open(canopy_path, "w") as f:
+        json.dump(canopy_polys_by_tile, f)
+    n_canopy_tiles = len(canopy_polys_by_tile)
+    n_canopy_polys = sum(len(v) for v in canopy_polys_by_tile.values())
+
     n_train_tiles = train_df["image_path"].nunique()
     n_val_tiles   = val_df["image_path"].nunique()
     print(f"\nTrain CSV : {len(train_df):6d} rows  {n_train_tiles} tiles → {train_path.name}")
     print(f"Val CSV   : {len(val_df):6d} rows  {n_val_tiles} tiles → {val_path.name}")
+    print(f"Canopy JSON: {n_canopy_polys:6d} polygons  {n_canopy_tiles} tiles → {canopy_path.name}")
     print("\nNext:")
     print("  modal volume put canopyai-deepforest-data "
           "phase30/phase30_tcd_train.csv phase30_tcd_train.csv")

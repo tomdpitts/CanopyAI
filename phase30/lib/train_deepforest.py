@@ -142,6 +142,134 @@ except ImportError:
     from models import ShadowConditionedDeepForest
 
 
+class _CanopyAwareTrainDataset:
+    """Wraps a deepforest BoxDataset to perform a manual random crop so that
+    canopy polygon coordinates can be transformed into crop-local space
+    alongside GT boxes.
+
+    Each ``__getitem__`` returns ``(image, target_dict, image_name)`` where
+    ``target_dict["canopy_polygons"]`` is a list of ``np.ndarray(V, 2)``
+    polygon vertex arrays in crop-local pixel coords (shape varies per
+    polygon).  Spatial augmentations are deliberately omitted from the
+    post-crop transform — only colour augmentations should be used with
+    canopy_mode because flipping/rotating the patch would invalidate the
+    polygon coordinates.
+
+    Defined at module level so it can be pickled by multiprocessing workers.
+    """
+
+    def __init__(self, base_ds, canopy_polygons_by_key, patch_size,
+                 post_crop_transform, min_visibility):
+        self.base               = base_ds
+        self.canopy_by_key      = canopy_polygons_by_key
+        self.patch_size         = patch_size
+        self.transform          = post_crop_transform   # albumentations.Compose, no crop
+        self.min_vis            = min_visibility
+        self.image_names        = base_ds.image_names
+        self.collate_fn         = base_ds.collate_fn
+        # Worker-local RNG seeded by base PID — each worker gets independent crops.
+        self._rng = np.random.default_rng()
+
+    def __len__(self):
+        return len(self.image_names)
+
+    def __getitem__(self, idx):
+        img_name = self.image_names[idx]
+        img      = self.base.load_image(idx)
+        H_full, W_full = img.shape[:2]
+        cs = self.patch_size
+
+        if H_full > cs and W_full > cs:
+            cy_off = int(self._rng.integers(0, H_full - cs + 1))
+            cx_off = int(self._rng.integers(0, W_full - cs + 1))
+        else:
+            cy_off = cx_off = 0
+        ch = min(cs, H_full)
+        cw = min(cs, W_full)
+        patch = img[cy_off:cy_off + ch, cx_off:cx_off + cw]
+
+        # --- Clip GT boxes ---
+        gt        = self.base.annotations_for_path(img_name)
+        boxes     = gt["boxes"]
+        labels    = gt["labels"]
+        if len(boxes):
+            cx1 = np.clip(boxes[:, 0] - cx_off, 0, cw)
+            cy1 = np.clip(boxes[:, 1] - cy_off, 0, ch)
+            cx2 = np.clip(boxes[:, 2] - cx_off, 0, cw)
+            cy2 = np.clip(boxes[:, 3] - cy_off, 0, ch)
+            bw  = boxes[:, 2] - boxes[:, 0]
+            bh  = boxes[:, 3] - boxes[:, 1]
+            vis = np.where(
+                bw * bh > 0,
+                np.maximum(cx2 - cx1, 0) * np.maximum(cy2 - cy1, 0) / (bw * bh),
+                0,
+            )
+            keep = vis >= self.min_vis
+            if keep.any():
+                gt_boxes  = np.stack(
+                    [cx1[keep], cy1[keep], cx2[keep], cy2[keep]],
+                    axis=1,
+                ).astype(np.float32)
+                gt_labels = labels[keep]
+            else:
+                gt_boxes, gt_labels = np.zeros((0, 4), np.float32), np.zeros(0, np.int64)
+        else:
+            gt_boxes, gt_labels = np.zeros((0, 4), np.float32), np.zeros(0, np.int64)
+
+        # --- Clip canopy polygons ---
+        key        = Path(img_name).name
+        polys_full = self.canopy_by_key.get(key, [])
+        polys_crop = []
+        if polys_full:
+            from shapely.geometry import box as shapely_box, Polygon
+            window = shapely_box(cx_off, cy_off, cx_off + cw, cy_off + ch)
+            for verts in polys_full:
+                if len(verts) < 3:
+                    continue
+                try:
+                    poly = Polygon(verts)
+                    if not poly.is_valid:
+                        poly = poly.buffer(0)
+                    clipped = poly.intersection(window)
+                    if clipped.is_empty or clipped.area < 4.0:
+                        continue
+                    if clipped.geom_type == "Polygon":
+                        parts = [clipped]
+                    elif clipped.geom_type == "MultiPolygon":
+                        parts = list(clipped.geoms)
+                    else:
+                        parts = []
+                    for g in parts:
+                        if g.is_empty or g.area < 4.0:
+                            continue
+                        ext = np.asarray(g.exterior.coords, dtype=np.float32)
+                        ext[:, 0] -= cx_off
+                        ext[:, 1] -= cy_off
+                        polys_crop.append(ext)
+                except Exception:
+                    continue
+
+        # --- Post-crop transform (no crop here, no spatial aug) ---
+        if self.transform is not None:
+            aug         = self.transform(image=patch, bboxes=gt_boxes,
+                                          category_ids=gt_labels)
+            image_t     = aug["image"]
+            gt_boxes    = np.array(aug["bboxes"], dtype=np.float32).reshape(-1, 4)
+            gt_labels   = np.array(aug["category_ids"], dtype=np.int64).reshape(-1)
+        else:
+            image_t = torch.from_numpy(np.rollaxis(patch, 2, 0)).float()
+
+        boxes_t  = torch.from_numpy(gt_boxes).float()  if len(gt_boxes)  else torch.zeros((0, 4), dtype=torch.float32)
+        labels_t = torch.from_numpy(gt_labels)         if len(gt_labels) else torch.zeros(0, dtype=torch.int64)
+
+        target = {
+            "boxes":           boxes_t,
+            "labels":          labels_t,
+            "canopy_polygons": polys_crop,   # list[np.ndarray(V,2)] crop-local px
+        }
+        return image_t, target, img_name
+
+
 class _TiledValDataset:
     """Tiles each 2048×2048 val image into 400×400 patches for validation.
     Defined at module level so it can be pickled by multiprocessing workers."""
@@ -381,9 +509,15 @@ def train_deepforest(
     accelerator=None,
     shadow_loss_reweight=False,
     shadow_loss_weight=2.0,
-    augmentations=None,           # list of dicts; overrides default augmentation
+    canopy_mode=None,                # None / "ignore" / "upweight" / "both"
+    canopy_polygons_path=None,       # JSON written by build_phase30_csvs.py
+    canopy_loss_weight=2.0,
+    canopy_loss_scale=0.5,
+    canopy_iop_ignore_thresh=0.1,
+    canopy_iop_upweight_thresh=0.4,
+    augmentations=None,              # list of dicts; overrides default augmentation
     fast_dev_run=False,
-    precision=None,               # override Lightning precision (e.g. "16-mixed", "16-mps")
+    precision=None,                  # override Lightning precision (e.g. "16-mixed", "16-mps")
 ):
     """
     Train a DeepForest model on TCD data with optional shadow loss reweighting.
@@ -415,15 +549,22 @@ def train_deepforest(
 
     print("\n⚙️  Initializing model...")
 
-    if shadow_loss_reweight:
+    if shadow_loss_reweight or canopy_mode is not None:
         model = ShadowConditionedDeepForest(
             train_csv=train_csv,
             val_csv=val_csv,
-            shadow_loss_reweight=True,
+            shadow_loss_reweight=shadow_loss_reweight,
             shadow_loss_weight=shadow_loss_weight,
+            canopy_mode=canopy_mode,
+            canopy_polygons_path=canopy_polygons_path,
+            canopy_loss_weight=canopy_loss_weight,
+            canopy_loss_scale=canopy_loss_scale,
+            canopy_iop_ignore_thresh=canopy_iop_ignore_thresh,
+            canopy_iop_upweight_thresh=canopy_iop_upweight_thresh,
         )
     else:
         print("   Shadow loss reweighting: DISABLED")
+        print("   Canopy loss policy: DISABLED")
         model = deepforest_main.deepforest()
 
     import traceback
@@ -435,7 +576,7 @@ def train_deepforest(
             ck_keys          = list(state_dict.keys())
             has_model_prefix = any(k.startswith("model.") for k in ck_keys)
 
-            if has_model_prefix and shadow_loss_reweight:
+            if has_model_prefix and (shadow_loss_reweight or canopy_mode is not None):
                 missing, unexpected = model.load_state_dict(state_dict, strict=False)
                 print(f"   Loaded full wrapper checkpoint ({len(ck_keys)} keys)")
                 if missing:    print(f"   Missing ({len(missing)}): {missing[:3]}...")
@@ -498,7 +639,17 @@ def train_deepforest(
                                clip=True, min_visibility=MIN_VIS)
     crop_t      = A.RandomCrop(height=CROP_SIZE, width=CROP_SIZE, p=1.0)
 
-    def _build_train_transform(extra_augs):
+    # Spatial augmentations are not safe with canopy_mode because the
+    # _CanopyAwareTrainDataset wrapper performs its own crop and stores polygon
+    # coords in crop-local space — albumentations flips/rotates would desync them.
+    _SPATIAL_AUG_NAMES = {
+        "HorizontalFlip", "VerticalFlip", "Flip", "RandomRotate90", "Rotate",
+        "Affine", "ShiftScaleRotate", "ElasticTransform", "GridDistortion",
+        "OpticalDistortion", "RandomCrop", "Crop", "CenterCrop", "Resize",
+        "Transpose", "SafeRotate", "Perspective",
+    }
+
+    def _build_train_transform(extra_augs, include_crop=True):
         aug_list = []
         for a in (extra_augs or []):
             name   = list(a.keys())[0] if isinstance(a, dict) else a
@@ -506,20 +657,40 @@ def train_deepforest(
             cls    = getattr(A, name, None)
             if cls is not None:
                 aug_list.append(cls(**params) if params else cls())
-        return A.Compose([crop_t] + aug_list + [ToTensorV2()], bbox_params=BBOX_PARAMS)
+        prefix = [crop_t] if include_crop else []
+        return A.Compose(prefix + aug_list + [ToTensorV2()], bbox_params=BBOX_PARAMS)
 
     if augmentations is not None:
         model._train_transform_override = _build_train_transform(augmentations)
         model.config.train.augmentations = OmegaConf.create([])
         names = [list(a.keys())[0] if isinstance(a, dict) else a for a in augmentations]
         print(f"   🔄 Train transform: crop{CROP_SIZE} + {names} + ToTensorV2")
-    elif shadow_loss_reweight:
+    elif shadow_loss_reweight or canopy_mode is not None:
         model._train_transform_override = _build_train_transform(None)
         model.config.train.augmentations = OmegaConf.create([])
-        print(f"   🔄 Train transform: crop{CROP_SIZE} + ToTensorV2 (shadow loss reweight)")
+        print(f"   🔄 Train transform: crop{CROP_SIZE} + ToTensorV2 "
+              f"(shadow/canopy loss reweighting)")
     else:
         model._train_transform_override = _build_train_transform([{"HorizontalFlip": {"p": 0.5}}])
         print(f"   🔄 Train transform: crop{CROP_SIZE} + HorizontalFlip + ToTensorV2 (default)")
+
+    if canopy_mode is not None:
+        # Canopy mode does its own crop in the wrapper; the override transform
+        # must NOT include the crop step.  Strip any spatial augmentations
+        # (flips/rotates) since they would desync polygon coords.
+        spatial_in_augs = []
+        for a in (augmentations or []):
+            name = list(a.keys())[0] if isinstance(a, dict) else a
+            if name in _SPATIAL_AUG_NAMES:
+                spatial_in_augs.append(name)
+        if spatial_in_augs:
+            print(f"   ⚠️  Canopy mode strips spatial augmentations: {spatial_in_augs}")
+        safe_augs = [a for a in (augmentations or []) if (
+            (list(a.keys())[0] if isinstance(a, dict) else a) not in _SPATIAL_AUG_NAMES
+        )]
+        model._canopy_train_transform_no_crop = _build_train_transform(
+            safe_augs, include_crop=False
+        )
 
     if val_csv:
         model.config.validation.csv_file = val_csv
@@ -539,6 +710,19 @@ def train_deepforest(
 
     pin_memory = torch.cuda.is_available()
 
+    def _maybe_wrap_canopy(ds, model_ref):
+        """If canopy_mode is enabled, wrap the BoxDataset so __getitem__ also
+        emits crop-local canopy polygons alongside boxes/labels."""
+        if model_ref.canopy_mode is None or not getattr(model_ref, "canopy_polygons", None):
+            return ds
+        return _CanopyAwareTrainDataset(
+            base_ds=ds,
+            canopy_polygons_by_key=model_ref.canopy_polygons,
+            patch_size=CROP_SIZE,
+            post_crop_transform=getattr(model_ref, "_canopy_train_transform_no_crop", None),
+            min_visibility=MIN_VIS,
+        )
+
     if _empty_image_paths:
         print(f"\n🔲 Found {len(_empty_image_paths)} confirmed-empty (hard-negative) images")
         _clean_train_csv = "/tmp/_clean_train.csv"
@@ -555,18 +739,25 @@ def train_deepforest(
                 ds.transform = self_model._train_transform_override
             print(f"   ✅ Injected {len(_empty_image_paths)} empty images "
                   f"(total: {len(ds.image_names)} images)")
+            ds = _maybe_wrap_canopy(ds, self_model)
             return DataLoader(ds, batch_size=dl.batch_size, shuffle=True,
                               collate_fn=ds.collate_fn, num_workers=8,
                               pin_memory=pin_memory, persistent_workers=True)
 
         model.train_dataloader = types.MethodType(_train_dataloader_with_empties, model)
     else:
-        if hasattr(model, "_train_transform_override"):
+        if hasattr(model, "_train_transform_override") or canopy_mode is not None:
             _orig_tl = model.train_dataloader.__func__
             def _train_dataloader_with_transform(self_model):
                 dl = _orig_tl(self_model)
-                dl.dataset.transform = self_model._train_transform_override
-                return dl
+                if hasattr(self_model, "_train_transform_override"):
+                    dl.dataset.transform = self_model._train_transform_override
+                wrapped = _maybe_wrap_canopy(dl.dataset, self_model)
+                if wrapped is dl.dataset:
+                    return dl
+                return DataLoader(wrapped, batch_size=dl.batch_size, shuffle=True,
+                                  collate_fn=wrapped.collate_fn, num_workers=8,
+                                  pin_memory=pin_memory, persistent_workers=True)
             model.train_dataloader = types.MethodType(_train_dataloader_with_transform, model)
 
     print(f"\n📊 Training data: {len(train_df[~_empty_mask])} boxes, "
@@ -696,7 +887,7 @@ def train_deepforest(
     print("\n✅ Training complete!")
 
     final_model_path = Path(run_output_dir) / "deepforest_final.pth"
-    if shadow_loss_reweight:
+    if shadow_loss_reweight or canopy_mode is not None:
         torch.save(model.state_dict(), str(final_model_path))
     else:
         torch.save(model.model.state_dict(), str(final_model_path))
@@ -722,6 +913,19 @@ def main():
                         help="Upweight focal loss for shadow-casting GT boxes")
     parser.add_argument("--shadow-loss-weight", type=float, default=2.0,
                         help="Focal loss multiplier for shadow-casting GT anchors (default 2.0)")
+    parser.add_argument("--canopy-mode", default=None,
+                        choices=[None, "ignore", "upweight", "both"],
+                        help="Canopy region loss policy (default: disabled)")
+    parser.add_argument("--canopy-polygons", default=None,
+                        help="Path to phase30_tcd_canopy_polygons.json (required if --canopy-mode set)")
+    parser.add_argument("--canopy-loss-weight", type=float, default=2.0,
+                        help="Per-anchor focal loss multiplier for canopy-upweight anchors")
+    parser.add_argument("--canopy-loss-scale",  type=float, default=0.5,
+                        help="Scale factor applied to the summed canopy loss contribution")
+    parser.add_argument("--canopy-iop-ignore-thresh", type=float, default=0.1,
+                        help="IoP threshold above which anchors are ignored (ignore/both)")
+    parser.add_argument("--canopy-iop-upweight-thresh", type=float, default=0.4,
+                        help="IoP threshold above which anchors are upweighted (upweight/both)")
     parser.add_argument("--checkpoint",    default=None,
                         help="Path to initial weights (.pth or .ckpt)")
     parser.add_argument("--fast-dev-run",  action="store_true",
@@ -745,6 +949,12 @@ def main():
         accelerator=args.accelerator,
         shadow_loss_reweight=args.shadow_loss_reweight,
         shadow_loss_weight=args.shadow_loss_weight,
+        canopy_mode=args.canopy_mode,
+        canopy_polygons_path=args.canopy_polygons,
+        canopy_loss_weight=args.canopy_loss_weight,
+        canopy_loss_scale=args.canopy_loss_scale,
+        canopy_iop_ignore_thresh=args.canopy_iop_ignore_thresh,
+        canopy_iop_upweight_thresh=args.canopy_iop_upweight_thresh,
         fast_dev_run=args.fast_dev_run,
         precision=args.precision,
     )
