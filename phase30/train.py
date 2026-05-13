@@ -31,8 +31,9 @@ if __name__ == "__main__":
     p.add_argument("--val-csv",      required=True,  help="Path to validation CSV")
     p.add_argument("--checkpoint",   required=True,  help="Starting checkpoint (.pth or .ckpt)")
     p.add_argument("--output-dir",   default="checkpoints", help="Where to save checkpoints")
-    p.add_argument("--batch-size",   type=int, default=32,  help="Batch size (32 for A100-40GB)")
-    p.add_argument("--fast-dev-run", action="store_true",   help="1 train + 1 val batch then exit")
+    p.add_argument("--batch-size",   type=int,   default=32,     help="Batch size (32 for A100-40GB)")
+    p.add_argument("--lr",           type=float, default=0.0001,  help="Learning rate")
+    p.add_argument("--fast-dev-run", action="store_true",        help="1 train + 1 val batch then exit")
     args = p.parse_args()
 
     train_deepforest(
@@ -43,12 +44,11 @@ if __name__ == "__main__":
         run_name="phase30_tcd_L2",
         epochs=50,
         batch_size=args.batch_size,
-        lr=0.001,
+        lr=args.lr,
         patience=10,
         shadow_loss_reweight=True,
         shadow_loss_weight=2.0,
         augmentations=TCD_AUGMENTATIONS_COLOUR,
         accelerator="gpu",
-        won_bbox_shrink=True,
         fast_dev_run=args.fast_dev_run,
     )
