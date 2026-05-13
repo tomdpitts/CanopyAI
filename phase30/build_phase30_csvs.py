@@ -20,10 +20,11 @@ to completion without interruption (all 4,169 tif files exist on disk).
 A warning is printed for any item whose tif file is missing.
 
 --- Canopy annotation strategy ---
-category_id 2 (ITC): COCO bbox used directly → label="Tree"
-category_id 1 (canopy): large polygon subdivided into a grid of pseudo-ITC
-    bboxes. Only cells where Area(cell ∩ polygon) / Area(cell) ≥ 0.5 are kept.
-    Cell size = median ITC bbox width in same tile, or CANOPY_DEFAULT_SIZE (100px).
+category_id 2 (ITC):    COCO bbox used directly → label="Tree" in the CSV.
+category_id 1 (canopy): polygon vertices written to phase30_tcd_canopy_polygons.json
+    (companion file).  No pseudo-ITC bboxes are added to the CSV — at training
+    time, ShadowConditionedDeepForest reads the JSON and applies the canopy
+    positive policy polygon-precisely via per-anchor IoP against the polygon.
 
 --- Shadow vectors ---
 Joined from data/tcd/tcd_shadow_vectors.json for manually_reviewed tiles only.
@@ -37,12 +38,11 @@ Usage:
 
 import argparse
 import json
-import math
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from shapely.geometry import box as shapely_box, Polygon
+from shapely.geometry import Polygon
 from shapely.ops import unary_union
 from tqdm import tqdm
 
@@ -53,8 +53,7 @@ OUT_DIR   = ROOT / "phase30"
 
 CANOPY_CAT            = 1
 ITC_CAT               = 2
-CANOPY_OVERLAP_THRESH = 0.5
-CANOPY_DEFAULT_SIZE   = 100   # px fallback when tile has no ITC annotations
+MIN_CANOPY_AREA_PX    = 400   # drop degenerate canopy polygons smaller than this
 VAL_FOLD              = 4
 
 
@@ -116,83 +115,6 @@ def parse_polygon(seg, img_w: int, img_h: int):
     return None
 
 
-_RNG = np.random.default_rng(42)
-MAX_BOXES_PER_POLYGON = 5000  # safety cap only — grid pass is no longer K-limited
-EDGE_THRESH           = 0.3   # min fraction of cell area overlapping polygon for edge cells
-
-
-def subdivide_canopy(polygon: Polygon, cell_size: int, img_w: int, img_h: int) -> list:
-    """
-    Jittered grid with edge-cell recovery:
-      Pass 1 — visit every grid cell, place a jittered box where the centroid
-               lands inside the polygon. No K cutoff → full interior coverage.
-      Pass 2 — for cells whose jittered centroid missed the polygon, check if
-               ≥30% of the cell area intersects it; if so, add the box anyway.
-               Catches boundary cells the centroid check would skip.
-    Result: organic randomness preserved, near-zero interior gaps, better edge
-    coverage, no visible grid pattern.
-    """
-    half   = cell_size / 2.0
-    thresh = EDGE_THRESH * cell_size * cell_size
-
-    minx, miny, maxx, maxy = polygon.bounds
-    minx = max(0., minx); miny = max(0., miny)
-    maxx = min(float(img_w), maxx); maxy = min(float(img_h), maxy)
-    if maxx <= minx or maxy <= miny:
-        return []
-
-    W = maxx - minx; H = maxy - miny
-    n_cols = max(1, round(W / cell_size))
-    n_rows = max(1, round(H / cell_size))
-    col_w  = W / n_cols
-    row_h  = H / n_rows
-
-    boxes        = []
-    edge_cells   = []   # (cx, cy, x1, y1, x2, y2) — failed centroid check
-
-    # Pass 1: jittered centroid check over all cells
-    for r in range(n_rows):
-        for c in range(n_cols):
-            cx = minx + (c + _RNG.uniform(0.15, 0.85)) * col_w
-            cy = miny + (r + _RNG.uniform(0.15, 0.85)) * row_h
-            x1 = max(0., cx - half);          y1 = max(0., cy - half)
-            x2 = min(float(img_w), cx + half); y2 = min(float(img_h), cy + half)
-            try:
-                inside = polygon.contains(
-                    shapely_box(cx - half, cy - half, cx + half, cy + half).centroid)
-            except Exception:
-                inside = False
-            if inside:
-                boxes.append((x1, y1, x2, y2))
-            else:
-                edge_cells.append((cx, cy, x1, y1, x2, y2))
-
-    # Pass 2: intersection-area check for cells that failed pass 1
-    for cx, cy, x1, y1, x2, y2 in edge_cells:
-        if len(boxes) >= MAX_BOXES_PER_POLYGON:
-            break
-        try:
-            cell = shapely_box(x1, y1, x2, y2)
-            if polygon.intersects(cell) and polygon.intersection(cell).area >= thresh:
-                boxes.append((x1, y1, x2, y2))
-        except Exception:
-            pass
-
-    if len(boxes) > MAX_BOXES_PER_POLYGON:
-        boxes = boxes[:MAX_BOXES_PER_POLYGON]
-
-    # Centroid fallback for zero-box polygons (degenerate/very small)
-    if not boxes:
-        try:
-            c = polygon.centroid
-            cx, cy = float(c.x), float(c.y)
-            boxes.append((max(0., cx - half), max(0., cy - half),
-                          min(float(img_w), cx + half), min(float(img_h), cy + half)))
-        except Exception:
-            pass
-    return boxes
-
-
 def _polygon_to_coord_lists(geom) -> list:
     """Flatten a Shapely Polygon/MultiPolygon exterior into [x1,y1,x2,y2,...] lists.
     MultiPolygon parts are emitted as separate entries.  Returns [] for empty input.
@@ -217,12 +139,19 @@ def _polygon_to_coord_lists(geom) -> list:
 
 
 def process_tile(item: dict, tile_stem: str, img_path: Path,
-                 shadow_vecs: dict) -> tuple[list, int, int, list]:
+                 shadow_vecs: dict) -> tuple[list, int, list]:
     """
     Extract training rows for one tile.
-    Returns (rows, n_itc, n_pseudo_canopy, canopy_polygons_flat).
-    canopy_polygons_flat is a list of [x1,y1,x2,y2,...] vertex lists in full-tile
-    pixel space, one per cat=1 polygon component (after parse_polygon/buffer fix).
+
+    Returns (rows, n_itc, canopy_polygons_flat) where:
+        rows                 -- list[dict] of CSV rows (ITC bboxes only; tiles
+                                with no ITC bboxes emit a single NaN-bbox
+                                hard-negative row).
+        n_itc                -- number of genuine ITC bboxes from category 2.
+        canopy_polygons_flat -- list of [x1,y1,...] vertex arrays in full-tile
+                                pixel space, one per cat=1 polygon component.
+                                Written to phase30_tcd_canopy_polygons.json by
+                                main(); training reads it via canopy_polygons_path.
     """
     raw = item.get("coco_annotations") or []
     if isinstance(raw, str):
@@ -235,9 +164,8 @@ def process_tile(item: dict, tile_stem: str, img_path: Path,
     img_h  = item.get("height", 2048)
     fold   = item.get("validation_fold", -1)
 
-    # ITC annotations (category 2)
-    itc_rows    = []
-    itc_widths  = []
+    # ITC annotations (category 2) — the only GT bboxes written to the CSV.
+    itc_rows = []
     for ann in anns:
         if ann.get("category_id") != ITC_CAT:
             continue
@@ -249,13 +177,11 @@ def process_tile(item: dict, tile_stem: str, img_path: Path,
         ymin = max(0.0, min(ymin, img_h)); ymax = max(0.0, min(ymax, img_h))
         if xmax <= xmin or ymax <= ymin:
             continue
-        itc_widths.append(xmax - xmin)
         itc_rows.append((xmin, ymin, xmax, ymax))
 
-    cell_size = max(20, int(np.percentile(itc_widths, 75))) if itc_widths else CANOPY_DEFAULT_SIZE
-
-    # Canopy annotations (category 1) → pseudo-ITC grid + raw polygons (for canopy_mode)
-    canopy_rows         = []
+    # Canopy annotations (category 1) → polygon vertices written to JSON only.
+    # No pseudo-ITC bboxes are added; ShadowConditionedDeepForest applies the
+    # canopy positive policy polygon-precisely via per-anchor IoP at train time.
     canopy_polygons_raw = []
     for ann in anns:
         if ann.get("category_id") != CANOPY_CAT:
@@ -264,9 +190,8 @@ def process_tile(item: dict, tile_stem: str, img_path: Path,
         if not seg:
             continue
         poly = parse_polygon(seg, img_w, img_h)
-        if poly is None or poly.is_empty or poly.area < (cell_size ** 2) * 0.25:
+        if poly is None or poly.is_empty or poly.area < MIN_CANOPY_AREA_PX:
             continue
-        canopy_rows.extend(subdivide_canopy(poly, cell_size, img_w, img_h))
         canopy_polygons_raw.extend(_polygon_to_coord_lists(poly))
 
     # Shadow vectors keyed by tcd_{image_id} in the new by-id JSON
@@ -279,12 +204,12 @@ def process_tile(item: dict, tile_stem: str, img_path: Path,
 
     img_str = str(img_path)
 
-    # Empty tile → emit a single hard-negative row with NaN bbox.
+    # Tile with 0 ITC bboxes → emit a single hard-negative row with NaN bbox.
     # train_deepforest.py detects rows with NaN xmin and re-injects these
-    # tiles into the training dataset with zero-box targets, teaching the
-    # model that some landscapes contain NO trees.
-    all_boxes = itc_rows + canopy_rows
-    if not all_boxes:
+    # tiles into the training dataset with zero-box targets.  If the tile
+    # also has canopy polygons in the JSON, the canopy positive policy will
+    # still supply positive signal via per-anchor IoP at training time.
+    if not itc_rows:
         return [{
             "image_path":   img_str,
             "xmin":         float("nan"), "ymin": float("nan"),
@@ -295,7 +220,7 @@ def process_tile(item: dict, tile_stem: str, img_path: Path,
             "shadow_y":     shadow_y,
             "domain":       "TCD",
             "fold":         fold,
-        }], 0, 0, canopy_polygons_raw
+        }], 0, canopy_polygons_raw
 
     rows = [
         {
@@ -309,9 +234,9 @@ def process_tile(item: dict, tile_stem: str, img_path: Path,
             "domain":       "TCD",
             "fold":         fold,
         }
-        for b in all_boxes
+        for b in itc_rows
     ]
-    return rows, len(itc_rows), len(canopy_rows), canopy_polygons_raw
+    return rows, len(itc_rows), canopy_polygons_raw
 
 
 # ---------------------------------------------------------------------------
@@ -339,7 +264,6 @@ def main():
 
     all_rows     = []
     total_itc    = 0
-    total_pseudo = 0
     missing_tif  = 0
     empty_tiles  = 0
     canopy_polys_by_tile: dict[str, list] = {}   # tile basename → list of flat coord lists
@@ -371,18 +295,17 @@ def main():
             with open(meta_path) as f:
                 item = json.load(f)
 
-            rows, n_itc, n_pseudo, canopy_polys = process_tile(item, tile_stem, tif_path, shadow_vecs)
+            rows, n_itc, canopy_polys = process_tile(item, tile_stem, tif_path, shadow_vecs)
             all_rows.extend(rows)
             total_itc    += n_itc
-            total_pseudo += n_pseudo
             if canopy_polys:
                 canopy_polys_by_tile[tif_path.name] = canopy_polys
-            if n_itc == 0 and n_pseudo == 0:
+            if n_itc == 0 and not canopy_polys:
                 empty_tiles += 1
 
             if i < 5 or i % 500 == 0:
                 tqdm.write(
-                    f"  [{i:4d}] {tile_stem}  itc={n_itc}  pseudo={n_pseudo}"
+                    f"  [{i:4d}] {tile_stem}  itc={n_itc}  canopy_polys={len(canopy_polys)}"
                     f"  fold={item.get('validation_fold','?')}"
                     f"  biome={item.get('biome_name','?')}"
                 )
@@ -424,30 +347,31 @@ def main():
                 with open(meta_path, "w") as f:
                     json.dump(meta, f)
 
-            rows, n_itc, n_pseudo, canopy_polys = process_tile(item, tile_stem, img_path, shadow_vecs)
+            rows, n_itc, canopy_polys = process_tile(item, tile_stem, img_path, shadow_vecs)
             all_rows.extend(rows)
             total_itc    += n_itc
-            total_pseudo += n_pseudo
             if canopy_polys:
                 canopy_polys_by_tile[img_path.name] = canopy_polys
-            if n_itc == 0 and n_pseudo == 0:
+            if n_itc == 0 and not canopy_polys:
                 empty_tiles += 1
 
             if i < 5 or i % 500 == 0:
                 tqdm.write(
-                    f"  [{i:4d}] {tile_stem}  itc={n_itc}  pseudo={n_pseudo}"
+                    f"  [{i:4d}] {tile_stem}  itc={n_itc}  canopy_polys={len(canopy_polys)}"
                     f"  fold={item.get('validation_fold','?')}"
                     f"  biome={item.get('biome_name','?')}"
                 )
 
     df = pd.DataFrame(all_rows)
+    n_canopy_tiles_total = len(canopy_polys_by_tile)
+    n_canopy_polys_total = sum(len(v) for v in canopy_polys_by_tile.values())
     print(f"\n{'─'*50}")
-    print(f"Tiles processed : {i + 1 - missing_tif}")
-    print(f"Missing tif     : {missing_tif}")
-    print(f"Empty tiles     : {empty_tiles}")
-    print(f"Total rows      : {len(df)}")
-    print(f"  ITC           : {total_itc}")
-    print(f"  Pseudo-canopy : {total_pseudo}")
+    print(f"Tiles processed       : {i + 1 - missing_tif}")
+    print(f"Missing tif           : {missing_tif}")
+    print(f"Tiles with no ITC nor canopy: {empty_tiles}")
+    print(f"Total CSV rows        : {len(df)}")
+    print(f"  ITC bboxes          : {total_itc}")
+    print(f"Canopy polygons       : {n_canopy_polys_total}  ({n_canopy_tiles_total} tiles)")
     if "fold" in df.columns:
         print(f"\nFold distribution (rows):")
         print(df["fold"].value_counts().sort_index().to_string())

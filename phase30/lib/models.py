@@ -15,29 +15,25 @@ except ImportError:
 class ShadowConditionedDeepForest(deepforest_main.deepforest):
     """
     DeepForest fine-tuned with shadow loss reweighting and (optionally) a
-    polygon-precise canopy region loss policy.
+    polygon-precise canopy positive policy.
 
     Shadow reweighting:
         For GT boxes in images that have a shadow_x/shadow_y annotation, the
         focal loss is upweighted for boxes where shadow evidence is detected
         downstream of the crown.
 
-    Canopy modes (controlled by ``canopy_mode``):
-        "ignore"   — anchors whose intersection-over-anchor-area against a
-                     canopy polygon ≥ ``canopy_iop_ignore_thresh`` are excluded
-                     from the classification loss (neither rewarded nor
-                     penalised), mimicking ``iscrowd`` but polygon-precise.
-        "upweight" — anchors with IoP ≥ ``canopy_iop_upweight_thresh`` are
-                     treated as positives in the focal loss and upweighted by
-                     ``canopy_loss_weight``; their regression contribution is
-                     suppressed (no precise crown box to regress to).  The
-                     summed canopy contribution is scaled by
-                     ``canopy_loss_scale`` before being added to the per-image
-                     loss, to prevent canopy regions from dominating training.
-        "both"     — partial overlap (ignore_thresh ≤ IoP < upweight_thresh) is
-                     ignored; full overlap (IoP ≥ upweight_thresh) is
-                     upweighted.
+    Canopy positive policy (active when ``canopy_polygons_path`` is supplied):
+        Anchors whose intersection-over-anchor-area against the canopy
+        polygons exceeds ``CANOPY_IOP_THRESH`` (0.7) are treated as normal
+        positive examples for the classification focal loss (cls target=1,
+        no per-anchor reweight), and their regression contribution is
+        suppressed — there is no precise crown box to regress to.  The
+        summed canopy contribution can optionally be dampened by
+        ``canopy_loss_scale`` (≤1.0) to stop large canopy polygons from
+        outvoting ITC anchors.
     """
+
+    CANOPY_IOP_THRESH = 0.7
 
     def __init__(
         self,
@@ -45,28 +41,16 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
         val_csv=None,
         shadow_loss_reweight=False,
         shadow_loss_weight=2.0,
-        canopy_mode=None,
         canopy_polygons_path=None,
-        canopy_loss_weight=2.0,
-        canopy_loss_scale=0.5,
-        canopy_iop_ignore_thresh=0.1,
-        canopy_iop_upweight_thresh=0.4,
+        canopy_loss_scale=1.0,
         config=None,
         **kwargs,
     ):
         self.shadow_loss_reweight = shadow_loss_reweight
         self.shadow_loss_weight   = shadow_loss_weight
 
-        if canopy_mode not in (None, "ignore", "upweight", "both"):
-            raise ValueError(
-                f"canopy_mode must be None, 'ignore', 'upweight', or 'both' "
-                f"(got {canopy_mode!r})"
-            )
-        self.canopy_mode                = canopy_mode
-        self.canopy_loss_weight         = float(canopy_loss_weight)
-        self.canopy_loss_scale          = float(canopy_loss_scale)
-        self.canopy_iop_ignore_thresh   = float(canopy_iop_ignore_thresh)
-        self.canopy_iop_upweight_thresh = float(canopy_iop_upweight_thresh)
+        self.canopy_enabled    = canopy_polygons_path is not None
+        self.canopy_loss_scale = float(canopy_loss_scale)
 
         deepforest_main.deepforest.__init__(self, config=config, **kwargs)
 
@@ -122,11 +106,7 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
         # Canopy polygons lookup: {tile_basename: [np.ndarray(V,2), ...]}.
         # Loaded from JSON written by build_phase30_csvs.py.
         self.canopy_polygons = {}
-        if self.canopy_mode is not None:
-            if canopy_polygons_path is None:
-                raise ValueError(
-                    "canopy_mode is set but canopy_polygons_path was not provided"
-                )
+        if self.canopy_enabled:
             cp_path = Path(canopy_polygons_path)
             if not cp_path.exists():
                 raise FileNotFoundError(f"canopy_polygons file not found: {cp_path}")
@@ -149,15 +129,12 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
         else:
             print("   Shadow Loss Reweight: DISABLED")
 
-        if self.canopy_mode is not None:
-            print(
-                f"   ✅ Canopy Loss Policy: mode={self.canopy_mode}  "
-                f"weight={self.canopy_loss_weight}x  scale={self.canopy_loss_scale}  "
-                f"iop_thresh=ignore≥{self.canopy_iop_ignore_thresh}/"
-                f"upweight≥{self.canopy_iop_upweight_thresh}"
-            )
+        if self.canopy_enabled:
+            print(f"   ✅ Canopy Positive Policy: ENABLED  "
+                  f"iop_thresh={self.CANOPY_IOP_THRESH}  "
+                  f"scale={self.canopy_loss_scale}")
         else:
-            print("   Canopy Loss Policy: DISABLED")
+            print("   Canopy Positive Policy: DISABLED")
 
     # ------------------------------------------------------------------
     # Shadow map
@@ -385,9 +362,9 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
 
     def _patch_retinanet_head_loss(self):
         """Replace RetinaNetHead.compute_loss with a unified version that
-        applies shadow GT weighting AND polygon-precise canopy region
-        handling.  Operates at the head level (not classification_head) so it
-        has access to ``anchors`` for per-anchor IoP computation.
+        applies shadow GT weighting AND polygon-precise canopy positive
+        handling.  Operates at the head level (not classification_head) so
+        it has access to ``anchors`` for per-anchor IoP computation.
         """
         if self._head_loss_patched:
             return
@@ -396,8 +373,8 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
         if hasattr(inner, "model"):
             inner = inner.model
         if not hasattr(inner, "head") or not hasattr(inner.head, "classification_head"):
-            print("   ⚠️  Cannot find RetinaNet head — canopy loss policy disabled")
-            self.canopy_mode = None
+            print("   ⚠️  Cannot find RetinaNet head — canopy policy disabled")
+            self.canopy_enabled    = False
             self._head_loss_patched = True
             return
 
@@ -405,6 +382,7 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
         cls_head  = head.classification_head
         reg_head  = head.regression_head
         model_ref = self
+        iop_thr   = self.CANOPY_IOP_THRESH
 
         def patched_head_compute_loss(targets, head_outputs, anchors, matched_idxs):
             from torchvision.ops import sigmoid_focal_loss
@@ -418,9 +396,7 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
             canopy_polys_batch = model_ref._current_canopy_polygons
             sizes_pre          = model_ref._current_image_sizes_pre  or []
             sizes_post         = model_ref._current_image_sizes_post or []
-            ignore_thr   = model_ref.canopy_iop_ignore_thresh
-            upweight_thr = model_ref.canopy_iop_upweight_thresh
-            mode         = model_ref.canopy_mode
+            canopy_on          = model_ref.canopy_enabled
 
             for img_idx, (targets_per_image, cls_logits_per_image,
                           bbox_reg_per_image, anchors_per_image,
@@ -434,11 +410,10 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
                 num_foreground  = int(foreground_idxs.sum().item())
                 valid_idxs      = matched_idxs_per_image != cls_head.BETWEEN_THRESHOLDS
 
-                # ----- Per-anchor canopy IoP & masks -----
-                canopy_ignore_mask   = torch.zeros(N_anchors, dtype=torch.bool, device=device)
-                canopy_upweight_mask = torch.zeros(N_anchors, dtype=torch.bool, device=device)
+                # ----- Per-anchor canopy IoP & positive mask -----
+                canopy_positive_mask = torch.zeros(N_anchors, dtype=torch.bool, device=device)
 
-                if (mode is not None and canopy_polys_batch is not None
+                if (canopy_on and canopy_polys_batch is not None
                         and img_idx < len(canopy_polys_batch)
                         and canopy_polys_batch[img_idx]
                         and img_idx < len(sizes_pre) and img_idx < len(sizes_post)):
@@ -454,25 +429,28 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
                         iop = model_ref._anchor_iop_from_integral(
                             anchors_per_image, integral_t, post_h, post_w
                         )
-                        if mode in ("upweight", "both"):
-                            canopy_upweight_mask = iop >= upweight_thr
-                        if mode in ("ignore", "both"):
-                            canopy_ignore_mask = iop >= ignore_thr
-                        if mode == "both":
-                            # full-overlap → upweight; partial → ignore (exclusive)
-                            canopy_ignore_mask = canopy_ignore_mask & ~canopy_upweight_mask
+                        canopy_positive_mask = iop >= iop_thr
 
                 # ===== Classification loss =====
+                # canopy_loss_scale == 0 short-circuits to iscrowd semantics:
+                # canopy anchors are dropped from cls + denominator entirely.
+                canopy_acts_as_ignore = (
+                    model_ref.canopy_loss_scale == 0.0 and canopy_positive_mask.any()
+                )
+                if canopy_acts_as_ignore:
+                    effective_valid = valid_idxs & ~canopy_positive_mask
+                else:
+                    effective_valid = valid_idxs
+
                 gt_classes_target = torch.zeros_like(cls_logits_per_image)
                 gt_classes_target[
                     foreground_idxs,
                     targets_per_image["labels"][matched_idxs_per_image[foreground_idxs]],
                 ] = 1.0
-                # Treat canopy-upweight anchors as positives for the (single) tree class.
-                if canopy_upweight_mask.any():
-                    gt_classes_target[canopy_upweight_mask, 0] = 1.0
-
-                effective_valid = valid_idxs & ~canopy_ignore_mask
+                # Treat canopy-positive anchors as positives for the (single) tree
+                # class — unless scale=0.0, in which case they're ignored above.
+                if canopy_positive_mask.any() and not canopy_acts_as_ignore:
+                    gt_classes_target[canopy_positive_mask, 0] = 1.0
 
                 per_anchor_loss = sigmoid_focal_loss(
                     cls_logits_per_image[effective_valid],
@@ -491,27 +469,26 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
                     fg_valid_pos = fg_in_valid.nonzero(as_tuple=True)[0]
                     anchor_weights[fg_valid_pos[valid_match]] = w[matched_gt[valid_match]]
 
-                # Canopy upweighting
-                upweight_in_valid = canopy_upweight_mask[effective_valid]
-                n_canopy_up       = int(upweight_in_valid.sum().item())
-                if n_canopy_up > 0:
-                    anchor_weights = anchor_weights.clone()
-                    anchor_weights[upweight_in_valid] = (
-                        anchor_weights[upweight_in_valid] * model_ref.canopy_loss_weight
-                    )
-
-                # Apply canopy_loss_scale to the canopy contribution only.
-                if n_canopy_up > 0 and model_ref.canopy_loss_scale != 1.0:
-                    non_canopy = ~upweight_in_valid
-                    non_canopy_sum = (per_anchor_loss[non_canopy] *
-                                      anchor_weights[non_canopy]).sum()
-                    canopy_sum     = (per_anchor_loss[upweight_in_valid] *
-                                      anchor_weights[upweight_in_valid]).sum()
-                    total_loss = non_canopy_sum + canopy_sum * model_ref.canopy_loss_scale
+                # Canopy contribution can be dampened by canopy_loss_scale (≤1.0)
+                # to stop large polygons from outvoting ITC anchors.
+                if canopy_acts_as_ignore:
+                    n_canopy_pos = 0  # excluded from both numerator and denominator
+                    total_loss   = (per_anchor_loss * anchor_weights).sum()
                 else:
-                    total_loss = (per_anchor_loss * anchor_weights).sum()
+                    positive_in_valid = canopy_positive_mask[effective_valid]
+                    n_canopy_pos      = int(positive_in_valid.sum().item())
 
-                norm = max(1, num_foreground + n_canopy_up)
+                    if n_canopy_pos > 0 and model_ref.canopy_loss_scale != 1.0:
+                        non_canopy = ~positive_in_valid
+                        non_canopy_sum = (per_anchor_loss[non_canopy] *
+                                          anchor_weights[non_canopy]).sum()
+                        canopy_sum     = (per_anchor_loss[positive_in_valid] *
+                                          anchor_weights[positive_in_valid]).sum()
+                        total_loss = non_canopy_sum + canopy_sum * model_ref.canopy_loss_scale
+                    else:
+                        total_loss = (per_anchor_loss * anchor_weights).sum()
+
+                norm = max(1, num_foreground + n_canopy_pos)
                 cls_losses.append(total_loss / norm)
 
                 # ===== Regression loss =====
@@ -521,9 +498,9 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
 
                 fg_idxs_pos = foreground_idxs.nonzero(as_tuple=True)[0]
                 # Suppress regression for foreground anchors that are also canopy-
-                # upweighted: pseudo-canopy GT boxes are not precise crown targets.
-                if mode in ("upweight", "both") and canopy_upweight_mask.any():
-                    keep = ~canopy_upweight_mask[fg_idxs_pos]
+                # positive: pseudo-canopy GT boxes are not precise crown targets.
+                if canopy_on and canopy_positive_mask.any():
+                    keep = ~canopy_positive_mask[fg_idxs_pos]
                     fg_idxs_pos = fg_idxs_pos[keep]
 
                 if fg_idxs_pos.numel() == 0:
@@ -554,7 +531,7 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
         # When the head patch is active, classification_head.compute_loss is no
         # longer invoked, so the shadow-only cls patch is unnecessary.
         self._cls_loss_patched   = True
-        print(f"   ✅ RetinaNet head loss patched — canopy_mode={self.canopy_mode}  "
+        print(f"   ✅ RetinaNet head loss patched — canopy={self.canopy_enabled}  "
               f"shadow={self.shadow_loss_reweight}")
 
     # ------------------------------------------------------------------
@@ -562,7 +539,7 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
     # ------------------------------------------------------------------
 
     def on_train_start(self):
-        if self.canopy_mode is not None:
+        if self.canopy_enabled:
             self._patch_transform_capture()
             self._patch_retinanet_head_loss()
         elif self.shadow_loss_reweight and not self._cls_loss_patched:
@@ -582,7 +559,7 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
         else:
             self._current_shadow_gt_weights = None
 
-        if self.canopy_mode is not None:
+        if self.canopy_enabled:
             self._current_canopy_polygons = [
                 t.get("canopy_polygons", []) if isinstance(t, dict) else []
                 for t in targets

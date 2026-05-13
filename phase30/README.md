@@ -7,7 +7,7 @@ Fine-tuning a DeepForest (RetinaNet) model on the [Restor TCD dataset](https://h
 | File | Purpose |
 |---|---|
 | `train.py` | Training launcher — call with CSV paths and checkpoint to start training |
-| `prepare_data.py` | Downloads TCD tiles from HuggingFace and generates training/val CSVs |
+| `build_phase30_csvs.py` | Streams TCD from HuggingFace → writes train/val CSVs + canopy polygons JSON |
 | `evaluate.py` | Evaluates a trained checkpoint against the TCD holdout test set |
 | `lib/` | Internal modules: training loop, model definition, utilities, configs |
 | `inference/predict.py` | Two-stage inference pipeline: DeepForest → SAM segmentation |
@@ -46,54 +46,64 @@ modal volume get canopyai-deepforest-checkpoints \
 
 ---
 
-## 3. Build training CSVs
+## 3. Build training CSVs + canopy polygons
 
-Streams the TCD dataset from HuggingFace and generates training/val CSVs with pseudo-canopy bounding boxes. **Downloads ~40 GB of tiles on first run** — point `--save-dir` at a location with enough disk space.
+Streams the TCD dataset from HuggingFace and writes:
+
+- `phase30_tcd_train.csv`, `phase30_tcd_val.csv` — genuine ITC bboxes only (`category_id=2` in COCO; `category_id=1` canopy polygons are **not** written as pseudo-ITC rows).
+- `phase30_tcd_canopy_polygons.json` — original canopy polygon vertices. All canopy-region training signal flows through this file via the polygon-precise canopy positive policy.
+
+**Downloads ~40 GB of tiles on first run.**
 
 ```bash
-# Stream from HuggingFace (first-time setup — downloads all tiles):
-python prepare_data.py
+# First-time setup — streams from HuggingFace:
+python build_phase30_csvs.py
 
-# If tiles are already downloaded locally:
-python prepare_data.py --from-disk --skip-repair
-
-# Dry run (counts only, no writes):
-python prepare_data.py --dry-run
+# Re-build from tiles already on disk:
+python build_phase30_csvs.py --from-disk --skip-repair
 ```
-
-Output: `phase26_tcd_train.csv` and `phase26_tcd_val.csv` in the current directory.
 
 ---
 
 ## 4. Sanity check (1 batch)
 
-Before submitting to the cluster, verify paths and environment on a GPU node:
-
 ```bash
-python train.py \
-    --train-csv phase26_tcd_train.csv \
-    --val-csv   phase26_tcd_val.csv \
-    --checkpoint phase22_B_L4.pth \
-    --fast-dev-run
+python train.py --train-csv phase30/phase30_tcd_train.csv --val-csv phase30/phase30_tcd_val.csv --checkpoint phase22_B_L4.pth --fast-dev-run
 ```
 
 Should complete in under 2 minutes with no errors.
 
 ---
 
-## 5. Full training
+## 5. Training: experiment matrix
+
+All runs share: lr=1e-4, `shadow_loss_reweight=True`, shadow_weight=2.0, batch=32, epochs=50, patience=10. Canopy regions are now handled exclusively via `--canopy-polygons` + `--canopy-loss-scale`.
+
+**Canopy positive (default)** — anchors with IoP ≥ 0.7 against a canopy polygon are treated as positives (cls target=1, regression suppressed):
 
 ```bash
-python train.py \
-    --train-csv phase26_tcd_train.csv \
-    --val-csv   phase26_tcd_val.csv \
-    --checkpoint phase22_B_L4.pth \
-    --output-dir checkpoints
+python train.py --train-csv phase30/phase30_tcd_train.csv --val-csv phase30/phase30_tcd_val.csv --checkpoint phase22_B_L4.pth --canopy-polygons phase30/phase30_tcd_canopy_polygons.json --run-name phase31_canopy
 ```
 
-Key hyperparameters are fixed in `train.py`: `lr=0.001`, `shadow_loss_weight=2.0`, `epochs=50`, `patience=10`.
+**Canopy dampened** — each canopy anchor's contribution halved. Use if canopy swamps ITC:
 
-Checkpoints are saved to `--output-dir/phase30_tcd_L2/`. The best checkpoint (highest `map` on val) is kept; early stopping patience is 10 epochs.
+```bash
+python train.py --train-csv phase30/phase30_tcd_train.csv --val-csv phase30/phase30_tcd_val.csv --checkpoint phase22_B_L4.pth --canopy-polygons phase30/phase30_tcd_canopy_polygons.json --canopy-loss-scale 0.5 --run-name phase31_canopy_scale05
+```
+
+**Canopy iscrowd-style ignore** — `--canopy-loss-scale 0.0` strips canopy anchors from the cls loss entirely (and from the denominator):
+
+```bash
+python train.py --train-csv phase30/phase30_tcd_train.csv --val-csv phase30/phase30_tcd_val.csv --checkpoint phase22_B_L4.pth --canopy-polygons phase30/phase30_tcd_canopy_polygons.json --canopy-loss-scale 0.0 --run-name phase31_canopy_ignore
+```
+
+**ITC-only ablation** — omit `--canopy-polygons` entirely. Canopy regions become unannotated, so anchors there are trained as negatives. Useful as a worst-case lower bound on the value of modelling canopy at all:
+
+```bash
+python train.py --train-csv phase30/phase30_tcd_train.csv --val-csv phase30/phase30_tcd_val.csv --checkpoint phase22_B_L4.pth --run-name phase31_itc_only
+```
+
+Checkpoints land in `checkpoints/<run-name>/`; best `map` is kept. Internal IoP threshold is `ShadowConditionedDeepForest.CANOPY_IOP_THRESH = 0.7`.
 
 ---
 

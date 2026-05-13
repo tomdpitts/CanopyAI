@@ -16,8 +16,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import pandas as pd
 import numpy as np
 import torch
-from torch import nn
-import torch.nn.functional as F
 
 from deepforest import main as deepforest_main
 import pytorch_lightning as pl
@@ -152,7 +150,7 @@ class _CanopyAwareTrainDataset:
     polygon vertex arrays in crop-local pixel coords (shape varies per
     polygon).  Spatial augmentations are deliberately omitted from the
     post-crop transform — only colour augmentations should be used with
-    canopy_mode because flipping/rotating the patch would invalidate the
+    canopy mode because flipping/rotating the patch would invalidate the
     polygon coordinates.
 
     Defined at module level so it can be pickled by multiprocessing workers.
@@ -342,158 +340,6 @@ class _TiledValDataset:
         return image, {"boxes": boxes_t, "labels": labels_t}, img_name
 
 
-class _FP32Guard(torch.autograd.Function):
-    """fp16 → fp32 forward; fp32 gradient → fp16 backward."""
-    @staticmethod
-    def forward(ctx, x):
-        return x.float()
-
-    @staticmethod
-    def backward(ctx, grad):
-        return grad.half()
-
-
-class _FP16Guard(torch.autograd.Function):
-    """fp32 → fp16 forward; fp16 gradient → fp32 backward."""
-    @staticmethod
-    def forward(ctx, x):
-        return x.half()
-
-    @staticmethod
-    def backward(ctx, grad):
-        return grad.float()
-
-
-class MPSHalfPrecisionCallback(pl.Callback):
-    """
-    Manual fp16 mixed precision for Apple MPS.
-
-    MPS has no torch.autocast support, so mixed precision is implemented with
-    explicit dtype boundary functions (_FP32Guard / _FP16Guard) placed at every
-    point where a backward kernel requires float32:
-
-      Backbone convolutions  → fp16  (fast; MPS supports fp16 conv backward)
-      BatchNorm layers       → fp32  (wrapped by _FP32Guard / _FP16Guard hooks)
-      FPN convolutions       → fp16
-      Detection head         → fp32  (focal loss / smooth-L1 backward need fp32)
-    """
-
-    _NORM_TYPES = (
-        nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d,
-        nn.SyncBatchNorm, nn.GroupNorm, nn.LayerNorm,
-    )
-
-    def __init__(self):
-        self._master: dict[str, torch.Tensor] = {}
-        self._overflow = False
-        self._hooks: list = []
-
-    def on_fit_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
-        self._master = {
-            name: param.detach().float().clone()
-            for name, param in pl_module.named_parameters()
-        }
-        pl_module.half()
-
-        inner = pl_module.model
-        if hasattr(inner, "model"):
-            inner = inner.model
-
-        body = None
-        if hasattr(inner, "backbone") and hasattr(inner.backbone, "body"):
-            body = inner.backbone.body
-
-        n_bn = 0
-        if body is not None:
-            try:
-                import deepforest_custom.mps_ops as mps_ops
-                n_bn = mps_ops.patch_batchnorm_for_fp16(body)
-            except Exception as e:
-                print(f"[MPSHalf] kernel patch failed ({e}), falling back to Python hooks")
-                for m in body.modules():
-                    if isinstance(m, self._NORM_TYPES):
-                        m.float()
-                        self._hooks.append(m.register_forward_pre_hook(self._norm_pre_hook))
-                        self._hooks.append(m.register_forward_hook(self._norm_post_hook))
-                        n_bn += 1
-
-        head = getattr(inner, "head", None)
-        if head is not None:
-            head.float()
-            self._hooks.append(head.register_forward_pre_hook(self._head_pre_hook))
-
-        pl_module._mps_loss_scale = 1.0
-        print(
-            f"[MPSHalf] backbone fp16 | {n_bn} BN modules patched with MPSGraph kernel"
-            f" | detection head → fp32"
-        )
-
-    @staticmethod
-    def _norm_pre_hook(module, args):
-        if args and isinstance(args[0], torch.Tensor) and args[0].dtype == torch.float16:
-            return (_FP32Guard.apply(args[0]),) + args[1:]
-        return args
-
-    @staticmethod
-    def _norm_post_hook(module, args, output):
-        if isinstance(output, torch.Tensor) and output.dtype == torch.float32:
-            return _FP16Guard.apply(output)
-        return output
-
-    @staticmethod
-    def _head_pre_hook(module, args):
-        if not args:
-            return args
-        features = args[0]
-        def _cast(t):
-            return _FP32Guard.apply(t) if isinstance(t, torch.Tensor) and t.dtype == torch.float16 else t
-        if isinstance(features, dict):
-            features = {k: _cast(v) for k, v in features.items()}
-        elif isinstance(features, (list, tuple)):
-            features = type(features)(_cast(f) for f in features)
-        return (features,) + args[1:]
-
-    def on_before_optimizer_step(
-        self, trainer: pl.Trainer, pl_module: pl.LightningModule, optimizer
-    ) -> None:
-        overflow = any(
-            not torch.isfinite(p.grad).all()
-            for p in pl_module.parameters()
-            if p.grad is not None
-        )
-        if overflow:
-            self._overflow = True
-            for p in pl_module.parameters():
-                p.grad = None
-            for name, p in pl_module.named_parameters():
-                if name in self._master:
-                    p.data = self._master[name].data.clone()
-            print("[MPSHalf] Overflow in fp16 gradients — step skipped")
-            return
-
-        self._overflow = False
-        for name, p in pl_module.named_parameters():
-            if p.grad is not None:
-                self._master[name].grad = p.grad.detach().float()
-        for name, p in pl_module.named_parameters():
-            if name in self._master:
-                p.data = self._master[name].data.clone()
-
-    def on_train_batch_end(
-        self, trainer: pl.Trainer, pl_module: pl.LightningModule, outputs, batch, batch_idx
-    ) -> None:
-        if not self._overflow:
-            for name, p in pl_module.named_parameters():
-                self._master[name].data.copy_(p.data.float())
-        pl_module.half()
-        inner = pl_module.model
-        if hasattr(inner, "model"):
-            inner = inner.model
-        head = getattr(inner, "head", None)
-        if head is not None:
-            head.float()
-
-
 def train_deepforest(
     train_csv,
     val_csv=None,
@@ -509,15 +355,13 @@ def train_deepforest(
     accelerator=None,
     shadow_loss_reweight=False,
     shadow_loss_weight=2.0,
-    canopy_mode=None,                # None / "ignore" / "upweight" / "both"
     canopy_polygons_path=None,       # JSON written by build_phase30_csvs.py
-    canopy_loss_weight=2.0,
-    canopy_loss_scale=0.5,
-    canopy_iop_ignore_thresh=0.1,
-    canopy_iop_upweight_thresh=0.4,
+                                     # (presence enables canopy-positive policy)
+    canopy_loss_scale=1.0,           # dampener for canopy loss contribution
+                                     # 1.0 = full canopy positives, 0.0 = ignore
     augmentations=None,              # list of dicts; overrides default augmentation
     fast_dev_run=False,
-    precision=None,                  # override Lightning precision (e.g. "16-mixed", "16-mps")
+    precision=None,                  # override Lightning precision (e.g. "bf16-mixed", "16-mixed")
 ):
     """
     Train a DeepForest model on TCD data with optional shadow loss reweighting.
@@ -538,7 +382,7 @@ def train_deepforest(
         shadow_loss_weight:   multiplier for shadow-casting GT anchors (default 2.0)
         augmentations:        list of albumentations dicts applied after 400px crop
         fast_dev_run:         Lightning fast_dev_run (1 train + 1 val batch then exit)
-        precision:            Lightning precision string (e.g. "bf16-mixed", "16-mps")
+        precision:            Lightning precision string (e.g. "bf16-mixed", "16-mixed")
     """
     run_output_dir = str(Path(output_dir) / run_name)
     Path(run_output_dir).mkdir(parents=True, exist_ok=True)
@@ -549,22 +393,19 @@ def train_deepforest(
 
     print("\n⚙️  Initializing model...")
 
-    if shadow_loss_reweight or canopy_mode is not None:
+    canopy_enabled = canopy_polygons_path is not None
+    if shadow_loss_reweight or canopy_enabled:
         model = ShadowConditionedDeepForest(
             train_csv=train_csv,
             val_csv=val_csv,
             shadow_loss_reweight=shadow_loss_reweight,
             shadow_loss_weight=shadow_loss_weight,
-            canopy_mode=canopy_mode,
             canopy_polygons_path=canopy_polygons_path,
-            canopy_loss_weight=canopy_loss_weight,
             canopy_loss_scale=canopy_loss_scale,
-            canopy_iop_ignore_thresh=canopy_iop_ignore_thresh,
-            canopy_iop_upweight_thresh=canopy_iop_upweight_thresh,
         )
     else:
         print("   Shadow loss reweighting: DISABLED")
-        print("   Canopy loss policy: DISABLED")
+        print("   Canopy positive policy: DISABLED")
         model = deepforest_main.deepforest()
 
     import traceback
@@ -576,7 +417,7 @@ def train_deepforest(
             ck_keys          = list(state_dict.keys())
             has_model_prefix = any(k.startswith("model.") for k in ck_keys)
 
-            if has_model_prefix and (shadow_loss_reweight or canopy_mode is not None):
+            if has_model_prefix and (shadow_loss_reweight or canopy_enabled):
                 missing, unexpected = model.load_state_dict(state_dict, strict=False)
                 print(f"   Loaded full wrapper checkpoint ({len(ck_keys)} keys)")
                 if missing:    print(f"   Missing ({len(missing)}): {missing[:3]}...")
@@ -639,7 +480,7 @@ def train_deepforest(
                                clip=True, min_visibility=MIN_VIS)
     crop_t      = A.RandomCrop(height=CROP_SIZE, width=CROP_SIZE, p=1.0)
 
-    # Spatial augmentations are not safe with canopy_mode because the
+    # Spatial augmentations are not safe when canopy is enabled because the
     # _CanopyAwareTrainDataset wrapper performs its own crop and stores polygon
     # coords in crop-local space — albumentations flips/rotates would desync them.
     _SPATIAL_AUG_NAMES = {
@@ -665,7 +506,7 @@ def train_deepforest(
         model.config.train.augmentations = OmegaConf.create([])
         names = [list(a.keys())[0] if isinstance(a, dict) else a for a in augmentations]
         print(f"   🔄 Train transform: crop{CROP_SIZE} + {names} + ToTensorV2")
-    elif shadow_loss_reweight or canopy_mode is not None:
+    elif shadow_loss_reweight or canopy_enabled:
         model._train_transform_override = _build_train_transform(None)
         model.config.train.augmentations = OmegaConf.create([])
         print(f"   🔄 Train transform: crop{CROP_SIZE} + ToTensorV2 "
@@ -674,7 +515,7 @@ def train_deepforest(
         model._train_transform_override = _build_train_transform([{"HorizontalFlip": {"p": 0.5}}])
         print(f"   🔄 Train transform: crop{CROP_SIZE} + HorizontalFlip + ToTensorV2 (default)")
 
-    if canopy_mode is not None:
+    if canopy_enabled:
         # Canopy mode does its own crop in the wrapper; the override transform
         # must NOT include the crop step.  Strip any spatial augmentations
         # (flips/rotates) since they would desync polygon coords.
@@ -711,9 +552,9 @@ def train_deepforest(
     pin_memory = torch.cuda.is_available()
 
     def _maybe_wrap_canopy(ds, model_ref):
-        """If canopy_mode is enabled, wrap the BoxDataset so __getitem__ also
+        """If canopy is enabled, wrap the BoxDataset so __getitem__ also
         emits crop-local canopy polygons alongside boxes/labels."""
-        if model_ref.canopy_mode is None or not getattr(model_ref, "canopy_polygons", None):
+        if not getattr(model_ref, "canopy_enabled", False) or not getattr(model_ref, "canopy_polygons", None):
             return ds
         return _CanopyAwareTrainDataset(
             base_ds=ds,
@@ -746,7 +587,7 @@ def train_deepforest(
 
         model.train_dataloader = types.MethodType(_train_dataloader_with_empties, model)
     else:
-        if hasattr(model, "_train_transform_override") or canopy_mode is not None:
+        if hasattr(model, "_train_transform_override") or canopy_enabled:
             _orig_tl = model.train_dataloader.__func__
             def _train_dataloader_with_transform(self_model):
                 dl = _orig_tl(self_model)
@@ -859,16 +700,15 @@ def train_deepforest(
     else:
         trainer_kwargs["accelerator"] = "cpu"
 
-    if precision == "16-mps":
-        model.mps_fp16 = True
-        callbacks.append(MPSHalfPrecisionCallback())
-        print("   ✅ MPS fp16: backbone/FPN in fp16 | BN + head in fp32")
-    elif precision:
+    # Precision is keyed on actual device availability, not on the user-supplied
+    # accelerator string — Lightning resolves accelerator="gpu" to MPS on Mac,
+    # and MPS has no torch.autocast support so any mixed-precision mode crashes.
+    if precision:
         trainer_kwargs["precision"] = precision
-    elif trainer_kwargs.get("accelerator") == "gpu":
+    elif torch.cuda.is_available():
         trainer_kwargs["precision"] = "bf16-mixed"
-    elif trainer_kwargs.get("accelerator") == "mps":
-        trainer_kwargs["precision"] = "32-true"  # MPS has no autocast support
+    else:
+        trainer_kwargs["precision"] = "32-true"  # MPS / CPU — no autocast on MPS
 
     print("\n🚀 Starting training...")
     print("-" * 60)
@@ -887,7 +727,7 @@ def train_deepforest(
     print("\n✅ Training complete!")
 
     final_model_path = Path(run_output_dir) / "deepforest_final.pth"
-    if shadow_loss_reweight or canopy_mode is not None:
+    if shadow_loss_reweight or canopy_enabled:
         torch.save(model.state_dict(), str(final_model_path))
     else:
         torch.save(model.model.state_dict(), str(final_model_path))
@@ -913,25 +753,19 @@ def main():
                         help="Upweight focal loss for shadow-casting GT boxes")
     parser.add_argument("--shadow-loss-weight", type=float, default=2.0,
                         help="Focal loss multiplier for shadow-casting GT anchors (default 2.0)")
-    parser.add_argument("--canopy-mode", default=None,
-                        choices=[None, "ignore", "upweight", "both"],
-                        help="Canopy region loss policy (default: disabled)")
     parser.add_argument("--canopy-polygons", default=None,
-                        help="Path to phase30_tcd_canopy_polygons.json (required if --canopy-mode set)")
-    parser.add_argument("--canopy-loss-weight", type=float, default=2.0,
-                        help="Per-anchor focal loss multiplier for canopy-upweight anchors")
-    parser.add_argument("--canopy-loss-scale",  type=float, default=0.5,
-                        help="Scale factor applied to the summed canopy loss contribution")
-    parser.add_argument("--canopy-iop-ignore-thresh", type=float, default=0.1,
-                        help="IoP threshold above which anchors are ignored (ignore/both)")
-    parser.add_argument("--canopy-iop-upweight-thresh", type=float, default=0.4,
-                        help="IoP threshold above which anchors are upweighted (upweight/both)")
+                        help="Path to phase30_tcd_canopy_polygons.json. When set, "
+                             "anchors with IoP≥0.4 against a canopy polygon are "
+                             "treated as positives (cls target=1, regression suppressed).")
+    parser.add_argument("--canopy-loss-scale",  type=float, default=1.0,
+                        help="Dampener for the summed canopy cls contribution. "
+                             "1.0 = full positive treatment, 0.0 = iscrowd-like ignore.")
     parser.add_argument("--checkpoint",    default=None,
                         help="Path to initial weights (.pth or .ckpt)")
     parser.add_argument("--fast-dev-run",  action="store_true",
                         help="Run 1 train + 1 val batch then exit")
     parser.add_argument("--precision",     default=None,
-                        help="Lightning precision override (e.g. 16-mixed, bf16-mixed, 16-mps)")
+                        help="Lightning precision override (e.g. 16-mixed, bf16-mixed)")
 
     args = parser.parse_args()
 
@@ -949,12 +783,8 @@ def main():
         accelerator=args.accelerator,
         shadow_loss_reweight=args.shadow_loss_reweight,
         shadow_loss_weight=args.shadow_loss_weight,
-        canopy_mode=args.canopy_mode,
         canopy_polygons_path=args.canopy_polygons,
-        canopy_loss_weight=args.canopy_loss_weight,
         canopy_loss_scale=args.canopy_loss_scale,
-        canopy_iop_ignore_thresh=args.canopy_iop_ignore_thresh,
-        canopy_iop_upweight_thresh=args.canopy_iop_upweight_thresh,
         fast_dev_run=args.fast_dev_run,
         precision=args.precision,
     )

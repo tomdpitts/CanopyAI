@@ -37,18 +37,14 @@ if __name__ == "__main__":
     p.add_argument("--epochs",       type=int,   default=50,     help="Max epochs")
     p.add_argument("--patience",     type=int,   default=10,     help="Early-stop patience")
     p.add_argument("--fast-dev-run", action="store_true",        help="1 train + 1 val batch then exit")
-    # Canopy region loss policy
-    p.add_argument("--canopy-mode",             default=None,
-                   choices=[None, "ignore", "upweight", "both"],
-                   help="Canopy region loss policy (default: disabled / baseline)")
-    p.add_argument("--canopy-polygons",         default=None,
-                   help="Path to phase30_tcd_canopy_polygons.json (required if --canopy-mode set)")
-    p.add_argument("--canopy-loss-weight",      type=float, default=2.0,
-                   help="Per-anchor focal loss multiplier for canopy-upweight anchors")
-    p.add_argument("--canopy-loss-scale",       type=float, default=0.5,
-                   help="Scale factor applied to the summed canopy loss contribution")
-    p.add_argument("--canopy-iop-ignore-thresh",   type=float, default=0.1)
-    p.add_argument("--canopy-iop-upweight-thresh", type=float, default=0.4)
+    # Canopy positive policy (binary: presence of --canopy-polygons turns it on)
+    p.add_argument("--canopy-polygons", default=None,
+                   help="Path to phase30_tcd_canopy_polygons.json. When set, "
+                        "anchors with IoP≥0.4 against a canopy polygon are treated "
+                        "as positives (cls target=1, regression suppressed).")
+    p.add_argument("--canopy-loss-scale", type=float, default=1.0,
+                   help="Dampener for summed canopy cls contribution. "
+                        "1.0 = full positive, 0.0 = iscrowd-like ignore.")
     args = p.parse_args()
 
     train_deepforest(
@@ -63,12 +59,8 @@ if __name__ == "__main__":
         patience=args.patience,
         shadow_loss_reweight=True,
         shadow_loss_weight=2.0,
-        canopy_mode=args.canopy_mode,
         canopy_polygons_path=args.canopy_polygons,
-        canopy_loss_weight=args.canopy_loss_weight,
         canopy_loss_scale=args.canopy_loss_scale,
-        canopy_iop_ignore_thresh=args.canopy_iop_ignore_thresh,
-        canopy_iop_upweight_thresh=args.canopy_iop_upweight_thresh,
         augmentations=TCD_AUGMENTATIONS_COLOUR,
         accelerator="gpu",
         fast_dev_run=args.fast_dev_run,
