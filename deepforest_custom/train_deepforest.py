@@ -380,31 +380,32 @@ class MPSHalfPrecisionCallback(pl.Callback):
         if hasattr(inner, "model"):
             inner = inner.model
 
-        # ── BatchNorm boundaries (backbone body) ──────────────────────
-        # BN backward on MPS requires float32.  For every BN layer in the
-        # ResNet body, cast fp16 input → fp32 before the forward pass and
-        # fp32 output → fp16 after, with matching gradient casts in backward.
+        # ── BN layers: patch forward to use MPSGraph fp16 kernel ──────
+        # Instead of Python _FP32Guard hooks (one call per BN per step),
+        # each BN module's forward is replaced with a version that calls
+        # our compiled MPSGraph kernel directly.  The kernel handles fp16
+        # → fp32 internally in C++ with no per-call Python overhead.
         body = None
         if hasattr(inner, "backbone") and hasattr(inner.backbone, "body"):
             body = inner.backbone.body
 
         n_bn = 0
         if body is not None:
-            for m in body.modules():
-                if isinstance(m, self._NORM_TYPES):
-                    m.float()   # keep BN params / running stats in fp32
-                    self._hooks.append(
-                        m.register_forward_pre_hook(self._norm_pre_hook)
-                    )
-                    self._hooks.append(
-                        m.register_forward_hook(self._norm_post_hook)
-                    )
-                    n_bn += 1
+            try:
+                import deepforest_custom.mps_ops as mps_ops
+                n_bn = mps_ops.patch_batchnorm_for_fp16(body)
+            except Exception as e:
+                # Fall back to Python hook approach if kernel unavailable
+                print(f"[MPSHalf] kernel patch failed ({e}), falling back to Python hooks")
+                for m in body.modules():
+                    if isinstance(m, self._NORM_TYPES):
+                        m.float()
+                        self._hooks.append(m.register_forward_pre_hook(self._norm_pre_hook))
+                        self._hooks.append(m.register_forward_hook(self._norm_post_hook))
+                        n_bn += 1
 
         # ── Detection head → fp32 ─────────────────────────────────────
-        # sigmoid_focal_loss and smooth_l1_loss backward kernels require fp32
-        # on MPS.  Keep the entire head (including its GroupNorm layers) in
-        # fp32 and cast the fp16 FPN feature maps to fp32 at the head boundary.
+        # sigmoid_focal_loss and smooth_l1_loss backward kernels require fp32.
         head = getattr(inner, "head", None)
         if head is not None:
             head.float()
@@ -412,9 +413,9 @@ class MPSHalfPrecisionCallback(pl.Callback):
                 head.register_forward_pre_hook(self._head_pre_hook)
             )
 
-        pl_module._mps_loss_scale = 1.0   # no loss scaling (loss is fp32)
+        pl_module._mps_loss_scale = 1.0
         print(
-            f"[MPSHalf] backbone fp16 | {n_bn} BN layers → fp32 with dtype guards"
+            f"[MPSHalf] backbone fp16 | {n_bn} BN modules patched with MPSGraph kernel"
             f" | detection head → fp32"
         )
 
@@ -468,7 +469,8 @@ class MPSHalfPrecisionCallback(pl.Callback):
             for p in pl_module.parameters():
                 p.grad = None
             for name, p in pl_module.named_parameters():
-                p.data.copy_(self._master[name])
+                if name in self._master:
+                    p.data = self._master[name].data.clone()
             print("[MPSHalf] Overflow in fp16 gradients — step skipped")
             return
 
@@ -479,27 +481,25 @@ class MPSHalfPrecisionCallback(pl.Callback):
             if p.grad is not None:
                 self._master[name].grad = p.grad.detach().float()
 
-        # Restore fp32 weights so the optimizer steps in fp32
+        # Give each param fresh fp32 storage from master so the optimizer steps
+        # in fp32.  p.data = replaces storage and dtype; .copy_() would preserve
+        # the existing fp16 dtype, keeping params fp16 for the optimizer.
         for name, p in pl_module.named_parameters():
-            p.data.copy_(self._master[name])
+            if name in self._master:
+                p.data = self._master[name].data.clone()
 
     def on_train_batch_end(
         self, trainer: pl.Trainer, pl_module: pl.LightningModule, outputs, batch, batch_idx
     ) -> None:
         if not self._overflow:
-            # Store updated fp32 weights back into master
             for name, p in pl_module.named_parameters():
                 self._master[name].data.copy_(p.data.float())
-        # Restore model to fp16 for the next forward pass
+        # Restore model to fp16; re-apply fp32 to head (half() clobbers it).
+        # BN layers are patched via forward() override so their dtype doesn't matter.
         pl_module.half()
-        # Re-apply fp32 to norm layers and head (half() clobbers them)
         inner = pl_module.model
         if hasattr(inner, "model"):
             inner = inner.model
-        if hasattr(inner, "backbone") and hasattr(inner.backbone, "body"):
-            for m in inner.backbone.body.modules():
-                if isinstance(m, self._NORM_TYPES):
-                    m.float()
         head = getattr(inner, "head", None)
         if head is not None:
             head.float()
@@ -972,6 +972,8 @@ def train_deepforest(
         trainer_kwargs["precision"] = precision
     elif trainer_kwargs.get("accelerator") == "gpu":
         trainer_kwargs["precision"] = "bf16-mixed"
+    elif trainer_kwargs.get("accelerator") == "mps":
+        trainer_kwargs["precision"] = "32-true"  # MPS has no autocast support
 
     trainer = pl.Trainer(**trainer_kwargs)
 
