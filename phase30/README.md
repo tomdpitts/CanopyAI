@@ -114,7 +114,7 @@ python phase30/train.py --train-csv phase30/phase30_tcd_train.csv --val-csv phas
 python phase30/train.py --train-csv phase30/phase30_tcd_train.csv --val-csv phase30/phase30_tcd_val.csv --checkpoint phase22_B_L4.pth --run-name phase31_itc_only
 ```
 
-Checkpoints land in `checkpoints/<run-name>/`; best `map` is kept. Internal IoP threshold is `ShadowConditionedDeepForest.CANOPY_IOP_THRESH = 0.7`.
+Checkpoints land in `checkpoints/<run-name>/`; best `map` is kept. Internal IoP threshold is `ShadowConditionedDeepForest.CANOPY_IOP_THRESH = 0.7`. Val `map` treats canopy regions as `iscrowd` — detections inside a canopy polygon with no matching ITC GT are dropped before scoring, so canopy predictions are neither rewarded nor penalised.
 
 ---
 

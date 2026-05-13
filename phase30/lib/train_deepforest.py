@@ -270,16 +270,25 @@ class _CanopyAwareTrainDataset:
 
 class _TiledValDataset:
     """Tiles each 2048×2048 val image into 400×400 patches for validation.
-    Defined at module level so it can be pickled by multiprocessing workers."""
-    def __init__(self, base_ds, patch_size=400, overlap=0.0, min_visibility=0.5):
+    Defined at module level so it can be pickled by multiprocessing workers.
+
+    If ``canopy_polygons_by_key`` is supplied, each patch's target dict also
+    carries a ``"canopy_polygons"`` field — a list of ``np.ndarray(V, 2)``
+    polygon vertex arrays in patch-local pixel coords.  Consumed by
+    ShadowConditionedDeepForest.validation_step to filter predictions that
+    fall inside canopy regions but have no ITC GT match.
+    """
+    def __init__(self, base_ds, patch_size=400, overlap=0.0, min_visibility=0.5,
+                 canopy_polygons_by_key=None):
         import albumentations as A
         from albumentations.pytorch import ToTensorV2
-        self.base        = base_ds
-        self.patch_size  = patch_size
-        self.step        = max(1, int(patch_size * (1 - overlap)))
-        self.min_vis     = min_visibility
-        self.collate_fn  = base_ds.collate_fn
-        self._val_t      = A.Compose(
+        self.base            = base_ds
+        self.patch_size      = patch_size
+        self.step            = max(1, int(patch_size * (1 - overlap)))
+        self.min_vis         = min_visibility
+        self.collate_fn      = base_ds.collate_fn
+        self.canopy_by_key   = canopy_polygons_by_key or {}
+        self._val_t          = A.Compose(
             [ToTensorV2()],
             bbox_params=A.BboxParams(format="pascal_voc",
                                      label_fields=["category_ids"],
@@ -337,7 +346,45 @@ class _TiledValDataset:
         image   = aug["image"]
         boxes_t = torch.from_numpy(np.array(aug["bboxes"], dtype=np.float32)).reshape(-1, 4)
         labels_t= torch.from_numpy(np.array(aug["category_ids"], dtype=np.int64))
-        return image, {"boxes": boxes_t, "labels": labels_t}, img_name
+
+        # Clip canopy polygons to this patch (if any), translated to patch-local coords
+        polys_crop = []
+        if self.canopy_by_key:
+            polys_full = self.canopy_by_key.get(Path(img_name).name, [])
+            if polys_full:
+                from shapely.geometry import box as shapely_box, Polygon
+                window = shapely_box(px1, py1, px2, py2)
+                for verts in polys_full:
+                    if len(verts) < 3:
+                        continue
+                    try:
+                        poly = Polygon(verts)
+                        if not poly.is_valid:
+                            poly = poly.buffer(0)
+                        clipped = poly.intersection(window)
+                        if clipped.is_empty or clipped.area < 4.0:
+                            continue
+                        if clipped.geom_type == "Polygon":
+                            parts = [clipped]
+                        elif clipped.geom_type == "MultiPolygon":
+                            parts = list(clipped.geoms)
+                        else:
+                            parts = []
+                        for g in parts:
+                            if g.is_empty or g.area < 4.0:
+                                continue
+                            ext = np.asarray(g.exterior.coords, dtype=np.float32)
+                            ext[:, 0] -= px1
+                            ext[:, 1] -= py1
+                            polys_crop.append(ext)
+                    except Exception:
+                        continue
+
+        return image, {
+            "boxes":           boxes_t,
+            "labels":          labels_t,
+            "canopy_polygons": polys_crop,
+        }, img_name
 
 
 def train_deepforest(
@@ -622,7 +669,9 @@ def train_deepforest(
                 dl = _orig_val_dataloader(self_model)
                 ds = dl.dataset
                 ds.image_names = np.append(ds.image_names, _val_empty_paths)
-                tiled_ds = _TiledValDataset(ds, patch_size=CROP_SIZE, min_visibility=MIN_VIS)
+                cp = self_model.canopy_polygons if getattr(self_model, "canopy_enabled", False) else None
+                tiled_ds = _TiledValDataset(ds, patch_size=CROP_SIZE, min_visibility=MIN_VIS,
+                                            canopy_polygons_by_key=cp)
                 return DataLoader(tiled_ds, batch_size=dl.batch_size, shuffle=False,
                                   collate_fn=ds.collate_fn, num_workers=8,
                                   pin_memory=pin_memory, persistent_workers=True)
@@ -630,7 +679,9 @@ def train_deepforest(
         else:
             def _val_dataloader_tiled(self_model):
                 dl       = _orig_val_dataloader(self_model)
-                tiled_ds = _TiledValDataset(dl.dataset, patch_size=CROP_SIZE, min_visibility=MIN_VIS)
+                cp = self_model.canopy_polygons if getattr(self_model, "canopy_enabled", False) else None
+                tiled_ds = _TiledValDataset(dl.dataset, patch_size=CROP_SIZE, min_visibility=MIN_VIS,
+                                            canopy_polygons_by_key=cp)
                 return DataLoader(tiled_ds, batch_size=dl.batch_size, shuffle=False,
                                   collate_fn=dl.dataset.collate_fn, num_workers=8,
                                   pin_memory=pin_memory, persistent_workers=True)

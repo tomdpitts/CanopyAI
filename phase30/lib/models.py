@@ -568,3 +568,109 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
             self._current_canopy_polygons = None
 
         return super().training_step(batch, batch_idx)
+
+    # ------------------------------------------------------------------
+    # Canopy-aware validation
+    # ------------------------------------------------------------------
+
+    _VAL_ITC_IOU_THRESH = 0.4   # IoU above which a prediction counts as matched to ITC GT
+
+    def validation_step(self, batch, batch_idx):
+        """If canopy is enabled, replicate the base validation_step but filter
+        predictions before updating mAP / IoU metrics: drop detections that fall
+        substantially inside a canopy polygon AND have no matching ITC GT
+        bbox.  Such detections are correct under the canopy positive policy and
+        should not be charged as FPs."""
+        if not self.canopy_enabled:
+            return super().validation_step(batch, batch_idx)
+
+        from torchvision.ops import box_iou
+        from deepforest import utilities as _df_utilities
+
+        images, targets, image_names = batch
+
+        # Loss pass (train-mode forward, no backward) — mirrors base behaviour.
+        self.model.train()
+        with torch.no_grad():
+            loss_dict = self.model.forward(images, targets)
+        losses = sum(loss_dict.values())
+        try:
+            for key, value in loss_dict.items():
+                self.log(f"val_{key}", value, on_epoch=True, batch_size=len(images))
+            self.log("val_loss", losses, on_epoch=True, batch_size=len(images))
+        except Exception:
+            pass
+
+        # Prediction pass (eval-mode forward).
+        self.model.eval()
+        with torch.no_grad():
+            preds = self.model.forward(images, targets)
+
+        # Filter predictions: drop in-canopy detections with no ITC GT match.
+        iop_thr = self.CANOPY_IOP_THRESH
+        iou_thr = self._VAL_ITC_IOU_THRESH
+        filtered_preds   = []
+        filtered_targets = []
+        for img_i, (target, pred, img_t) in enumerate(zip(targets, preds, images)):
+            if target["boxes"].shape[0] == 0:
+                continue   # base validation_step skips empty-GT — preserve that
+
+            pred_boxes = pred["boxes"]
+            polys      = target.get("canopy_polygons", []) if isinstance(target, dict) else []
+
+            if pred_boxes.numel() == 0 or not polys:
+                filtered_preds.append(pred)
+                filtered_targets.append(target)
+                continue
+
+            device = pred_boxes.device
+            gt_boxes = target["boxes"].to(device)
+
+            # IoU of each prediction with each ITC GT bbox
+            iou = box_iou(pred_boxes, gt_boxes)
+            max_iou_per_pred = iou.max(dim=1).values
+            matched_to_gt    = max_iou_per_pred >= iou_thr
+
+            # IoP of each (unmatched) prediction against the canopy polygon mask.
+            # Predictions live in patch-local pixel coords (RetinaNet's transform
+            # rescales them back to the input image size before returning), so
+            # the canopy mask is built at the patch size with no scale factor.
+            H, W = int(img_t.shape[-2]), int(img_t.shape[-1])
+            integral = self._build_canopy_integral(polys, H, W, 1.0, 1.0)
+            if integral is None:
+                filtered_preds.append(pred)
+                filtered_targets.append(target)
+                continue
+
+            integral_t = torch.from_numpy(integral).to(device)
+            iop = self._anchor_iop_from_integral(pred_boxes, integral_t, H, W)
+
+            # Drop predictions that are mostly inside canopy AND not an ITC match
+            drop = (iop >= iop_thr) & (~matched_to_gt)
+            if drop.any():
+                keep = ~drop
+                pred = {
+                    "boxes":  pred_boxes[keep],
+                    "scores": pred["scores"][keep],
+                    "labels": pred["labels"][keep],
+                }
+            filtered_preds.append(pred)
+            filtered_targets.append(target)
+
+        if filtered_targets:
+            if hasattr(self, "iou_metric"):
+                self.iou_metric.update(filtered_preds, filtered_targets)
+            self.mAP_metric.update(filtered_preds, filtered_targets)
+
+        # Preserve the base behaviour of logging unfiltered predictions so any
+        # downstream evaluator sees what the model actually predicted.
+        for i, result in enumerate(preds):
+            try:
+                formatted_result = _df_utilities.format_geometry(result)
+            except Exception:
+                formatted_result = None
+            if formatted_result is not None:
+                formatted_result["image_path"] = image_names[i]
+                self.predictions.append(formatted_result)
+
+        return losses
