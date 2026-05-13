@@ -580,7 +580,13 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
         predictions before updating mAP / IoU metrics: drop detections that fall
         substantially inside a canopy polygon AND have no matching ITC GT
         bbox.  Such detections are correct under the canopy positive policy and
-        should not be charged as FPs."""
+        should not be charged as FPs.
+
+        The train-mode forward used by the base validation_step to log
+        ``val_loss`` is deliberately omitted — no callback / scheduler consumes
+        it any more (LR scheduler now monitors train_loss_epoch; EarlyStopping
+        and ModelCheckpoint both monitor map).  Skipping it ~halves val cost.
+        """
         if not self.canopy_enabled:
             return super().validation_step(batch, batch_idx)
 
@@ -588,18 +594,6 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
         from deepforest import utilities as _df_utilities
 
         images, targets, image_names = batch
-
-        # Loss pass (train-mode forward, no backward) — mirrors base behaviour.
-        self.model.train()
-        with torch.no_grad():
-            loss_dict = self.model.forward(images, targets)
-        losses = sum(loss_dict.values())
-        try:
-            for key, value in loss_dict.items():
-                self.log(f"val_{key}", value, on_epoch=True, batch_size=len(images))
-            self.log("val_loss", losses, on_epoch=True, batch_size=len(images))
-        except Exception:
-            pass
 
         # Prediction pass (eval-mode forward).
         self.model.eval()
@@ -673,4 +667,5 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
                 formatted_result["image_path"] = image_names[i]
                 self.predictions.append(formatted_result)
 
-        return losses
+        # Lightning accepts None — no callback/scheduler reads the return value here.
+        return None

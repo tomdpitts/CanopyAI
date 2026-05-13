@@ -298,16 +298,22 @@ class _TiledValDataset:
         self._H, self._W = _sample.shape[:2]
         self._build_patch_list()
 
+    # Deterministic val sampling: four 400×400 patches per 2048×2048 tile,
+    # centred on the quadrant centres.  No randomness — same patches every
+    # val run, every model, every epoch, so cross-model map comparisons are
+    # apples-to-apples.  9× fewer val batches than the old full-grid sweep.
+    VAL_PATCH_OFFSETS = [(424, 424), (1224, 424), (424, 1224), (1224, 1224)]
+
     def _build_patch_list(self):
         self._patches = []
         for img_idx in range(len(self.base.image_names)):
-            for py in range(0, self._H, self.step):
-                for px in range(0, self._W, self.step):
-                    py2 = min(py + self.patch_size, self._H)
-                    px2 = min(px + self.patch_size, self._W)
-                    py1 = max(0, py2 - self.patch_size)
-                    px1 = max(0, px2 - self.patch_size)
-                    self._patches.append((img_idx, px1, py1, px2, py2))
+            for px1, py1 in self.VAL_PATCH_OFFSETS:
+                px2 = min(px1 + self.patch_size, self._W)
+                py2 = min(py1 + self.patch_size, self._H)
+                # Clamp back if a tile is smaller than expected (defensive)
+                px1 = max(0, px2 - self.patch_size)
+                py1 = max(0, py2 - self.patch_size)
+                self._patches.append((img_idx, px1, py1, px2, py2))
 
     def __len__(self):
         return len(self._patches)
@@ -713,6 +719,7 @@ def train_deepforest(
         dirpath=run_output_dir,
         filename="deepforest-{epoch:02d}-{map:.2f}",
         monitor=_monitor, mode="max", save_top_k=1, verbose=True,
+        save_last=True,   # last.ckpt at every epoch end as a fallback
     ))
 
     if val_csv:
