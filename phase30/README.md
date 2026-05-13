@@ -8,6 +8,7 @@ Fine-tuning a DeepForest (RetinaNet) model on the [Restor TCD dataset](https://h
 |---|---|
 | `train.py` | Training launcher — call with CSV paths and checkpoint to start training |
 | `build_phase30_csvs.py` | Streams TCD from HuggingFace → writes train/val CSVs + canopy polygons JSON |
+| `visualise_canopy_policy.py` | Renders an explainer PNG showing how the canopy policy treats ITC vs canopy anchors |
 | `evaluate.py` | Evaluates a trained checkpoint against the TCD holdout test set |
 | `lib/` | Internal modules: training loop, model definition, utilities, configs |
 | `inference/predict.py` | Two-stage inference pipeline: DeepForest → SAM segmentation |
@@ -46,68 +47,90 @@ modal volume get canopyai-deepforest-checkpoints \
 
 ---
 
-## 3. Build training CSVs + canopy polygons
+## 3. Set the TCD tile path
 
-Streams the TCD dataset from HuggingFace and writes:
+By default the build script expects tiles at `data/tcd/images/data/tcd/raw/`. If your TCD data lives elsewhere, edit `TRAIN_DIR` near the top of [phase30/build_phase30_csvs.py](phase30/build_phase30_csvs.py):
 
-- `phase30_tcd_train.csv`, `phase30_tcd_val.csv` — genuine ITC bboxes only (`category_id=2` in COCO; `category_id=1` canopy polygons are **not** written as pseudo-ITC rows).
-- `phase30_tcd_canopy_polygons.json` — original canopy polygon vertices. All canopy-region training signal flows through this file via the polygon-precise canopy positive policy.
+```python
+TRAIN_DIR = Path("/abs/path/to/your/tcd/tiles")   # must contain tcd_tile_*.tif + tcd_tile_*_meta.json
+```
 
-**Downloads ~40 GB of tiles on first run.**
+You also need the shadow vectors JSON at `data/tcd/tcd_shadow_vectors_by_id.json` (request from Tom) — the build script reads this at startup even when you aren't using shadow loss.
+
+---
+
+## 4. Build training CSVs + canopy polygons
+
+Writes three files into `phase30/`:
+
+- `phase30_tcd_train.csv`, `phase30_tcd_val.csv` — genuine ITC bboxes only (`category_id=2` in COCO; canopy polygons are **not** written as pseudo-ITC rows).
+- `phase30_tcd_canopy_polygons.json` — canopy polygon vertices, consumed by the canopy positive policy at training time.
 
 ```bash
-# First-time setup — streams from HuggingFace:
-python build_phase30_csvs.py
+# First-time setup — streams ~40 GB of tiles from HuggingFace into TRAIN_DIR:
+python phase30/build_phase30_csvs.py
 
-# Re-build from tiles already on disk:
-python build_phase30_csvs.py --from-disk --skip-repair
+# Re-build when tiles + meta.json are already present locally:
+python phase30/build_phase30_csvs.py --from-disk
 ```
 
 ---
 
-## 4. Sanity check (1 batch)
+## 5. Sanity check (1 batch)
 
 ```bash
-python train.py --train-csv phase30/phase30_tcd_train.csv --val-csv phase30/phase30_tcd_val.csv --checkpoint phase22_B_L4.pth --fast-dev-run
+python phase30/train.py --train-csv phase30/phase30_tcd_train.csv --val-csv phase30/phase30_tcd_val.csv --checkpoint phase22_B_L4.pth --canopy-polygons phase30/phase30_tcd_canopy_polygons.json --fast-dev-run
 ```
 
 Should complete in under 2 minutes with no errors.
 
 ---
 
-## 5. Training: experiment matrix
+## 6. Training: experiment matrix
 
-All runs share: lr=1e-4, `shadow_loss_reweight=True`, shadow_weight=2.0, batch=32, epochs=50, patience=10. Canopy regions are now handled exclusively via `--canopy-polygons` + `--canopy-loss-scale`.
+All runs share: lr=1e-4, `shadow_loss_reweight=True`, shadow_weight=2.0, batch=32, epochs=50, patience=10. Canopy regions are handled exclusively via `--canopy-polygons` + `--canopy-loss-scale`.
 
 **Canopy positive (default)** — anchors with IoP ≥ 0.7 against a canopy polygon are treated as positives (cls target=1, regression suppressed):
 
 ```bash
-python train.py --train-csv phase30/phase30_tcd_train.csv --val-csv phase30/phase30_tcd_val.csv --checkpoint phase22_B_L4.pth --canopy-polygons phase30/phase30_tcd_canopy_polygons.json --run-name phase31_canopy
+python phase30/train.py --train-csv phase30/phase30_tcd_train.csv --val-csv phase30/phase30_tcd_val.csv --checkpoint phase22_B_L4.pth --canopy-polygons phase30/phase30_tcd_canopy_polygons.json --run-name phase31_canopy
 ```
 
 **Canopy dampened** — each canopy anchor's contribution halved. Use if canopy swamps ITC:
 
 ```bash
-python train.py --train-csv phase30/phase30_tcd_train.csv --val-csv phase30/phase30_tcd_val.csv --checkpoint phase22_B_L4.pth --canopy-polygons phase30/phase30_tcd_canopy_polygons.json --canopy-loss-scale 0.5 --run-name phase31_canopy_scale05
+python phase30/train.py --train-csv phase30/phase30_tcd_train.csv --val-csv phase30/phase30_tcd_val.csv --checkpoint phase22_B_L4.pth --canopy-polygons phase30/phase30_tcd_canopy_polygons.json --canopy-loss-scale 0.5 --run-name phase31_canopy_scale05
 ```
 
 **Canopy iscrowd-style ignore** — `--canopy-loss-scale 0.0` strips canopy anchors from the cls loss entirely (and from the denominator):
 
 ```bash
-python train.py --train-csv phase30/phase30_tcd_train.csv --val-csv phase30/phase30_tcd_val.csv --checkpoint phase22_B_L4.pth --canopy-polygons phase30/phase30_tcd_canopy_polygons.json --canopy-loss-scale 0.0 --run-name phase31_canopy_ignore
+python phase30/train.py --train-csv phase30/phase30_tcd_train.csv --val-csv phase30/phase30_tcd_val.csv --checkpoint phase22_B_L4.pth --canopy-polygons phase30/phase30_tcd_canopy_polygons.json --canopy-loss-scale 0.0 --run-name phase31_canopy_ignore
 ```
 
 **ITC-only ablation** — omit `--canopy-polygons` entirely. Canopy regions become unannotated, so anchors there are trained as negatives. Useful as a worst-case lower bound on the value of modelling canopy at all:
 
 ```bash
-python train.py --train-csv phase30/phase30_tcd_train.csv --val-csv phase30/phase30_tcd_val.csv --checkpoint phase22_B_L4.pth --run-name phase31_itc_only
+python phase30/train.py --train-csv phase30/phase30_tcd_train.csv --val-csv phase30/phase30_tcd_val.csv --checkpoint phase22_B_L4.pth --run-name phase31_itc_only
 ```
 
 Checkpoints land in `checkpoints/<run-name>/`; best `map` is kept. Internal IoP threshold is `ShadowConditionedDeepForest.CANOPY_IOP_THRESH = 0.7`.
 
 ---
 
-## 6. Inference
+## 7. Optional — explainer visualisation
+
+Renders a five-panel figure showing how the canopy positive policy treats representative ITC and canopy anchors in real training tiles. Useful for sharing with collaborators:
+
+```bash
+python phase30/visualise_canopy_policy.py
+```
+
+Writes [phase30/canopy_policy_explainer.png](phase30/canopy_policy_explainer.png).
+
+---
+
+## 8. Inference
 
 Run the two-stage DeepForest → SAM pipeline on a single tile:
 
@@ -120,7 +143,7 @@ python inference/predict.py \
 
 ---
 
-## 7. Benchmark
+## 9. Benchmark
 
 Evaluate a checkpoint against the TCD holdout test set:
 
