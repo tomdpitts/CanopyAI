@@ -1,0 +1,612 @@
+#!/usr/bin/env python3
+"""
+benchmark.py — Restor-comparable evaluation on the OAM-TCD holdout split.
+
+Computes the two metric flavours reported in the Restor TCD paper:
+
+  • Binary semantic segmentation (micro-averaged pixel IoU / F1 / Acc)
+        comparable to Restor Table 1 (UNet / SegFormer holdout column).
+  • Instance mAP50 via pycocotools segm task (cat=2 trees only)
+        comparable to Restor's Mask-RCNN R50 baseline (mAP50 = 43.22).
+
+Reuses the existing per-tile inference contract from benchmark_tcd.py:
+each model produces  {stem}_canopyai.geojson  in pixel space with one
+of the known confidence columns (deepforest_score / score / etc.).
+
+Inference is delegated to:
+  • foxtrot.py            — phase30 .pth checkpoints
+  • infer_detectree2.py   — detectree2 baseline
+  • infer_segformer.py    — Restor SegFormer mit-b5
+
+Usage:
+    python phase30/benchmark.py \\
+        --models phase30_L4.pth detectree2 segformer \\
+        --names  phase30_L4    detectree2 segformer_b5 \\
+        --output-root benchmark_results_holdout \\
+        --skip-existing
+"""
+
+import argparse
+import csv
+import datetime
+import io
+import json
+import subprocess
+import sys
+import time
+from concurrent.futures import ProcessPoolExecutor
+from contextlib import redirect_stdout
+from pathlib import Path
+
+import geopandas as gpd
+import numpy as np
+import rasterio.features
+from shapely.geometry import Polygon, shape
+from shapely.validation import make_valid
+
+# Project root: phase30/ sibling scripts (foxtrot.py etc.) live one level up.
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+
+DEFAULT_HOLDOUT_DIR = REPO_ROOT / "data" / "tcd" / "images" / "data" / "tcd" / "val"
+
+
+# ── CLI ────────────────────────────────────────────────────────────────────────
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        description="Restor-comparable OAM-TCD holdout benchmark."
+    )
+    p.add_argument("--models", nargs="+", required=True,
+                   help="Specifiers: 'detectree2', 'segformer', or path to .pth checkpoint.")
+    p.add_argument("--names", nargs="+", required=True,
+                   help="Display name for each model (same length as --models).")
+    p.add_argument("--holdout-dir", default=str(DEFAULT_HOLDOUT_DIR),
+                   help=f"OAM-TCD val split with *.tif + *_meta.json (default: {DEFAULT_HOLDOUT_DIR}).")
+    p.add_argument("--output-root", default="benchmark_results_holdout",
+                   help="Where per-model prediction folders + summary files are written.")
+    p.add_argument("--shadow-model",
+                   default="solar/shadow_regression/output/shadow_model_combined_best.pth")
+    p.add_argument("--abs-luma-max", type=float, default=None,
+                   help="Shadow map luma ceiling passed to foxtrot (None → foxtrot default).")
+    p.add_argument("--tiles", nargs="+", default=None,
+                   help="Restrict to these tile stems (e.g. tcd_val_tile_0 tcd_val_tile_1).")
+    p.add_argument("--skip-inference", action="store_true",
+                   help="Skip Step 1; only re-evaluate existing geojsons under --output-root.")
+    p.add_argument("--skip-existing", action="store_true",
+                   help="During inference, skip tiles whose geojson is already on disk.")
+    p.add_argument("--pred-score-thresh", type=float, default=0.0,
+                   help="Drop predictions below this confidence before metric computation.")
+    return p.parse_args()
+
+
+def model_type(spec):
+    s = spec.lower()
+    if s == "detectree2":
+        return "detectree2"
+    if s == "segformer":
+        return "segformer"
+    return "checkpoint"
+
+
+# ── Inference (subprocess wrappers, mirroring benchmark_tcd.py) ───────────────
+
+def _progress_suffix(times, total):
+    elapsed = times[-1]
+    avg = sum(times) / len(times)
+    remaining = avg * (total - len(times))
+    eta = datetime.datetime.now() + datetime.timedelta(seconds=remaining)
+    return f"  {elapsed:5.1f}s | avg {avg:5.1f}s | ETA {eta:%H:%M:%S}"
+
+
+def run_foxtrot(model_spec, mtype, image_path, out_dir, shadow_model, abs_luma_max=None):
+    cmd = [sys.executable, str(REPO_ROOT / "foxtrot.py"),
+           "--image_path", str(image_path),
+           "--output_dir", str(out_dir),
+           "--shadow_model", str(shadow_model),
+           "--no_viz"]
+    if mtype == "checkpoint":
+        cmd += ["--deepforest_model", model_spec]
+    if abs_luma_max is not None:
+        cmd += ["--abs_luma_max", str(abs_luma_max)]
+    r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if r.returncode != 0:
+        print(f"      ⚠  foxtrot failed: {r.stderr[-300:]}")
+        return False
+    return True
+
+
+def run_segformer(image_path, out_dir):
+    cmd = [sys.executable, str(REPO_ROOT / "infer_segformer.py"),
+           "--image_path", str(image_path),
+           "--output_dir", str(out_dir)]
+    r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if r.returncode != 0:
+        print(f"      ⚠  infer_segformer failed: {r.stderr[-300:]}")
+        return False
+    return True
+
+
+def run_detectree2_one(image_path, out_dir):
+    cmd = [sys.executable, str(REPO_ROOT / "infer_detectree2.py"),
+           "--image_path", str(image_path),
+           "--output_dir", str(out_dir),
+           "--weights", "finetuned"]
+    r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if r.returncode != 0:
+        print(f"      ⚠  infer_detectree2 failed: {r.stderr[-300:]}")
+        return False
+    return True
+
+
+def run_inference(model_spec, mtype, holdout_dir, out_dir, shadow_model,
+                  abs_luma_max=None, skip_existing=False, tile_filter=None):
+    tifs = sorted(Path(holdout_dir).glob("*.tif"))
+    if tile_filter is not None:
+        tifs = [t for t in tifs if t.stem in tile_filter]
+    pending = [t for t in tifs
+               if not (skip_existing and (Path(out_dir) / f"{t.stem}_canopyai.geojson").exists())]
+
+    ok, skipped, times = 0, 0, []
+    for tif in tifs:
+        out_file = Path(out_dir) / f"{tif.stem}_canopyai.geojson"
+        if skip_existing and out_file.exists():
+            skipped += 1
+            ok += 1
+            continue
+        print(f"    {tif.name} ... ", end="", flush=True)
+        t0 = time.monotonic()
+        if mtype == "segformer":
+            success = run_segformer(tif, out_dir)
+        elif mtype == "detectree2":
+            success = run_detectree2_one(tif, out_dir)
+        else:
+            success = run_foxtrot(model_spec, mtype, tif, out_dir,
+                                  shadow_model, abs_luma_max)
+        times.append(time.monotonic() - t0)
+        print(("✓" if success else "✗") + _progress_suffix(times, len(pending)))
+        ok += success
+
+    if skipped:
+        print(f"  {skipped} tiles skipped (already exist)")
+    print(f"  {ok}/{len(tifs)} successful")
+    return ok > 0
+
+
+# ── GT parsing (pixel-space, no world transform needed) ───────────────────────
+
+def _parse_coco_annotations(meta):
+    """
+    Yield (category_id, segmentation_dict_or_polygon_list) from a meta.json.
+    Strings (legacy JSON-stringified field) are parsed.
+    """
+    coco = meta.get("coco_annotations", [])
+    if isinstance(coco, str):
+        coco = json.loads(coco)
+    for ann in coco or []:
+        seg = ann.get("segmentation")
+        if not seg:
+            continue
+        yield int(ann.get("category_id", 2)), seg, ann.get("bbox"), ann.get("area")
+
+
+def _seg_to_polygons(seg, height, width):
+    """
+    Convert a COCO segmentation into a list of shapely Polygons in pixel space.
+    Handles both polygon-list form (cat=2 trees) and RLE-dict form (cat=1 canopy).
+    """
+    from pycocotools import mask as mask_utils
+
+    polys = []
+    if isinstance(seg, list) and seg and isinstance(seg[0], list):
+        for ring in seg:
+            try:
+                coords = np.asarray(ring, dtype=np.float32).reshape(-1, 2)
+                if len(coords) < 3:
+                    continue
+                p = Polygon(coords)
+                if not p.is_valid:
+                    p = make_valid(p)
+                if p.is_valid and p.area > 0:
+                    polys.append(p)
+            except Exception:
+                continue
+    elif isinstance(seg, dict) and "counts" in seg:
+        try:
+            rle = mask_utils.frPyObjects(seg, height, width)
+            mask = mask_utils.decode(rle)
+            if mask.ndim == 3:
+                mask = mask[..., 0]
+            for geom, val in rasterio.features.shapes(mask.astype(np.uint8), mask > 0):
+                if val != 1:
+                    continue
+                p = shape(geom)
+                if not p.is_valid:
+                    p = make_valid(p)
+                if p.is_valid and p.area > 0:
+                    polys.append(p)
+        except Exception:
+            pass
+    return polys
+
+
+def _rasterize(polys, height, width):
+    if not polys:
+        return np.zeros((height, width), dtype=bool)
+    shapes = [(p, 1) for p in polys if p is not None and not p.is_empty]
+    if not shapes:
+        return np.zeros((height, width), dtype=bool)
+    mask = rasterio.features.rasterize(
+        shapes, out_shape=(height, width), fill=0, dtype=np.uint8, all_touched=False,
+    )
+    return mask.astype(bool)
+
+
+def _rle_encode(mask_bool, height, width):
+    """Encode a HxW boolean mask as a COCO compressed RLE."""
+    from pycocotools import mask as mask_utils
+    arr = np.asfortranarray(mask_bool.astype(np.uint8))
+    rle = mask_utils.encode(arr)
+    # pycocotools returns bytes in 'counts' — JSON-incompatible; decode for transport.
+    rle["counts"] = rle["counts"].decode("ascii")
+    return rle
+
+
+# ── Prediction parsing ────────────────────────────────────────────────────────
+
+_SCORE_COLS = ("deepforest_score", "score", "Confidence_score",
+               "Confidence", "confidence")
+
+
+def _load_predictions(pred_path, height, width, score_thresh):
+    """
+    Read {stem}_canopyai.geojson and return a list of (shapely_polygon, score)
+    in pixel space. Defensive against the rare case of stored world coords
+    (only foxtrot in TCD-raw mode would do that; val tiles are pixel-space).
+    """
+    if not pred_path.exists():
+        return []
+    gdf = gpd.read_file(str(pred_path))
+    if gdf.empty:
+        return []
+
+    # Score column
+    sc = next((c for c in _SCORE_COLS if c in gdf.columns), None)
+    scores = gdf[sc].astype(float).values if sc else np.ones(len(gdf))
+
+    out = []
+    for geom, score in zip(gdf.geometry, scores):
+        if geom is None or geom.is_empty:
+            continue
+        if score < score_thresh:
+            continue
+        g = geom if geom.is_valid else make_valid(geom)
+        if g.is_empty:
+            continue
+        out.append((g, float(score)))
+    return out
+
+
+# ── Per-tile worker: rasterise + per-tile counts + COCO dets ──────────────────
+
+def _eval_tile_worker(args):
+    """
+    One tile's contribution.
+    Returns:
+      tile_id, stem, n_gt_tree, n_pred,
+      tp, fp, fn, tn,                              # binary pixel counts
+      gt_anns,                                     # list of coco GT anns (cat=2 only)
+      pred_dets                                    # list of coco detections
+    """
+    (tile_id, stem, meta_path, pred_path, score_thresh) = args
+    with open(meta_path) as f:
+        meta = json.load(f)
+    H, W = int(meta["height"]), int(meta["width"])
+
+    # Build GT polygon lists per metric.
+    # For COCO: cat=2 (trees) are normal positives (iscrowd=0); cat=1 (canopy
+    # blobs) are emitted as iscrowd=1 ignore regions so tree predictions
+    # falling inside indistinct canopy don't get counted as FPs.
+    gt_polys_all = []          # cat=1 ∪ cat=2 — for binary semantic mask
+    gt_anns      = []          # list of dicts for COCO (trees + canopy-as-ignore)
+    n_gt_tree    = 0
+    for cat, seg, bbox, area in _parse_coco_annotations(meta):
+        polys = _seg_to_polygons(seg, H, W)
+        if not polys:
+            continue
+        gt_polys_all.extend(polys)
+
+        m = _rasterize(polys, H, W)
+        if not m.any():
+            continue
+        rle = _rle_encode(m, H, W)
+        ys, xs = np.where(m)
+        y0, x0 = int(ys.min()), int(xs.min())
+        y1, x1 = int(ys.max()) + 1, int(xs.max()) + 1
+        gt_anns.append({
+            "image_id":     tile_id,
+            "category_id":  1,                       # single class: "tree"
+            "segmentation": rle,
+            "bbox":         [x0, y0, x1 - x0, y1 - y0],
+            "area":         float(m.sum()),
+            "iscrowd":      0 if cat == 2 else 1,    # cat=1 canopy → ignore region
+        })
+        if cat == 2:
+            n_gt_tree += 1
+
+    gt_mask_all = _rasterize(gt_polys_all, H, W)
+
+    # Predictions
+    preds = _load_predictions(pred_path, H, W, score_thresh)
+    pred_polys = [g for g, _ in preds]
+    pred_mask = _rasterize(pred_polys, H, W)
+
+    # Binary pixel confusion counts
+    gt_flat   = gt_mask_all.ravel()
+    pred_flat = pred_mask.ravel()
+    tp = int(np.count_nonzero(pred_flat & gt_flat))
+    fp = int(np.count_nonzero(pred_flat & ~gt_flat))
+    fn = int(np.count_nonzero(~pred_flat & gt_flat))
+    tn = int(pred_flat.size - tp - fp - fn)
+
+    # COCO detections (one per predicted polygon, cat=1 in remapped space)
+    pred_dets = []
+    for poly, score in preds:
+        pmask = _rasterize([poly], H, W)
+        if not pmask.any():
+            continue
+        rle = _rle_encode(pmask, H, W)
+        ys, xs = np.where(pmask)
+        y0, x0 = int(ys.min()), int(xs.min())
+        y1, x1 = int(ys.max()) + 1, int(xs.max()) + 1
+        pred_dets.append({
+            "image_id":     tile_id,
+            "category_id":  1,
+            "segmentation": rle,
+            "bbox":         [x0, y0, x1 - x0, y1 - y0],
+            "score":        float(score),
+        })
+
+    return {
+        "tile_id":   tile_id,
+        "stem":      stem,
+        "H": H, "W": W,
+        "n_gt_all":  len(gt_polys_all),
+        "n_gt_tree": n_gt_tree,
+        "n_pred":    len(pred_polys),
+        "tp": tp, "fp": fp, "fn": fn, "tn": tn,
+        "gt_anns":   gt_anns,
+        "pred_dets": pred_dets,
+    }
+
+
+# ── COCO mAP50 ────────────────────────────────────────────────────────────────
+
+def _coco_map50(images, gt_anns, dets):
+    """
+    Run pycocotools COCOeval segm with IoU=0.5 only.
+    Returns (mAP50, AR_at_100).  Returns (None, None) if there is no GT or dets.
+    """
+    if not gt_anns or not dets:
+        return None, None
+    from pycocotools.coco import COCO
+    from pycocotools.cocoeval import COCOeval
+
+    gt_dict = {
+        "images":      images,
+        "annotations": [dict(a, id=i + 1) for i, a in enumerate(gt_anns)],
+        "categories":  [{"id": 1, "name": "tree"}],
+    }
+
+    silent = io.StringIO()
+    with redirect_stdout(silent):
+        coco_gt = COCO()
+        coco_gt.dataset = gt_dict
+        coco_gt.createIndex()
+        coco_dt = coco_gt.loadRes(dets)
+
+        ev = COCOeval(coco_gt, coco_dt, iouType="segm")
+        ev.params.iouThrs = np.array([0.5])
+        ev.params.maxDets = [1, 10, 1000]
+        ev.params.areaRng     = [[0, 1e10]]
+        ev.params.areaRngLbl  = ["all"]
+        ev.evaluate()
+        ev.accumulate()
+
+    # precision shape: [T, R, K, A, M].  Take the largest-maxDets slice (last M).
+    # Averaging across maxDets caps recall at 1/27 etc. on dense tiles and
+    # turns a perfect-prediction self-test into mAP=0.47 instead of 1.0.
+    prec = ev.eval["precision"][:, :, :, :, -1]
+    rec  = ev.eval["recall"][:, :, :, -1]
+    valid_p = prec[prec > -1]
+    valid_r = rec[rec > -1]
+    map50 = float(valid_p.mean()) if valid_p.size else None
+    ar    = float(valid_r.mean()) if valid_r.size else None
+    return map50, ar
+
+
+# ── Evaluation orchestration ──────────────────────────────────────────────────
+
+def evaluate_model(name, out_dir, holdout_dir, score_thresh, tile_filter=None):
+    holdout_dir = Path(holdout_dir)
+    metas = sorted(holdout_dir.glob("*_meta.json"))
+    if tile_filter is not None:
+        metas = [m for m in metas
+                 if m.name.replace("_meta.json", "") in tile_filter]
+
+    worker_args = []
+    images = []
+    for i, mp in enumerate(metas):
+        stem = mp.name.replace("_meta.json", "")
+        pred_path = Path(out_dir) / f"{stem}_canopyai.geojson"
+        worker_args.append((i, stem, str(mp), pred_path, score_thresh))
+        # populated with H,W after worker runs; pre-fill with placeholder dims
+        images.append({"id": i, "file_name": f"{stem}.tif",
+                       "width": 0, "height": 0})
+
+    if not worker_args:
+        return None
+
+    # Run rasterisation + counts in parallel
+    print(f"    Rasterising + counting on {len(worker_args)} tiles...")
+    t0 = time.monotonic()
+    results = []
+    with ProcessPoolExecutor() as ex:
+        for i, r in enumerate(ex.map(_eval_tile_worker, worker_args, chunksize=4)):
+            results.append(r)
+            images[r["tile_id"]]["width"]  = r["W"]
+            images[r["tile_id"]]["height"] = r["H"]
+            if (i + 1) % 50 == 0 or (i + 1) == len(worker_args):
+                avg = (time.monotonic() - t0) / (i + 1)
+                remaining = avg * (len(worker_args) - (i + 1))
+                eta = datetime.datetime.now() + datetime.timedelta(seconds=remaining)
+                print(f"      {i+1}/{len(worker_args)}  avg {avg:4.2f}s/tile  ETA {eta:%H:%M:%S}")
+
+    # Binary semantic-seg micro counts
+    tp = sum(r["tp"] for r in results)
+    fp = sum(r["fp"] for r in results)
+    fn = sum(r["fn"] for r in results)
+    tn = sum(r["tn"] for r in results)
+
+    denom_iou = tp + fp + fn
+    bin_iou = tp / denom_iou if denom_iou else 0.0
+    bin_f1  = (2 * tp) / (2 * tp + fp + fn) if (2 * tp + fp + fn) else 0.0
+    bin_acc = (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) else 0.0
+
+    # COCO mAP50 (cat=2 trees only)
+    gt_anns = [a for r in results for a in r["gt_anns"]]
+    dets    = [d for r in results for d in r["pred_dets"]]
+    n_pred_total = sum(r["n_pred"] for r in results)
+    n_gt_tree    = sum(r["n_gt_tree"] for r in results)
+
+    map50, ar = _coco_map50(images, gt_anns, dets)
+
+    return {
+        "n_tiles": len(results),
+        "n_gt_tree": n_gt_tree,
+        "n_pred": n_pred_total,
+        "tp": tp, "fp": fp, "fn": fn, "tn": tn,
+        "bin_iou": bin_iou, "bin_f1": bin_f1, "bin_acc": bin_acc,
+        "map50": map50, "ar1000": ar,
+        "per_tile": [
+            {"stem": r["stem"],
+             "n_gt_all": r["n_gt_all"], "n_gt_tree": r["n_gt_tree"],
+             "n_pred": r["n_pred"],
+             "tp": r["tp"], "fp": r["fp"], "fn": r["fn"], "tn": r["tn"]}
+            for r in results
+        ],
+    }
+
+
+# ── Output ────────────────────────────────────────────────────────────────────
+
+def _fmt(v, w=6, prec=3):
+    if v is None:
+        return "—".rjust(w)
+    return f"{v:{w}.{prec}f}"
+
+
+def print_table(all_results, holdout_dir):
+    n_tiles_total = len(sorted(Path(holdout_dir).glob("*_meta.json")))
+    bar = "═" * 79
+    print()
+    print(bar)
+    print(f"  BENCHMARK — OAM-TCD holdout ({n_tiles_total} tiles)")
+    print(f"  Binary semantic-seg (micro pixel)  +  Instance mAP50 (pycocotools segm)")
+    print(bar)
+    hdr = f"  {'Model':<18}  {'N':>4}  {'binIoU':>6}  {'binF1':>6}  {'binAcc':>6}  {'mAP50':>6}  {'AR@1000':>7}"
+    sep = "  " + "-"*18 + "  " + "-"*4 + "  " + "  ".join(["-"*6]*4) + "  " + "-"*7
+    print(hdr); print(sep)
+    for name, r in all_results.items():
+        if r is None:
+            print(f"  {name:<18}  {'—':>4}  {'—':>6}  {'—':>6}  {'—':>6}  {'—':>6}  {'—':>7}")
+            continue
+        print(f"  {name:<18}  {r['n_tiles']:>4}  "
+              f"{_fmt(r['bin_iou'])}  {_fmt(r['bin_f1'])}  {_fmt(r['bin_acc'])}  "
+              f"{_fmt(r['map50'])}  {_fmt(r['ar1000'], 7)}")
+    print(bar)
+    print("  Restor reference (holdout):  SegFormer mit-b5 IoU=0.876   Mask-RCNN R50 mAP50=0.432")
+    print(bar + "\n")
+
+
+def save_tile_csv(name, per_tile, out_path):
+    if not per_tile:
+        return
+    fieldnames = ["model"] + list(per_tile[0].keys())
+    with open(out_path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for row in per_tile:
+            w.writerow({"model": name, **row})
+    print(f"  📊 per-tile CSV: {out_path}")
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    args = parse_args()
+    if len(args.models) != len(args.names):
+        print("❌ --models and --names must match in length"); sys.exit(1)
+
+    holdout_dir = Path(args.holdout_dir)
+    if not holdout_dir.is_dir():
+        print(f"❌ holdout dir not found: {holdout_dir}"); sys.exit(1)
+
+    output_root = Path(args.output_root)
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    tile_filter = set(args.tiles) if args.tiles else None
+
+    # Step 1: inference per model
+    for spec, name in zip(args.models, args.names):
+        mtype = model_type(spec)
+        out_dir = output_root / name
+        out_dir.mkdir(exist_ok=True)
+        if args.skip_inference:
+            continue
+        print(f"\n{'─'*60}\n  Inference: {name}  [{mtype}]\n{'─'*60}")
+        run_inference(spec, mtype, holdout_dir, out_dir, args.shadow_model,
+                      abs_luma_max=args.abs_luma_max,
+                      skip_existing=args.skip_existing,
+                      tile_filter=tile_filter)
+
+    # Step 2: evaluation
+    all_results = {}
+    for spec, name in zip(args.models, args.names):
+        out_dir = output_root / name
+        print(f"\n  Evaluating {name} ...")
+        res = evaluate_model(name, out_dir, holdout_dir,
+                             args.pred_score_thresh, tile_filter=tile_filter)
+        all_results[name] = res
+        if res is not None:
+            save_tile_csv(name, res["per_tile"],
+                          output_root / f"{name}_holdout_tiles.csv")
+            map_str = "—" if res["map50"] is None else f"{res['map50']:.3f}"
+            print(f"    binIoU={res['bin_iou']:.3f}  binF1={res['bin_f1']:.3f}  "
+                  f"binAcc={res['bin_acc']:.3f}  mAP50={map_str}")
+
+    # Step 3: output
+    print_table(all_results, holdout_dir)
+
+    summary = {
+        "args": vars(args),
+        "results": {
+            name: (None if r is None else {
+                "n_tiles":  r["n_tiles"],
+                "n_gt_tree": r["n_gt_tree"],
+                "n_pred":   r["n_pred"],
+                "tp": r["tp"], "fp": r["fp"], "fn": r["fn"], "tn": r["tn"],
+                "bin_iou": r["bin_iou"], "bin_f1": r["bin_f1"], "bin_acc": r["bin_acc"],
+                "map50":   r["map50"],   "ar1000": r["ar1000"],
+            })
+            for name, r in all_results.items()
+        },
+    }
+    summary_path = output_root / "benchmark_holdout_summary.json"
+    with open(summary_path, "w") as f:
+        json.dump(summary, f, indent=2)
+    print(f"  💾 summary: {summary_path}")
+
+
+if __name__ == "__main__":
+    main()
