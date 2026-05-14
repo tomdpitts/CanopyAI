@@ -444,6 +444,11 @@ def train_deepforest(
     print(f"🌲 DeepForest Training: {run_name}")
     print("=" * 60)
 
+    # Seed all sources of randomness (DataLoader shuffle, albumentations, torch
+    # ops, workers).  Same seed across variant runs → run-to-run mAP deltas
+    # properly reflect config changes
+    pl.seed_everything(42, workers=True)
+
     print("\n⚙️  Initializing model...")
 
     canopy_enabled = canopy_polygons_path is not None
