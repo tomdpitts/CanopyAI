@@ -43,12 +43,15 @@ from benchmark import (
     _rasterize,
     _seg_to_polygons,
 )
+import geopandas as gpd
+from shapely.geometry import box as shapely_box
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_HOLDOUT_DIR = REPO_ROOT / "data" / "tcd" / "images" / "data" / "tcd" / "val"
 
-# Hardcoded for reproducibility — spread across the 0..438 holdout range.
-TILE_INDICES = [17, 73, 142, 215, 287, 356, 421]
+# Hardcoded for reproducibility — spread across the 0..438 holdout range,
+# plus three extra in the 100-164 band for closer side-by-side inspection.
+TILE_INDICES = [105, 111, 117, 123, 128, 132, 145]
 
 IOU_THRESH = 0.5
 IOP_THRESH = 0.5
@@ -110,6 +113,32 @@ def _classify(preds, tree_gts, canopy_gts,
 
 
 # ── Plotting ──────────────────────────────────────────────────────────────────
+
+def _load_pred_bboxes(pred_path):
+    """Read det_bbox property out of the geojson (foxtrot's raw DeepForest boxes,
+    before SAM polygonisation). Returns a list of shapely box Polygons aligned
+    with the polygon list from `_load_predictions` (same order, same length).
+    Predictions without a det_bbox property → None at that index."""
+    if not pred_path.exists():
+        return []
+    gdf = gpd.read_file(str(pred_path))
+    if gdf.empty or "det_bbox" not in gdf.columns:
+        return []
+    out = []
+    for raw in gdf["det_bbox"]:
+        if raw is None:
+            out.append(None); continue
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except Exception:
+                out.append(None); continue
+        if isinstance(raw, (list, tuple)) and len(raw) == 4:
+            out.append(shapely_box(*raw))
+        else:
+            out.append(None)
+    return out
+
 
 def _iter_polygons(geom):
     """Yield only Polygon parts of a geometry, recursing into MultiPolygon /
@@ -206,13 +235,37 @@ def visualise_tile(idx, model_dirs, model_names, holdout_dir, save_dir,
     # Model panels
     for ax, mdir, name in zip(axes[1:], model_dirs, model_names):
         pred_path = mdir / f"{stem}_canopyai.geojson"
+
+        # Distinguish "model predicted nothing" (file present, empty) from
+        # "inference hasn't run yet" (file missing). The viz would otherwise
+        # render identically for both cases.
+        if not pred_path.exists():
+            ax.imshow(img)
+            ax.text(0.5, 0.5, "NO PREDICTION FILE\n(inference not run yet)",
+                    transform=ax.transAxes, ha="center", va="center",
+                    fontsize=18, color="white", weight="bold",
+                    bbox=dict(facecolor="#e53935", alpha=0.85, edgecolor="white",
+                              boxstyle="round,pad=0.6"))
+            ax.set_title(f"{name}\n(missing: {pred_path.name})",
+                         fontsize=9, family="monospace", loc="left")
+            ax.set_xticks([]); ax.set_yticks([])
+            continue
+
         preds = _load_predictions(pred_path, H, W, score_thresh)
+        bboxes = _load_pred_bboxes(pred_path)
+        if len(bboxes) != len(preds):
+            # Score-thresh dropped some preds; can't align — disable bbox drawing.
+            bboxes = [None] * len(preds)
         classes, fn_idx = _classify(preds, tree_gts, canopy_gts)
 
         tp_polys     = [preds[i][0] for i, c in enumerate(classes) if c == "TP"]
         fp_polys     = [preds[i][0] for i, c in enumerate(classes) if c == "FP"]
         ignore_polys = [preds[i][0] for i, c in enumerate(classes) if c == "IGNORE"]
         fn_polys     = [tree_gts[j] for j in fn_idx]
+
+        tp_bboxes     = [bboxes[i] for i, c in enumerate(classes) if c == "TP" and bboxes[i] is not None]
+        fp_bboxes     = [bboxes[i] for i, c in enumerate(classes) if c == "FP" and bboxes[i] is not None]
+        ignore_bboxes = [bboxes[i] for i, c in enumerate(classes) if c == "IGNORE" and bboxes[i] is not None]
 
         # ── Instance metrics @ IoU=0.5 (iscrowd-ignored preds excluded from denom)
         n_tp, n_fp, n_fn = len(tp_polys), len(fp_polys), len(fn_polys)
@@ -239,10 +292,15 @@ def visualise_tile(idx, model_dirs, model_names, holdout_dir, save_dir,
         _draw_panel(
             ax, img,
             [
-                (fn_polys,     "#ff9500", "--", 1.0),   # missed trees from GT
-                (ignore_polys, "#9aa0a6", ":",  1.0),   # in-canopy → ignored
-                (fp_polys,     "#e53935", "-",  1.4),   # genuine false positives
-                (tp_polys,     "#22c55e", "-",  1.4),   # matched trees
+                # Raw DeepForest bboxes (under polygons): thin same-colour dashed lines
+                (ignore_bboxes, "#9aa0a6", "--", 0.6),
+                (fp_bboxes,     "#e53935", "--", 0.7),
+                (tp_bboxes,     "#22c55e", "--", 0.7),
+                # SAM-refined polygons on top: thicker solid lines
+                (fn_polys,      "#ff9500", "--", 1.0),   # missed trees from GT
+                (ignore_polys,  "#9aa0a6", ":",  1.0),   # in-canopy → ignored
+                (fp_polys,      "#e53935", "-",  1.4),   # genuine false positives
+                (tp_polys,      "#22c55e", "-",  1.4),   # matched trees
             ],
             title=title,
         )
@@ -250,8 +308,8 @@ def visualise_tile(idx, model_dirs, model_names, holdout_dir, save_dir,
     legend = [
         Line2D([0], [0], color="#ffd400", lw=1.5, label="GT tree (cat=2)"),
         Line2D([0], [0], color="#00d8ff", lw=1.5, ls="--", label="GT canopy (cat=1)"),
-        Line2D([0], [0], color="#22c55e", lw=1.5, label="TP  (pred IoU≥0.5 vs tree GT)"),
-        Line2D([0], [0], color="#e53935", lw=1.5, label="FP  (no match, not in canopy)"),
+        Line2D([0], [0], color="#22c55e", lw=1.5, label="TP polygon  (solid=SAM, dashed=raw bbox)"),
+        Line2D([0], [0], color="#e53935", lw=1.5, label="FP polygon  (solid=SAM, dashed=raw bbox)"),
         Line2D([0], [0], color="#9aa0a6", lw=1.5, ls=":", label="IGNORE  (pred IoP≥0.5 in canopy → ignored by mAP50)"),
         Line2D([0], [0], color="#ff9500", lw=1.5, ls="--", label="FN  (unmatched tree GT)"),
     ]

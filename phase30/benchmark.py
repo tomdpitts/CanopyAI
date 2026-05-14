@@ -69,6 +69,10 @@ def parse_args():
                    default="solar/shadow_regression/output/shadow_model_combined_best.pth")
     p.add_argument("--abs-luma-max", type=float, default=None,
                    help="Shadow map luma ceiling passed to foxtrot (None → foxtrot default).")
+    p.add_argument("--df-confidence", type=float, default=None,
+                   help="DeepForest detection confidence threshold passed to foxtrot "
+                        "(None → foxtrot default of 0.35). Lower it (e.g. 0.05) to "
+                        "diagnose models that under-predict.")
     p.add_argument("--tiles", nargs="+", default=None,
                    help="Restrict to these tile stems (e.g. tcd_val_tile_0 tcd_val_tile_1).")
     p.add_argument("--skip-inference", action="store_true",
@@ -99,7 +103,8 @@ def _progress_suffix(times, total):
     return f"  {elapsed:5.1f}s | avg {avg:5.1f}s | ETA {eta:%H:%M:%S}"
 
 
-def run_foxtrot(model_spec, mtype, image_path, out_dir, shadow_model, abs_luma_max=None):
+def run_foxtrot(model_spec, mtype, image_path, out_dir, shadow_model,
+                abs_luma_max=None, df_confidence=None):
     cmd = [sys.executable, str(REPO_ROOT / "foxtrot.py"),
            "--image_path", str(image_path),
            "--output_dir", str(out_dir),
@@ -109,6 +114,8 @@ def run_foxtrot(model_spec, mtype, image_path, out_dir, shadow_model, abs_luma_m
         cmd += ["--deepforest_model", model_spec]
     if abs_luma_max is not None:
         cmd += ["--abs_luma_max", str(abs_luma_max)]
+    if df_confidence is not None:
+        cmd += ["--deepforest_confidence", str(df_confidence)]
     r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if r.returncode != 0:
         print(f"      ⚠  foxtrot failed: {r.stderr[-300:]}")
@@ -140,7 +147,8 @@ def run_detectree2_one(image_path, out_dir):
 
 
 def run_inference(model_spec, mtype, holdout_dir, out_dir, shadow_model,
-                  abs_luma_max=None, skip_existing=False, tile_filter=None):
+                  abs_luma_max=None, df_confidence=None,
+                  skip_existing=False, tile_filter=None):
     tifs = sorted(Path(holdout_dir).glob("*.tif"))
     if tile_filter is not None:
         tifs = [t for t in tifs if t.stem in tile_filter]
@@ -162,7 +170,8 @@ def run_inference(model_spec, mtype, holdout_dir, out_dir, shadow_model,
             success = run_detectree2_one(tif, out_dir)
         else:
             success = run_foxtrot(model_spec, mtype, tif, out_dir,
-                                  shadow_model, abs_luma_max)
+                                  shadow_model, abs_luma_max=abs_luma_max,
+                                  df_confidence=df_confidence)
         times.append(time.monotonic() - t0)
         print(("✓" if success else "✗") + _progress_suffix(times, len(pending)))
         ok += success
@@ -429,23 +438,34 @@ def _coco_map50(images, gt_anns, dets):
 
 def evaluate_model(name, out_dir, holdout_dir, score_thresh, tile_filter=None):
     holdout_dir = Path(holdout_dir)
+    out_dir = Path(out_dir)
     metas = sorted(holdout_dir.glob("*_meta.json"))
     if tile_filter is not None:
         metas = [m for m in metas
                  if m.name.replace("_meta.json", "") in tile_filter]
 
+    # Auto-scope to tiles that have a prediction file. Missing geojsons would
+    # otherwise contribute pure FN and tank the metric — useless during a
+    # partial run. On a completed run every tile has a geojson so this is a no-op.
+    n_holdout = len(metas)
+    metas = [m for m in metas
+             if (out_dir / f"{m.name.replace('_meta.json', '')}_canopyai.geojson").exists()]
+    if not metas:
+        print(f"    ⚠  no predictions found in {out_dir}")
+        return None
+    if len(metas) < n_holdout:
+        print(f"    Evaluating {len(metas)}/{n_holdout} tiles "
+              f"({n_holdout - len(metas)} missing geojsons skipped)")
+
     worker_args = []
     images = []
     for i, mp in enumerate(metas):
         stem = mp.name.replace("_meta.json", "")
-        pred_path = Path(out_dir) / f"{stem}_canopyai.geojson"
+        pred_path = out_dir / f"{stem}_canopyai.geojson"
         worker_args.append((i, stem, str(mp), pred_path, score_thresh))
         # populated with H,W after worker runs; pre-fill with placeholder dims
         images.append({"id": i, "file_name": f"{stem}.tif",
                        "width": 0, "height": 0})
-
-    if not worker_args:
-        return None
 
     # Run rasterisation + counts in parallel
     print(f"    Rasterising + counting on {len(worker_args)} tiles...")
@@ -468,10 +488,18 @@ def evaluate_model(name, out_dir, holdout_dir, score_thresh, tile_filter=None):
     fn = sum(r["fn"] for r in results)
     tn = sum(r["tn"] for r in results)
 
-    denom_iou = tp + fp + fn
-    bin_iou = tp / denom_iou if denom_iou else 0.0
-    bin_f1  = (2 * tp) / (2 * tp + fp + fn) if (2 * tp + fp + fn) else 0.0
-    bin_acc = (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) else 0.0
+    # Match Restor TCD paper Table 1 conventions exactly. They cast binary canopy
+    # segmentation as 2-class multiclass and use torchmetrics with:
+    #   F1Score (task=multiclass, average="none")  → reports F1_tree (positive-class Dice)
+    #   JaccardIndex (task=multiclass)             → reports macro IoU = (IoU_bg + IoU_tree)/2
+    #   Accuracy (task=multiclass, average="none") → reports Acc_tree = TP/(TP+FN) = tree recall
+    # See src/tcd_pipeline/models/segmentationmodule.py in github.com/Restor-Foundation/tcd.
+    iou_tree = tp / (tp + fp + fn) if (tp + fp + fn) else 0.0
+    iou_bg   = tn / (tn + fp + fn) if (tn + fp + fn) else 0.0
+    macro_iou   = 0.5 * (iou_tree + iou_bg)
+    f1_tree     = (2 * tp) / (2 * tp + fp + fn) if (2 * tp + fp + fn) else 0.0
+    tree_recall = tp / (tp + fn) if (tp + fn) else 0.0
+    pixel_acc   = (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) else 0.0
 
     # COCO mAP50 (cat=2 trees only)
     gt_anns = [a for r in results for a in r["gt_anns"]]
@@ -486,7 +514,14 @@ def evaluate_model(name, out_dir, holdout_dir, score_thresh, tile_filter=None):
         "n_gt_tree": n_gt_tree,
         "n_pred": n_pred_total,
         "tp": tp, "fp": fp, "fn": fn, "tn": tn,
-        "bin_iou": bin_iou, "bin_f1": bin_f1, "bin_acc": bin_acc,
+        # Restor-paper-comparable columns:
+        "macro_iou":   macro_iou,
+        "f1_tree":     f1_tree,
+        "tree_recall": tree_recall,
+        # Extras (not in Restor table) for transparency:
+        "iou_tree":    iou_tree,
+        "iou_bg":      iou_bg,
+        "pixel_acc":   pixel_acc,
         "map50": map50, "ar1000": ar,
         "per_tile": [
             {"stem": r["stem"],
@@ -508,24 +543,29 @@ def _fmt(v, w=6, prec=3):
 
 def print_table(all_results, holdout_dir):
     n_tiles_total = len(sorted(Path(holdout_dir).glob("*_meta.json")))
-    bar = "═" * 79
+    bar = "═" * 90
     print()
     print(bar)
-    print(f"  BENCHMARK — OAM-TCD holdout ({n_tiles_total} tiles)")
-    print(f"  Binary semantic-seg (micro pixel)  +  Instance mAP50 (pycocotools segm)")
+    print(f"  BENCHMARK — OAM-TCD holdout ({n_tiles_total} tiles)   columns match Restor TCD paper Table 1")
+    print(f"  IoU  = macro JaccardIndex (avg of bg + tree)")
+    print(f"  F1   = per-class F1_tree (positive-class Dice)")
+    print(f"  Acc  = per-class Accuracy_tree (= tree recall, TP/(TP+FN))")
+    print(f"  mAP50, AR@1000 = pycocotools segm task, cat=tree, canopy as iscrowd")
     print(bar)
-    hdr = f"  {'Model':<18}  {'N':>4}  {'binIoU':>6}  {'binF1':>6}  {'binAcc':>6}  {'mAP50':>6}  {'AR@1000':>7}"
-    sep = "  " + "-"*18 + "  " + "-"*4 + "  " + "  ".join(["-"*6]*4) + "  " + "-"*7
+    hdr = (f"  {'Model':<18}  {'N':>4}  {'IoU':>6}  {'F1':>6}  {'Acc':>6}  "
+           f"{'mAP50':>6}  {'AR@1000':>7}  | {'IoU_tree':>8}")
+    sep = "  " + "-"*18 + "  " + "-"*4 + "  " + "  ".join(["-"*6]*4) + "  " + "-"*7 + "  | " + "-"*8
     print(hdr); print(sep)
     for name, r in all_results.items():
         if r is None:
-            print(f"  {name:<18}  {'—':>4}  {'—':>6}  {'—':>6}  {'—':>6}  {'—':>6}  {'—':>7}")
+            print(f"  {name:<18}  {'—':>4}  {'—':>6}  {'—':>6}  {'—':>6}  "
+                  f"{'—':>6}  {'—':>7}  | {'—':>8}")
             continue
         print(f"  {name:<18}  {r['n_tiles']:>4}  "
-              f"{_fmt(r['bin_iou'])}  {_fmt(r['bin_f1'])}  {_fmt(r['bin_acc'])}  "
-              f"{_fmt(r['map50'])}  {_fmt(r['ar1000'], 7)}")
+              f"{_fmt(r['macro_iou'])}  {_fmt(r['f1_tree'])}  {_fmt(r['tree_recall'])}  "
+              f"{_fmt(r['map50'])}  {_fmt(r['ar1000'], 7)}  | {_fmt(r['iou_tree'], 8)}")
     print(bar)
-    print("  Restor reference (holdout):  SegFormer mit-b5 IoU=0.876   Mask-RCNN R50 mAP50=0.432")
+    print("  Restor reference (holdout, mit-b5):  IoU=0.876  F1=0.902  Acc=0.890   Mask-RCNN R50 mAP50=0.432")
     print(bar + "\n")
 
 
@@ -567,6 +607,7 @@ def main():
         print(f"\n{'─'*60}\n  Inference: {name}  [{mtype}]\n{'─'*60}")
         run_inference(spec, mtype, holdout_dir, out_dir, args.shadow_model,
                       abs_luma_max=args.abs_luma_max,
+                      df_confidence=args.df_confidence,
                       skip_existing=args.skip_existing,
                       tile_filter=tile_filter)
 
@@ -582,8 +623,8 @@ def main():
             save_tile_csv(name, res["per_tile"],
                           output_root / f"{name}_holdout_tiles.csv")
             map_str = "—" if res["map50"] is None else f"{res['map50']:.3f}"
-            print(f"    binIoU={res['bin_iou']:.3f}  binF1={res['bin_f1']:.3f}  "
-                  f"binAcc={res['bin_acc']:.3f}  mAP50={map_str}")
+            print(f"    IoU(macro)={res['macro_iou']:.3f}  F1(tree)={res['f1_tree']:.3f}  "
+                  f"Acc(tree-recall)={res['tree_recall']:.3f}  mAP50={map_str}")
 
     # Step 3: output
     print_table(all_results, holdout_dir)
@@ -596,7 +637,12 @@ def main():
                 "n_gt_tree": r["n_gt_tree"],
                 "n_pred":   r["n_pred"],
                 "tp": r["tp"], "fp": r["fp"], "fn": r["fn"], "tn": r["tn"],
-                "bin_iou": r["bin_iou"], "bin_f1": r["bin_f1"], "bin_acc": r["bin_acc"],
+                "macro_iou":   r["macro_iou"],
+                "f1_tree":     r["f1_tree"],
+                "tree_recall": r["tree_recall"],
+                "iou_tree":    r["iou_tree"],
+                "iou_bg":      r["iou_bg"],
+                "pixel_acc":   r["pixel_acc"],
                 "map50":   r["map50"],   "ar1000": r["ar1000"],
             })
             for name, r in all_results.items()
