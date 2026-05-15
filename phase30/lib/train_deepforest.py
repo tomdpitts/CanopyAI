@@ -787,6 +787,16 @@ def train_deepforest(
 
     trainer = pl.Trainer(**trainer_kwargs)
 
+    # Install loss patches BEFORE torch.compile so Dynamo traces the patched
+    # head.compute_loss (otherwise it caches the original method body and the
+    # canopy / shadow supervision is silently inactive in the compiled graph).
+    # The patch methods are idempotent — on_train_start re-calls them as a no-op.
+    if canopy_enabled:
+        model._patch_transform_capture()
+        model._patch_retinanet_head_loss()
+    elif shadow_loss_reweight:
+        model._patch_retinanet_cls_loss()
+
     if trainer_kwargs.get("accelerator") == "gpu" and torch.cuda.is_available():
         try:
             model.model = torch.compile(model.model)

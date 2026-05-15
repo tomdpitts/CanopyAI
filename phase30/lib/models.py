@@ -34,6 +34,16 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
     """
 
     CANOPY_IOP_THRESH = 0.7
+    # Size-aware suppression over canopy positives: process anchors largest
+    # first; suppress every smaller anchor whose own-area share inside the
+    # kept anchor exceeds this threshold (Intersection-over-Smaller).  Plain
+    # IoU NMS does NOT enforce this — a 32px anchor fully inside a 128px
+    # anchor has IoU≈0.06, so all the small redundants survive.  Suppressed
+    # anchors become IGNORED in the cls loss (not negative), so the model is
+    # not trained to predict background under canopy.  GT-matched anchors
+    # are excluded from the pool — labelled ITCs always keep their fg
+    # supervision.
+    CANOPY_NMS_IOU = 0.2
 
     def __init__(
         self,
@@ -98,6 +108,7 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
         self._cls_loss_patched          = False
         self._head_loss_patched         = False
         self._transform_capture_patched = False
+        self._head_loss_invoked         = False  # set True on first patched-head call
         self._current_shadow_gt_weights = None
         self._current_canopy_polygons   = None   # list[list[np.ndarray(V,2)]] per batch
         self._current_image_sizes_pre   = None   # list[(H,W)] pre-transform sizes
@@ -242,6 +253,86 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
         integral[1:, 1:] = mask.cumsum(0).cumsum(1).astype(np.float32)
         return integral
 
+    def _build_canopy_integrals_per_poly(self, polygons, post_h, post_w,
+                                         scale_w, scale_h):
+        """Per-polygon integral images.  Returns a list of (H+1, W+1) float32
+        numpy arrays — one per polygon that rasterises non-empty — or None.
+
+        Used by the head-loss patch so the canopy IoP test is run against a
+        SINGLE continuous polygon at a time rather than the union of all
+        polygons.  An anchor straddling the boundary of two adjacent polygons
+        no longer qualifies just because its union-IoP is high.
+        """
+        if not polygons:
+            return None
+        from PIL import Image, ImageDraw
+        out = []
+        for verts in polygons:
+            if len(verts) < 3:
+                continue
+            try:
+                img = Image.new("L", (post_w, post_h), 0)
+                drw = ImageDraw.Draw(img)
+                pts = [(float(v[0]) * scale_w, float(v[1]) * scale_h) for v in verts]
+                drw.polygon(pts, fill=1)
+                mask = np.asarray(img, dtype=np.int64)
+            except Exception:
+                continue
+            if mask.sum() == 0:
+                continue
+            integral = np.zeros((post_h + 1, post_w + 1), dtype=np.float32)
+            integral[1:, 1:] = mask.cumsum(0).cumsum(1).astype(np.float32)
+            out.append(integral)
+        return out if out else None
+
+    @staticmethod
+    def _ios_greedy_suppress(boxes, ios_thresh):
+        """Greedy 'NMS' using Intersection-over-Smaller (IoS) as the overlap
+        metric instead of IoU.  Boxes are processed largest area first; every
+        smaller box whose own-area share inside the kept box exceeds
+        ``ios_thresh`` is suppressed.  Survivor invariant: for any pair the
+        smaller box has at most ``ios_thresh`` of its area inside the larger.
+
+        ``boxes`` is (N,4) on device.  Returns a long tensor of indices into
+        ``boxes`` to keep.
+        """
+        N = boxes.shape[0]
+        if N == 0:
+            return boxes.new_zeros(0, dtype=torch.long)
+
+        areas = (
+            (boxes[:, 2] - boxes[:, 0]).clamp(min=1.0)
+            * (boxes[:, 3] - boxes[:, 1]).clamp(min=1.0)
+        )
+        order = areas.argsort(descending=True)
+        sorted_boxes = boxes[order]
+        sorted_areas = areas[order]
+
+        # alive[k]=True means index k (in sorted order) is still a candidate.
+        alive = torch.ones(N, dtype=torch.bool, device=boxes.device)
+        keep_sorted: list[int] = []
+        # The number of survivors is small relative to the pool, so a Python
+        # loop over kept-only is cheap; each iteration is fully vectorised.
+        for k in range(N):
+            if not alive[k]:
+                continue
+            keep_sorted.append(k)
+            tail = slice(k + 1, N)
+            box = sorted_boxes[k]
+            x1 = torch.maximum(sorted_boxes[tail, 0], box[0])
+            y1 = torch.maximum(sorted_boxes[tail, 1], box[1])
+            x2 = torch.minimum(sorted_boxes[tail, 2], box[2])
+            y2 = torch.minimum(sorted_boxes[tail, 3], box[3])
+            inter = (x2 - x1).clamp(min=0) * (y2 - y1).clamp(min=0)
+            # IoSmaller — denominator is the smaller box's own area (always
+            # the tail box here, since tail is strictly smaller-or-equal).
+            ios = inter / sorted_areas[tail]
+            alive[tail] &= ~(ios > ios_thresh)
+
+        keep_sorted_t = torch.tensor(keep_sorted, dtype=torch.long,
+                                     device=boxes.device)
+        return order[keep_sorted_t]
+
     @staticmethod
     def _anchor_iop_from_integral(anchors, integral_t, post_h, post_w):
         """Vectorised intersection-over-anchor-area via the integral image
@@ -383,6 +474,7 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
         reg_head  = head.regression_head
         model_ref = self
         iop_thr   = self.CANOPY_IOP_THRESH
+        printed_once = [False]   # closure-captured one-shot diagnostic flag
 
         def patched_head_compute_loss(targets, head_outputs, anchors, matched_idxs):
             from torchvision.ops import sigmoid_focal_loss
@@ -391,6 +483,12 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
             bbox_reg_all   = head_outputs["bbox_regression"]
             cls_losses     = []
             reg_losses     = []
+
+            # One-shot diagnostic accumulators
+            diag_n_anchors      = 0
+            diag_n_canopy_raw   = 0   # anchors passing IoP>=iop_thr (pre-NMS)
+            diag_n_canopy_pos   = 0   # NMS survivors that actually train as positive
+            diag_n_foreground   = 0
 
             shadow_gt_weights  = model_ref._current_shadow_gt_weights
             canopy_polys_batch = model_ref._current_canopy_polygons
@@ -411,7 +509,9 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
                 valid_idxs      = matched_idxs_per_image != cls_head.BETWEEN_THRESHOLDS
 
                 # ----- Per-anchor canopy IoP & positive mask -----
-                canopy_positive_mask = torch.zeros(N_anchors, dtype=torch.bool, device=device)
+                canopy_positive_mask   = torch.zeros(N_anchors, dtype=torch.bool, device=device)
+                canopy_raw_mask        = torch.zeros(N_anchors, dtype=torch.bool, device=device)
+                canopy_suppressed_mask = torch.zeros(N_anchors, dtype=torch.bool, device=device)
 
                 if (canopy_on and canopy_polys_batch is not None
                         and img_idx < len(canopy_polys_batch)
@@ -421,15 +521,50 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
                     post_h, post_w = sizes_post[img_idx]
                     scale_w = post_w / max(1, pre_w)
                     scale_h = post_h / max(1, pre_h)
-                    integral = model_ref._build_canopy_integral(
+                    integrals = model_ref._build_canopy_integrals_per_poly(
                         canopy_polys_batch[img_idx], post_h, post_w, scale_w, scale_h
                     )
-                    if integral is not None:
-                        integral_t = torch.from_numpy(integral).to(device)
-                        iop = model_ref._anchor_iop_from_integral(
-                            anchors_per_image, integral_t, post_h, post_w
+                    if integrals is not None:
+                        # Per-polygon IoP: anchor qualifies iff its own-area
+                        # share inside ANY SINGLE polygon exceeds iop_thr.
+                        # Computed as max IoP across polygons — straddling two
+                        # adjacent polygons no longer qualifies.
+                        max_iop = torch.zeros(
+                            N_anchors, dtype=torch.float32, device=device
                         )
-                        canopy_positive_mask = iop >= iop_thr
+                        for integral in integrals:
+                            integral_t = torch.from_numpy(integral).to(device)
+                            iop_p = model_ref._anchor_iop_from_integral(
+                                anchors_per_image, integral_t, post_h, post_w
+                            )
+                            max_iop = torch.maximum(max_iop, iop_p)
+                        canopy_raw_mask = max_iop >= iop_thr
+
+                        # Size-aware suppression over canopy-only anchors
+                        # (GT-matched anchors excluded so labelled ITCs always
+                        # keep their fg supervision).  IoSmaller is used as
+                        # the overlap metric — plain IoU NMS fails here
+                        # because a small anchor fully inside a large anchor
+                        # has IoU = small_area / large_area, often well below
+                        # the threshold, so the small redundants survive.
+                        nms_pool = canopy_raw_mask & ~foreground_idxs
+                        if nms_pool.any():
+                            pool_idx   = nms_pool.nonzero(as_tuple=True)[0]
+                            pool_boxes = anchors_per_image[pool_idx]
+                            keep_in_pool = model_ref._ios_greedy_suppress(
+                                pool_boxes, model_ref.CANOPY_NMS_IOU
+                            )
+                            survivors = torch.zeros_like(canopy_raw_mask)
+                            survivors[pool_idx[keep_in_pool]] = True
+                            canopy_positive_mask   = survivors
+                            canopy_suppressed_mask = (
+                                canopy_raw_mask & ~foreground_idxs & ~survivors
+                            )
+
+                diag_n_anchors    += N_anchors
+                diag_n_canopy_raw += int(canopy_raw_mask.sum().item())
+                diag_n_canopy_pos += int(canopy_positive_mask.sum().item())
+                diag_n_foreground += num_foreground
 
                 # ===== Classification loss =====
                 # canopy_loss_scale == 0 short-circuits to iscrowd semantics:
@@ -437,10 +572,15 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
                 canopy_acts_as_ignore = (
                     model_ref.canopy_loss_scale == 0.0 and canopy_positive_mask.any()
                 )
+                # NMS-suppressed canopy anchors are ALWAYS ignored from the
+                # cls loss regardless of canopy_loss_scale — that is the whole
+                # point of running NMS over the canopy pool.
                 if canopy_acts_as_ignore:
-                    effective_valid = valid_idxs & ~canopy_positive_mask
+                    effective_valid = (
+                        valid_idxs & ~canopy_positive_mask & ~canopy_suppressed_mask
+                    )
                 else:
-                    effective_valid = valid_idxs
+                    effective_valid = valid_idxs & ~canopy_suppressed_mask
 
                 gt_classes_target = torch.zeros_like(cls_logits_per_image)
                 gt_classes_target[
@@ -520,6 +660,16 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
                 ) / max(1, num_foreground)
                 reg_losses.append(reg_loss_img)
 
+            if not printed_once[0]:
+                printed_once[0] = True
+                model_ref._head_loss_invoked = True
+                print(f"   🔬 head loss patch INVOKED  batch={len(targets)}  "
+                      f"canopy_on={canopy_on}  scale={model_ref.canopy_loss_scale}")
+                print(f"      anchors={diag_n_anchors}  "
+                      f"iop>={iop_thr}={diag_n_canopy_raw}  "
+                      f"after_nms({model_ref.CANOPY_NMS_IOU})={diag_n_canopy_pos}  "
+                      f"foreground_gt={diag_n_foreground}")
+
             N_batch = max(1, len(targets))
             return {
                 "classification":  sum(cls_losses) / N_batch,
@@ -546,6 +696,16 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
             self._patch_retinanet_cls_loss()
         if hasattr(super(), "on_train_start"):
             super().on_train_start()
+
+    def on_train_epoch_end(self):
+        if self.canopy_enabled and not self._head_loss_invoked:
+            print("\n❌ WARNING: head loss patch was NEVER invoked — "
+                  "canopy supervision is INACTIVE.")
+            print("   Likely cause: torch.compile interference. Try removing the "
+                  "torch.compile call in train_deepforest.py:792, or apply the "
+                  "head patch BEFORE compile.")
+        if hasattr(super(), "on_train_epoch_end"):
+            super().on_train_epoch_end()
 
     def training_step(self, batch, batch_idx):
         images      = batch[0]
