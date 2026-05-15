@@ -23,26 +23,24 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
         downstream of the crown.
 
     Canopy positive policy (active when ``canopy_polygons_path`` is supplied):
-        Anchors whose intersection-over-anchor-area against the canopy
-        polygons exceeds ``CANOPY_IOP_THRESH`` (0.7) are treated as normal
-        positive examples for the classification focal loss (cls target=1,
-        no per-anchor reweight), and their regression contribution is
-        suppressed — there is no precise crown box to regress to.  The
-        summed canopy contribution can optionally be dampened by
-        ``canopy_loss_scale`` (≤1.0) to stop large canopy polygons from
-        outvoting ITC anchors.
+        An anchor is canopy-positive iff its own-area share inside one single
+        canopy polygon clears ``CANOPY_IOP_THRESH`` (0.7).  Size-aware
+        IoSmaller suppression at ``CANOPY_NMS_IOU`` (0.2) then keeps the
+        largest anchor in each overlap cluster and ignores the rest.  GT-
+        matched anchors are exempt from the suppression pool.  Survivors are
+        treated as positive examples for the classification focal loss
+        (cls target=1) with regression suppressed — there is no precise
+        crown box to regress to.  The summed canopy contribution can be
+        dampened by ``canopy_loss_scale`` (≤1.0).
     """
 
     CANOPY_IOP_THRESH = 0.7
-    # Size-aware suppression over canopy positives: process anchors largest
-    # first; suppress every smaller anchor whose own-area share inside the
-    # kept anchor exceeds this threshold (Intersection-over-Smaller).  Plain
-    # IoU NMS does NOT enforce this — a 32px anchor fully inside a 128px
-    # anchor has IoU≈0.06, so all the small redundants survive.  Suppressed
-    # anchors become IGNORED in the cls loss (not negative), so the model is
-    # not trained to predict background under canopy.  GT-matched anchors
-    # are excluded from the pool — labelled ITCs always keep their fg
-    # supervision.
+    # Intersection-over-Smaller threshold for size-aware suppression among
+    # canopy positives: among any cluster of overlapping canopy anchors, the
+    # largest is kept and a smaller one is suppressed if its own-area share
+    # inside the larger exceeds this value.  Suppressed anchors are ignored
+    # by the cls loss (not labelled background), and GT-matched anchors are
+    # excluded from the suppression pool.
     CANOPY_NMS_IOU = 0.2
 
     def __init__(
@@ -255,13 +253,11 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
 
     def _build_canopy_integrals_per_poly(self, polygons, post_h, post_w,
                                          scale_w, scale_h):
-        """Per-polygon integral images.  Returns a list of (H+1, W+1) float32
-        numpy arrays — one per polygon that rasterises non-empty — or None.
-
-        Used by the head-loss patch so the canopy IoP test is run against a
-        SINGLE continuous polygon at a time rather than the union of all
-        polygons.  An anchor straddling the boundary of two adjacent polygons
-        no longer qualifies just because its union-IoP is high.
+        """Return one (H+1, W+1) float32 integral image per polygon (or None
+        if no polygon rasterises non-empty).  The head-loss patch then takes
+        the max IoP across these per-polygon masks, so an anchor qualifies
+        as canopy-positive only if it sits >=IoP_thresh inside one single
+        continuous polygon, not the union of several adjacent ones.
         """
         if not polygons:
             return None
@@ -287,14 +283,14 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
 
     @staticmethod
     def _ios_greedy_suppress(boxes, ios_thresh):
-        """Greedy 'NMS' using Intersection-over-Smaller (IoS) as the overlap
-        metric instead of IoU.  Boxes are processed largest area first; every
-        smaller box whose own-area share inside the kept box exceeds
-        ``ios_thresh`` is suppressed.  Survivor invariant: for any pair the
-        smaller box has at most ``ios_thresh`` of its area inside the larger.
+        """Greedy size-aware suppression on ``boxes`` (N,4) using
+        Intersection-over-Smaller as the overlap metric.  Anchors are
+        processed largest area first; a smaller box is suppressed if its
+        own-area share inside any kept box exceeds ``ios_thresh``.
 
-        ``boxes`` is (N,4) on device.  Returns a long tensor of indices into
-        ``boxes`` to keep.
+        Survivor invariant: for any surviving pair, the smaller box has at
+        most ``ios_thresh`` of its area inside the larger.  Returns a long
+        tensor of indices into ``boxes`` to keep.
         """
         N = boxes.shape[0]
         if N == 0:
@@ -525,10 +521,9 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
                         canopy_polys_batch[img_idx], post_h, post_w, scale_w, scale_h
                     )
                     if integrals is not None:
-                        # Per-polygon IoP: anchor qualifies iff its own-area
-                        # share inside ANY SINGLE polygon exceeds iop_thr.
-                        # Computed as max IoP across polygons — straddling two
-                        # adjacent polygons no longer qualifies.
+                        # Anchor qualifies as canopy-positive iff its own-area
+                        # share inside a single polygon clears iop_thr — taken
+                        # as the max IoP across per-polygon masks.
                         max_iop = torch.zeros(
                             N_anchors, dtype=torch.float32, device=device
                         )
@@ -540,13 +535,10 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
                             max_iop = torch.maximum(max_iop, iop_p)
                         canopy_raw_mask = max_iop >= iop_thr
 
-                        # Size-aware suppression over canopy-only anchors
-                        # (GT-matched anchors excluded so labelled ITCs always
-                        # keep their fg supervision).  IoSmaller is used as
-                        # the overlap metric — plain IoU NMS fails here
-                        # because a small anchor fully inside a large anchor
-                        # has IoU = small_area / large_area, often well below
-                        # the threshold, so the small redundants survive.
+                        # Size-aware IoSmaller suppression: keep the largest
+                        # anchor in each overlap cluster, suppress smaller
+                        # redundants.  GT-matched anchors stay out of the pool
+                        # so labelled ITCs keep their fg supervision.
                         nms_pool = canopy_raw_mask & ~foreground_idxs
                         if nms_pool.any():
                             pool_idx   = nms_pool.nonzero(as_tuple=True)[0]
@@ -572,9 +564,8 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
                 canopy_acts_as_ignore = (
                     model_ref.canopy_loss_scale == 0.0 and canopy_positive_mask.any()
                 )
-                # NMS-suppressed canopy anchors are ALWAYS ignored from the
-                # cls loss regardless of canopy_loss_scale — that is the whole
-                # point of running NMS over the canopy pool.
+                # NMS-suppressed canopy anchors are excluded from the cls
+                # loss (never count as positives nor negatives).
                 if canopy_acts_as_ignore:
                     effective_valid = (
                         valid_idxs & ~canopy_positive_mask & ~canopy_suppressed_mask
@@ -700,10 +691,8 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
     def on_train_epoch_end(self):
         if self.canopy_enabled and not self._head_loss_invoked:
             print("\n❌ WARNING: head loss patch was NEVER invoked — "
-                  "canopy supervision is INACTIVE.")
-            print("   Likely cause: torch.compile interference. Try removing the "
-                  "torch.compile call in train_deepforest.py:792, or apply the "
-                  "head patch BEFORE compile.")
+                  "canopy supervision is INACTIVE. Confirm that "
+                  "RetinaNet head.compute_loss is reached during training.")
         if hasattr(super(), "on_train_epoch_end"):
             super().on_train_epoch_end()
 
