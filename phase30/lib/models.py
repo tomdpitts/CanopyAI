@@ -29,8 +29,11 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
         largest anchor in each overlap cluster and ignores the rest.  GT-
         matched anchors are exempt from the suppression pool.  Survivors are
         treated as positive examples for the classification focal loss
-        (cls target=1) with regression suppressed — there is no precise
-        crown box to regress to.  The summed canopy contribution can be
+        (cls target=1) and their regression target is the survivor anchor
+        itself (zero offset) — at inference this emits the survivor's own
+        geometry, so dense canopy is covered by the large boxes the NMS pass
+        chose rather than ITC-shaped boxes from an unsupervised reg head.
+        The summed canopy contribution to both cls and reg losses can be
         dampened by ``canopy_loss_scale`` (≤1.0).
     """
 
@@ -251,18 +254,21 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
         integral[1:, 1:] = mask.cumsum(0).cumsum(1).astype(np.float32)
         return integral
 
-    def _build_canopy_integrals_per_poly(self, polygons, post_h, post_w,
-                                         scale_w, scale_h):
-        """Return one (H+1, W+1) float32 integral image per polygon (or None
-        if no polygon rasterises non-empty).  The head-loss patch then takes
-        the max IoP across these per-polygon masks, so an anchor qualifies
-        as canopy-positive only if it sits >=IoP_thresh inside one single
-        continuous polygon, not the union of several adjacent ones.
+    def _build_canopy_integral_stack(self, polygons, post_h, post_w,
+                                     scale_w, scale_h):
+        """Return a single (P, H+1, W+1) float32 numpy stack of integral
+        images, one per polygon that rasterises non-empty, or None.
+
+        The head-loss patch takes the max IoP across the P slices, so an
+        anchor is canopy-positive iff its own-area share inside a single
+        continuous polygon clears ``CANOPY_IOP_THRESH``.  Stacking lets the
+        per-polygon integrals reach the GPU in one transfer and lets the IoP
+        computation run as a single batched kernel.
         """
         if not polygons:
             return None
         from PIL import Image, ImageDraw
-        out = []
+        slices = []
         for verts in polygons:
             if len(verts) < 3:
                 continue
@@ -278,8 +284,10 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
                 continue
             integral = np.zeros((post_h + 1, post_w + 1), dtype=np.float32)
             integral[1:, 1:] = mask.cumsum(0).cumsum(1).astype(np.float32)
-            out.append(integral)
-        return out if out else None
+            slices.append(integral)
+        if not slices:
+            return None
+        return np.stack(slices, axis=0)
 
     @staticmethod
     def _ios_greedy_suppress(boxes, ios_thresh):
@@ -290,44 +298,49 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
 
         Survivor invariant: for any surviving pair, the smaller box has at
         most ``ios_thresh`` of its area inside the larger.  Returns a long
-        tensor of indices into ``boxes`` to keep.
+        tensor of indices into ``boxes`` (matching its device) to keep.
+
+        The greedy pass runs on CPU/numpy.  The loop reads a scalar bool per
+        iteration; on GPU that would force a stream sync each step, which
+        dominates wall-clock for typical canopy pool sizes (tens of
+        thousands of anchors per image).
         """
         N = boxes.shape[0]
         if N == 0:
             return boxes.new_zeros(0, dtype=torch.long)
 
-        areas = (
-            (boxes[:, 2] - boxes[:, 0]).clamp(min=1.0)
-            * (boxes[:, 3] - boxes[:, 1]).clamp(min=1.0)
+        device = boxes.device
+        boxes_np = boxes.detach().cpu().numpy()
+        areas_np = (
+            np.clip(boxes_np[:, 2] - boxes_np[:, 0], 1.0, None)
+            * np.clip(boxes_np[:, 3] - boxes_np[:, 1], 1.0, None)
         )
-        order = areas.argsort(descending=True)
-        sorted_boxes = boxes[order]
-        sorted_areas = areas[order]
+        order = np.argsort(-areas_np)
+        sorted_boxes = boxes_np[order]
+        sorted_areas = areas_np[order]
 
-        # alive[k]=True means index k (in sorted order) is still a candidate.
-        alive = torch.ones(N, dtype=torch.bool, device=boxes.device)
+        alive = np.ones(N, dtype=bool)
         keep_sorted: list[int] = []
-        # The number of survivors is small relative to the pool, so a Python
-        # loop over kept-only is cheap; each iteration is fully vectorised.
         for k in range(N):
             if not alive[k]:
                 continue
             keep_sorted.append(k)
-            tail = slice(k + 1, N)
-            box = sorted_boxes[k]
-            x1 = torch.maximum(sorted_boxes[tail, 0], box[0])
-            y1 = torch.maximum(sorted_boxes[tail, 1], box[1])
-            x2 = torch.minimum(sorted_boxes[tail, 2], box[2])
-            y2 = torch.minimum(sorted_boxes[tail, 3], box[3])
-            inter = (x2 - x1).clamp(min=0) * (y2 - y1).clamp(min=0)
-            # IoSmaller — denominator is the smaller box's own area (always
-            # the tail box here, since tail is strictly smaller-or-equal).
-            ios = inter / sorted_areas[tail]
-            alive[tail] &= ~(ios > ios_thresh)
+            if k + 1 >= N:
+                break
+            tail_b = sorted_boxes[k + 1:]
+            box_k  = sorted_boxes[k]
+            x1 = np.maximum(tail_b[:, 0], box_k[0])
+            y1 = np.maximum(tail_b[:, 1], box_k[1])
+            x2 = np.minimum(tail_b[:, 2], box_k[2])
+            y2 = np.minimum(tail_b[:, 3], box_k[3])
+            inter = np.clip(x2 - x1, 0, None) * np.clip(y2 - y1, 0, None)
+            # IoSmaller — the tail box is the smaller (or equal) one because
+            # the pool is sorted by area descending.
+            ios = inter / sorted_areas[k + 1:]
+            alive[k + 1:] &= ~(ios > ios_thresh)
 
-        keep_sorted_t = torch.tensor(keep_sorted, dtype=torch.long,
-                                     device=boxes.device)
-        return order[keep_sorted_t]
+        keep_idx = order[np.asarray(keep_sorted, dtype=np.int64)]
+        return torch.from_numpy(keep_idx).to(device=device, dtype=torch.long)
 
     @staticmethod
     def _anchor_iop_from_integral(anchors, integral_t, post_h, post_w):
@@ -348,6 +361,28 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
         anchor_h = (anchors[:, 3] - anchors[:, 1]).clamp(min=1.0)
         anchor_area = anchor_w * anchor_h
         return (canopy_area / anchor_area).clamp(0.0, 1.0)
+
+    @staticmethod
+    def _anchor_max_iop_from_stack(anchors, integral_stack_t, post_h, post_w):
+        """Batched form of ``_anchor_iop_from_integral`` over a stack of P
+        polygon integrals.  ``integral_stack_t`` is (P, H+1, W+1) on device.
+        Returns (N,) — the max IoP across polygons for each anchor.
+        """
+        x1 = anchors[:, 0].clamp(0, post_w).long()
+        y1 = anchors[:, 1].clamp(0, post_h).long()
+        x2 = anchors[:, 2].clamp(0, post_w).long()
+        y2 = anchors[:, 3].clamp(0, post_h).long()
+        # Fancy indexing with (y, x) returns (P, N) since integral_stack_t is (P, H, W).
+        A = integral_stack_t[:, y2, x2]
+        B = integral_stack_t[:, y2, x1]
+        C = integral_stack_t[:, y1, x2]
+        D = integral_stack_t[:, y1, x1]
+        canopy_area = A - B - C + D                       # (P, N)
+        anchor_w = (anchors[:, 2] - anchors[:, 0]).clamp(min=1.0)
+        anchor_h = (anchors[:, 3] - anchors[:, 1]).clamp(min=1.0)
+        anchor_area = anchor_w * anchor_h                 # (N,)
+        iop = (canopy_area / anchor_area).clamp(0.0, 1.0)  # (P, N) via broadcasting
+        return iop.max(dim=0).values
 
     # ------------------------------------------------------------------
     # Transform capture (record post-resize image sizes for canopy IoP)
@@ -517,22 +552,18 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
                     post_h, post_w = sizes_post[img_idx]
                     scale_w = post_w / max(1, pre_w)
                     scale_h = post_h / max(1, pre_h)
-                    integrals = model_ref._build_canopy_integrals_per_poly(
+                    integral_stack = model_ref._build_canopy_integral_stack(
                         canopy_polys_batch[img_idx], post_h, post_w, scale_w, scale_h
                     )
-                    if integrals is not None:
+                    if integral_stack is not None:
                         # Anchor qualifies as canopy-positive iff its own-area
                         # share inside a single polygon clears iop_thr — taken
-                        # as the max IoP across per-polygon masks.
-                        max_iop = torch.zeros(
-                            N_anchors, dtype=torch.float32, device=device
+                        # as the max IoP across per-polygon masks (computed in
+                        # one batched kernel from the stacked integral images).
+                        integral_stack_t = torch.from_numpy(integral_stack).to(device)
+                        max_iop = model_ref._anchor_max_iop_from_stack(
+                            anchors_per_image, integral_stack_t, post_h, post_w
                         )
-                        for integral in integrals:
-                            integral_t = torch.from_numpy(integral).to(device)
-                            iop_p = model_ref._anchor_iop_from_integral(
-                                anchors_per_image, integral_t, post_h, post_w
-                            )
-                            max_iop = torch.maximum(max_iop, iop_p)
                         canopy_raw_mask = max_iop >= iop_thr
 
                         # Size-aware IoSmaller suppression: keep the largest
@@ -623,33 +654,53 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
                 cls_losses.append(total_loss / norm)
 
                 # ===== Regression loss =====
-                if num_foreground == 0:
-                    reg_losses.append(cls_logits_per_image.new_zeros(()))
-                    continue
-
+                # GT-matched anchors regress to their matched ITC box.  Canopy
+                # survivors regress to themselves (zero offset) so the model
+                # emits the survivor anchor's own geometry at inference —
+                # under canopy that means large boxes (the IoSmaller NMS keeps
+                # the largest in each cluster), not arbitrary ITC-shaped boxes
+                # from an unsupervised reg head.  Canopy reg is dampened by
+                # canopy_loss_scale and dropped entirely when scale=0.
                 fg_idxs_pos = foreground_idxs.nonzero(as_tuple=True)[0]
-                # Suppress regression for foreground anchors that are also canopy-
-                # positive: pseudo-canopy GT boxes are not precise crown targets.
-                if canopy_on and canopy_positive_mask.any():
-                    keep = ~canopy_positive_mask[fg_idxs_pos]
-                    fg_idxs_pos = fg_idxs_pos[keep]
+                if canopy_acts_as_ignore:
+                    canopy_reg_idxs = anchors_per_image.new_zeros(
+                        0, dtype=torch.long
+                    )
+                else:
+                    canopy_reg_idxs = canopy_positive_mask.nonzero(as_tuple=True)[0]
 
-                if fg_idxs_pos.numel() == 0:
+                n_reg = fg_idxs_pos.numel() + canopy_reg_idxs.numel()
+                if n_reg == 0:
                     reg_losses.append(cls_logits_per_image.new_zeros(()))
                     continue
 
-                matched_gt_boxes  = targets_per_image["boxes"][
-                    matched_idxs_per_image[fg_idxs_pos]
-                ]
-                anchors_fg        = anchors_per_image[fg_idxs_pos]
-                reg_pred_fg       = bbox_reg_per_image[fg_idxs_pos]
-                target_regression = reg_head.box_coder.encode_single(
-                    matched_gt_boxes, anchors_fg
-                )
-                reg_loss_img = F.l1_loss(
-                    reg_pred_fg, target_regression, reduction="sum"
-                ) / max(1, num_foreground)
-                reg_losses.append(reg_loss_img)
+                reg_sum = cls_logits_per_image.new_zeros(())
+
+                if fg_idxs_pos.numel() > 0:
+                    matched_gt_boxes = targets_per_image["boxes"][
+                        matched_idxs_per_image[fg_idxs_pos]
+                    ]
+                    anchors_fg  = anchors_per_image[fg_idxs_pos]
+                    reg_pred_fg = bbox_reg_per_image[fg_idxs_pos]
+                    target_fg   = reg_head.box_coder.encode_single(
+                        matched_gt_boxes, anchors_fg
+                    )
+                    reg_sum = reg_sum + F.l1_loss(
+                        reg_pred_fg, target_fg, reduction="sum"
+                    )
+
+                if canopy_reg_idxs.numel() > 0:
+                    # target_box == anchor_box → encoded offsets are all zero;
+                    # no need to call encode_single.
+                    reg_pred_canopy = bbox_reg_per_image[canopy_reg_idxs]
+                    canopy_reg_sum  = F.l1_loss(
+                        reg_pred_canopy,
+                        torch.zeros_like(reg_pred_canopy),
+                        reduction="sum",
+                    )
+                    reg_sum = reg_sum + canopy_reg_sum * model_ref.canopy_loss_scale
+
+                reg_losses.append(reg_sum / n_reg)
 
             if not printed_once[0]:
                 printed_once[0] = True
