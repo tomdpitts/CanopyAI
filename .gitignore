@@ -79,3 +79,6 @@ Prediction_*.json
 *val.csv
 phase30/phase30_tcd_canopy_polygons.json
 phase30/debug
+
+benchmark_results/*
+benchmark_results_holdout/*
