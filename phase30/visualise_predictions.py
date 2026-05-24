@@ -38,9 +38,10 @@ from shapely.validation import make_valid
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from benchmark import (
+    _coco_map50,
+    _eval_tile_worker,
     _load_predictions,
     _parse_coco_annotations,
-    _rasterize,
     _seg_to_polygons,
 )
 import geopandas as gpd
@@ -133,8 +134,13 @@ def _load_pred_bboxes(pred_path):
                 raw = json.loads(raw)
             except Exception:
                 out.append(None); continue
-        if isinstance(raw, (list, tuple)) and len(raw) == 4:
-            out.append(shapely_box(*raw))
+        # Geopandas reads JSON list properties as numpy ndarrays, not lists,
+        # so accept any 4-element sequence here.
+        if hasattr(raw, "__len__") and len(raw) == 4 and not isinstance(raw, str):
+            try:
+                out.append(shapely_box(*(float(v) for v in raw)))
+            except (TypeError, ValueError):
+                out.append(None)
         else:
             out.append(None)
     return out
@@ -191,6 +197,20 @@ def _draw_panel(ax, img, polys_groups, title):
     ax.set_xticks([]); ax.set_yticks([])
 
 
+def _draw_bbox_scores(ax, bboxes, scores, color):
+    """Label each bbox with its confidence score, anchored just above the
+    top-left corner. Skips entries where bbox or score is None."""
+    for bb, sc in zip(bboxes, scores):
+        if bb is None or sc is None:
+            continue
+        minx, miny, _maxx, _maxy = bb.bounds
+        ax.text(minx, miny, f"{sc:.2f}",
+                fontsize=6, color="white", weight="bold",
+                ha="left", va="bottom",
+                bbox=dict(facecolor=color, alpha=0.85, edgecolor="none",
+                          boxstyle="round,pad=0.15"))
+
+
 def _load_tile(holdout_dir, idx):
     stem = f"tcd_val_tile_{idx}"
     tif = holdout_dir / f"{stem}.tif"
@@ -211,8 +231,9 @@ def _load_tile(holdout_dir, idx):
 
 
 def visualise_tile(idx, model_dirs, model_names, holdout_dir, save_dir,
-                   score_thresh):
+                   score_thresh, show_bboxes, show_scores):
     stem, img, tree_gts, canopy_gts, H, W = _load_tile(holdout_dir, idx)
+    meta_path = Path(holdout_dir) / f"{stem}_meta.json"
 
     n_cols = 1 + len(model_names)
     fig, axes = plt.subplots(1, n_cols, figsize=(6 * n_cols, 6.5))
@@ -228,9 +249,6 @@ def visualise_tile(idx, model_dirs, model_names, holdout_dir, save_dir,
         ],
         title=f"{stem}  —  GT  (trees={len(tree_gts)}, canopy={len(canopy_gts)})",
     )
-
-    # Pre-rasterise GT once for the binary metric (shared across all models)
-    gt_mask_bin = _rasterize(tree_gts + canopy_gts, H, W)
 
     # Model panels
     for ax, mdir, name in zip(axes[1:], model_dirs, model_names):
@@ -252,9 +270,11 @@ def visualise_tile(idx, model_dirs, model_names, holdout_dir, save_dir,
             continue
 
         preds = _load_predictions(pred_path, H, W, score_thresh)
-        bboxes = _load_pred_bboxes(pred_path)
-        if len(bboxes) != len(preds):
+        bboxes = _load_pred_bboxes(pred_path) if show_bboxes else []
+        if show_bboxes and len(bboxes) != len(preds):
             # Score-thresh dropped some preds; can't align — disable bbox drawing.
+            bboxes = [None] * len(preds)
+        elif not show_bboxes:
             bboxes = [None] * len(preds)
         classes, fn_idx = _classify(preds, tree_gts, canopy_gts)
 
@@ -263,54 +283,70 @@ def visualise_tile(idx, model_dirs, model_names, holdout_dir, save_dir,
         ignore_polys = [preds[i][0] for i, c in enumerate(classes) if c == "IGNORE"]
         fn_polys     = [tree_gts[j] for j in fn_idx]
 
-        tp_bboxes     = [bboxes[i] for i, c in enumerate(classes) if c == "TP" and bboxes[i] is not None]
-        fp_bboxes     = [bboxes[i] for i, c in enumerate(classes) if c == "FP" and bboxes[i] is not None]
-        ignore_bboxes = [bboxes[i] for i, c in enumerate(classes) if c == "IGNORE" and bboxes[i] is not None]
+        # Keep bbox/score pairs aligned per class so score labels match their boxes.
+        tp_bbox_pairs     = [(bboxes[i], preds[i][1]) for i, c in enumerate(classes) if c == "TP"     and bboxes[i] is not None]
+        fp_bbox_pairs     = [(bboxes[i], preds[i][1]) for i, c in enumerate(classes) if c == "FP"     and bboxes[i] is not None]
+        ignore_bbox_pairs = [(bboxes[i], preds[i][1]) for i, c in enumerate(classes) if c == "IGNORE" and bboxes[i] is not None]
+        tp_bboxes     = [b for b, _ in tp_bbox_pairs]
+        fp_bboxes     = [b for b, _ in fp_bbox_pairs]
+        ignore_bboxes = [b for b, _ in ignore_bbox_pairs]
 
-        # ── Instance metrics @ IoU=0.5 (iscrowd-ignored preds excluded from denom)
-        n_tp, n_fp, n_fn = len(tp_polys), len(fp_polys), len(fn_polys)
-        inst_p  = n_tp / (n_tp + n_fp) if (n_tp + n_fp) else 0.0
-        inst_r  = n_tp / (n_tp + n_fn) if (n_tp + n_fn) else 0.0
-        inst_f1 = 2 * inst_p * inst_r / (inst_p + inst_r) if (inst_p + inst_r) else 0.0
-
-        # ── Binary semantic-seg metrics (per-tile pixel counts)
-        pred_mask_bin = _rasterize([p for p, _ in preds], H, W)
-        tp_pix = int(np.count_nonzero(pred_mask_bin & gt_mask_bin))
-        fp_pix = int(np.count_nonzero(pred_mask_bin & ~gt_mask_bin))
-        fn_pix = int(np.count_nonzero(~pred_mask_bin & gt_mask_bin))
-        tn_pix = pred_mask_bin.size - tp_pix - fp_pix - fn_pix
-        bin_iou = tp_pix / (tp_pix + fp_pix + fn_pix) if (tp_pix + fp_pix + fn_pix) else 0.0
-        bin_f1  = (2 * tp_pix) / (2 * tp_pix + fp_pix + fn_pix) if (2 * tp_pix + fp_pix + fn_pix) else 0.0
-        bin_acc = (tp_pix + tn_pix) / pred_mask_bin.size
+        # ── Restor-paper-comparable metrics, computed per tile.
+        # Re-uses benchmark._eval_tile_worker so the exact formulas match the
+        # holdout summary table (macro IoU, F1_tree, tree-recall, mAP50, AR@1000).
+        wargs = (0, stem, str(meta_path), pred_path, score_thresh)
+        r = _eval_tile_worker(wargs)
+        tp_p, fp_p, fn_p, tn_p = r["tp"], r["fp"], r["fn"], r["tn"]
+        iou_tree   = tp_p / (tp_p + fp_p + fn_p) if (tp_p + fp_p + fn_p) else 0.0
+        iou_bg     = tn_p / (tn_p + fp_p + fn_p) if (tn_p + fp_p + fn_p) else 0.0
+        macro_iou  = 0.5 * (iou_tree + iou_bg)
+        f1_tree    = (2 * tp_p) / (2 * tp_p + fp_p + fn_p) if (2 * tp_p + fp_p + fn_p) else 0.0
+        acc_tree   = tp_p / (tp_p + fn_p) if (tp_p + fn_p) else 0.0
+        images_one = [{"id": 0, "file_name": f"{stem}.tif",
+                       "width": r["W"], "height": r["H"]}]
+        map50, ar  = _coco_map50(images_one, r["gt_anns"], r["pred_dets"])
+        m_fmt  = "—" if map50 is None else f"{map50:.3f}"
+        ar_fmt = "—" if ar    is None else f"{ar:.3f}"
 
         title = (
             f"{name}\n"
-            f"inst @IoU0.5  P={inst_p:.2f}  R={inst_r:.2f}  F1={inst_f1:.2f}   "
-            f"(TP={n_tp} FP={n_fp} IGN={len(ignore_polys)} FN={n_fn})\n"
-            f"binary       IoU={bin_iou:.3f}  F1={bin_f1:.3f}  Acc={bin_acc:.3f}"
+            f"IoU={macro_iou:.3f}  F1={f1_tree:.3f}  Acc={acc_tree:.3f}    "
+            f"mAP50={m_fmt}  AR@1000={ar_fmt}    "
+            f"(n_pred={len(preds)} n_gt={len(tree_gts)})"
         )
+        bbox_groups = [
+            # Raw DeepForest bboxes (under polygons): thin same-colour dashed lines
+            (ignore_bboxes, "#10b981", "--", 1.2),
+            (fp_bboxes,     "#e53935", "--", 0.7),
+            (tp_bboxes,     "#22c55e", "--", 0.7),
+        ] if show_bboxes else []
         _draw_panel(
             ax, img,
-            [
-                # Raw DeepForest bboxes (under polygons): thin same-colour dashed lines
-                (ignore_bboxes, "#9aa0a6", "--", 0.6),
-                (fp_bboxes,     "#e53935", "--", 0.7),
-                (tp_bboxes,     "#22c55e", "--", 0.7),
+            bbox_groups + [
                 # SAM-refined polygons on top: thicker solid lines
                 (fn_polys,      "#ff9500", "--", 1.0),   # missed trees from GT
-                (ignore_polys,  "#9aa0a6", ":",  1.0),   # in-canopy → ignored
+                (ignore_polys,  "#10b981", ":",  1.8),   # in-canopy → ignored
                 (fp_polys,      "#e53935", "-",  1.4),   # genuine false positives
                 (tp_polys,      "#22c55e", "-",  1.4),   # matched trees
             ],
             title=title,
         )
+        if show_bboxes and show_scores:
+            _draw_bbox_scores(ax, [b for b, _ in tp_bbox_pairs],
+                              [s for _, s in tp_bbox_pairs], "#22c55e")
+            _draw_bbox_scores(ax, [b for b, _ in fp_bbox_pairs],
+                              [s for _, s in fp_bbox_pairs], "#e53935")
+            _draw_bbox_scores(ax, [b for b, _ in ignore_bbox_pairs],
+                              [s for _, s in ignore_bbox_pairs], "#10b981")
 
+    tp_label = "TP polygon  (solid=SAM, dashed=raw bbox)" if show_bboxes else "TP polygon (SAM-refined)"
+    fp_label = "FP polygon  (solid=SAM, dashed=raw bbox)" if show_bboxes else "FP polygon (SAM-refined)"
     legend = [
         Line2D([0], [0], color="#ffd400", lw=1.5, label="GT tree (cat=2)"),
         Line2D([0], [0], color="#00d8ff", lw=1.5, ls="--", label="GT canopy (cat=1)"),
-        Line2D([0], [0], color="#22c55e", lw=1.5, label="TP polygon  (solid=SAM, dashed=raw bbox)"),
-        Line2D([0], [0], color="#e53935", lw=1.5, label="FP polygon  (solid=SAM, dashed=raw bbox)"),
-        Line2D([0], [0], color="#9aa0a6", lw=1.5, ls=":", label="IGNORE  (pred IoP≥0.5 in canopy → ignored by mAP50)"),
+        Line2D([0], [0], color="#22c55e", lw=1.5, label=tp_label),
+        Line2D([0], [0], color="#e53935", lw=1.5, label=fp_label),
+        Line2D([0], [0], color="#10b981", lw=1.8, ls=":", label="IGNORE  (pred IoP≥0.5 in canopy → ignored by mAP50)"),
         Line2D([0], [0], color="#ff9500", lw=1.5, ls="--", label="FN  (unmatched tree GT)"),
     ]
     fig.legend(handles=legend, loc="lower center", ncol=3, fontsize=8,
@@ -337,6 +373,13 @@ def parse_args():
     p.add_argument("--save-dir", default="phase30/viz_predictions",
                    help="Where PNGs are written.")
     p.add_argument("--pred-score-thresh", type=float, default=0.0)
+    p.add_argument("--show-bboxes", action="store_true",
+                   help="Also draw the raw DeepForest detection bboxes (dashed) "
+                        "underneath each SAM polygon. Off by default.")
+    p.add_argument("--no-scores", action="store_true",
+                   help="When --show-bboxes is set, suppress the confidence "
+                        "score labels (which otherwise print at each bbox's "
+                        "top-left).")
     p.add_argument("--tile-indices", nargs="+", type=int, default=None,
                    help=f"Override hardcoded indices (default: {TILE_INDICES}).")
     return p.parse_args()
@@ -366,7 +409,9 @@ def main():
     for idx in indices:
         try:
             path = visualise_tile(idx, model_dirs, names, holdout_dir, save_dir,
-                                  args.pred_score_thresh)
+                                  args.pred_score_thresh,
+                                  show_bboxes=args.show_bboxes,
+                                  show_scores=not args.no_scores)
             print(f"  ✓ tile {idx:>3}  →  {path}")
         except FileNotFoundError as e:
             print(f"  ✗ tile {idx:>3}  missing file: {e}")

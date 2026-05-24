@@ -73,6 +73,10 @@ def parse_args():
                    help="DeepForest detection confidence threshold passed to foxtrot "
                         "(None → foxtrot default of 0.35). Lower it (e.g. 0.05) to "
                         "diagnose models that under-predict.")
+    p.add_argument("--area-weight", type=float, default=0,
+                   help="NMS sort blending passed to foxtrot. Default 0 → "
+                        "pure-score sort. >0 → score * (area/median)^area_weight. "
+                        "Pass a very large value to restore legacy pure-area sort.")
     p.add_argument("--tiles", nargs="+", default=None,
                    help="Restrict to these tile stems (e.g. tcd_val_tile_0 tcd_val_tile_1).")
     p.add_argument("--skip-inference", action="store_true",
@@ -104,7 +108,7 @@ def _progress_suffix(times, total):
 
 
 def run_foxtrot(model_spec, mtype, image_path, out_dir, shadow_model,
-                abs_luma_max=None, df_confidence=None):
+                abs_luma_max=None, df_confidence=None, area_weight=None):
     cmd = [sys.executable, str(REPO_ROOT / "foxtrot.py"),
            "--image_path", str(image_path),
            "--output_dir", str(out_dir),
@@ -116,6 +120,8 @@ def run_foxtrot(model_spec, mtype, image_path, out_dir, shadow_model,
         cmd += ["--abs_luma_max", str(abs_luma_max)]
     if df_confidence is not None:
         cmd += ["--deepforest_confidence", str(df_confidence)]
+    if area_weight is not None:
+        cmd += ["--area_weight", str(area_weight)]
     r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if r.returncode != 0:
         print(f"      ⚠  foxtrot failed: {r.stderr[-300:]}")
@@ -147,7 +153,7 @@ def run_detectree2_one(image_path, out_dir):
 
 
 def run_inference(model_spec, mtype, holdout_dir, out_dir, shadow_model,
-                  abs_luma_max=None, df_confidence=None,
+                  abs_luma_max=None, df_confidence=None, area_weight=None,
                   skip_existing=False, tile_filter=None):
     tifs = sorted(Path(holdout_dir).glob("*.tif"))
     if tile_filter is not None:
@@ -171,7 +177,8 @@ def run_inference(model_spec, mtype, holdout_dir, out_dir, shadow_model,
         else:
             success = run_foxtrot(model_spec, mtype, tif, out_dir,
                                   shadow_model, abs_luma_max=abs_luma_max,
-                                  df_confidence=df_confidence)
+                                  df_confidence=df_confidence,
+                                  area_weight=area_weight)
         times.append(time.monotonic() - t0)
         print(("✓" if success else "✗") + _progress_suffix(times, len(pending)))
         ok += success
@@ -608,6 +615,7 @@ def main():
         run_inference(spec, mtype, holdout_dir, out_dir, args.shadow_model,
                       abs_luma_max=args.abs_luma_max,
                       df_confidence=args.df_confidence,
+                      area_weight=args.area_weight,
                       skip_existing=args.skip_existing,
                       tile_filter=tile_filter)
 
