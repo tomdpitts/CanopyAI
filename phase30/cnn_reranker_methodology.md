@@ -173,12 +173,46 @@ the rescored probabilities.
 
 ## Ablations recorded for the record
 
+All results below are on a 49-tile stride-9 subset of the holdout
+(`/tmp/sam_subset_tiles.txt`); SAM-B + reranker baseline on this subset
+is 0.530 (vs 0.515 on the full 439-tile holdout — the subset is somewhat
+harder than average).  Deltas are what generalise.
+
 * **ResNet50 backbone** vs ResNet18: 1-run mAP50 = 0.508 (R50) vs
-  0.507–0.509 (R18).  Indistinguishable.  ResNet50 has 2.1x the
-  parameters but the 96x96 patch is too small for the deeper feature
-  hierarchy to pay off, and the binary task doesn't need 1000-way
-  ImageNet capacity.  **Default stays at ResNet18.**
+  0.507–0.509 (R18) on the full holdout.  Indistinguishable.  ResNet50
+  has 2.1x the parameters but the 96x96 patch is too small for the
+  deeper feature hierarchy to pay off, and the binary task doesn't need
+  1000-way ImageNet capacity.  **Default stays at ResNet18.**
   (`--backbone resnet50` still available for future ablations.)
+
+* **Bigger out-of-box SAM** (frozen, no fine-tuning).  Reranker trained
+  on SAM-B polygons, applied unchanged to SAM-L / SAM-H polygons:
+
+  | SAM variant | params | mAP50 (no reranker) | mAP50 (+reranker) | Δ vs SAM-B |
+  |---|---|---|---|---|
+  | SAM-B (vit_b)  | 91M  | 0.362 | 0.530 | — |
+  | SAM-L (vit_l)  | 308M | 0.364 | (n/a) | +0.002 noise |
+  | SAM-H (vit_h)  | 636M | 0.371 | **0.543** | **+0.013 real** |
+
+  SAM-H gives a small but real +0.013 mAP on top of the reranker, and a
+  matching +0.010 AR@1000 (polygon quality is genuinely better — more
+  matches at IoU>=0.5).  Cost: 7x larger checkpoint (2.5 GB vs 358 MB)
+  and ~3-4x slower SAM inference per tile.  No code changes — one CLI
+  flag pair: `--sam-model vit_h --sam-checkpoint sam_vit_h_4b8939.pth`.
+
+  **Default stays at SAM-B.**  SAM-H is supported as an optional
+  configuration when the +0.013 mAP is worth the cost.  The reranker
+  trained on SAM-B polygons works unchanged on SAM-H polygons (proven
+  empirically) — no need to retrain when switching SAM size.
+
+* **SAM decoder fine-tuning.**  Not attempted on principle.  Frozen
+  SAM-H gives only +0.013 mAP and +0.010 AR (modest polygon-quality
+  improvement); fine-tuning on top would likely add another +0.01-0.02
+  at the cost of significant pipeline complexity (custom training loop,
+  domain-coupling — a fine-tuned SAM is specifically tuned for OAM-TCD
+  and may regress on other domains).  Cost/benefit doesn't justify it
+  given the threshold of "no significant complexity for 0.01 mAP that
+  doesn't generalise."
 
 ## What this approach can and cannot do
 
