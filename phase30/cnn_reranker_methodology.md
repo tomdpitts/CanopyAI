@@ -96,17 +96,21 @@ visible to the CNN.
 
 ## End-to-end reproducer
 
+There are two workflows: a **one-shot training + inference workflow** that
+produces a saved checkpoint, and a **deployment workflow** that re-runs
+foxtrot with the saved checkpoint on new tiles.
+
+### A. Train the reranker once and save a checkpoint
+
 ```bash
-# 1. Run foxtrot on the holdout (produces benchmark_results_holdout/<model>/)
+# A1. Run foxtrot on the holdout (eval target).
 python phase30/benchmark.py \
     --models kunqi5_epoch98.ckpt \
     --names  kunqi5_baseline \
     --output-root benchmark_results_holdout \
     --df-confidence 0.0 --pred-score-thresh 0.0 --area-weight 0
 
-# 2. Run foxtrot on the training-set sample (the deterministic
-#    600-tile list lives in /tmp/train_sample.txt + /tmp/train_sample_extra.txt
-#    or regenerate from the sampling script in this folder).
+# A2. Run foxtrot on a disjoint training sample (~600 tiles works).
 python phase30/benchmark.py \
     --models kunqi5_epoch98.ckpt \
     --names  kunqi5_train_for_reranker \
@@ -115,28 +119,52 @@ python phase30/benchmark.py \
     --tiles-file train_sample.txt \
     --df-confidence 0.0 --pred-score-thresh 0.0 --area-weight 0
 
-# 3. Train the CNN reranker (repeat 3x with different random inits,
-#    writing to rs_cnn_run1/2/3 folders).
+# A3. Train a 3-CNN ensemble in a single call and save the checkpoint.
 python phase30/cnn_reranker.py \
     --src       benchmark_results_holdout/kunqi5_baseline \
     --holdout-dir data/tcd/images/data/tcd/val \
     --train-src benchmark_results_train/kunqi5_train_for_reranker \
     --train-holdout-dir data/tcd/images/data/tcd/raw \
-    --dst       benchmark_results_holdout/rs_cnn_run1 \
-    --epochs 8 --batch-size 128
+    --dst       benchmark_results_holdout/rs_cnn_ensemble \
+    --n-runs 3 --epochs 8 --batch-size 128 \
+    --save-checkpoint phase30/cnn_reranker_ens3.pt
 
-# 4. Ensemble the runs.
-python phase30/ensemble_geojsons.py \
-    --srcs benchmark_results_holdout/rs_cnn_run{1,2,3} \
-    --dst  benchmark_results_holdout/rs_cnn_ensemble \
-    --mode mean
-
-# 5. Evaluate.
+# A4. Evaluate (the rescored geojsons are already in rs_cnn_ensemble/).
 python phase30/benchmark.py \
     --models kunqi5_epoch98.ckpt --names rs_cnn_ensemble \
     --output-root benchmark_results_holdout \
     --skip-inference --pred-score-thresh 0.0
 ```
+
+`phase30/cnn_reranker_ens3.pt` is now a self-contained reranker
+checkpoint (~150 MB for 3 × ResNet18 state_dicts).
+
+### B. Run foxtrot end-to-end with the saved reranker
+
+When `--reranker_checkpoint` is passed, foxtrot becomes a 3-stage
+pipeline (DeepForest -> SAM -> CNN reranker) and the geojson's
+`deepforest_score` is replaced inline with the calibrated probability.
+**Omit the flag to fall back to the 2-stage default.**
+
+```bash
+# Direct foxtrot call:
+python foxtrot.py \
+    --image_path /path/to/new_tile.tif \
+    --output_dir ./output \
+    --deepforest_model kunqi5_epoch98.ckpt \
+    --reranker_checkpoint phase30/cnn_reranker_ens3.pt
+
+# Or through benchmark.py for a whole holdout:
+python phase30/benchmark.py \
+    --models kunqi5_epoch98.ckpt \
+    --names  kunqi5_end2end \
+    --output-root benchmark_results_holdout \
+    --area-weight 0 \
+    --reranker-checkpoint phase30/cnn_reranker_ens3.pt
+```
+
+No separate post-processing step.  The output geojsons already carry
+the rescored probabilities.
 
 ## What this approach can and cannot do
 

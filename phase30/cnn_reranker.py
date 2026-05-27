@@ -266,6 +266,104 @@ class CNNReranker(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Inference API (used by foxtrot for in-pipeline reranking)
+# ---------------------------------------------------------------------------
+
+def extract_polygon_patches(image, polygons, patch_size=PATCH_SIZE,
+                            pad_frac=BBOX_PAD_FRAC):
+    """Extract image patches for a list of polygons.  Returns an array of
+    shape (N, patch_size, patch_size, 3) uint8.  Polygons that fail (None /
+    empty / out-of-bounds) get zero patches; caller should rely on the
+    polygon's own score handling if the patch is meaningless."""
+    if image.dtype != np.uint8:
+        mx = max(1, image.max())
+        image = (image.astype(np.float32) / mx * 255).astype(np.uint8)
+    H, W = image.shape[:2]
+    patches = np.zeros((len(polygons), patch_size, patch_size, 3), dtype=np.uint8)
+    for i, poly in enumerate(polygons):
+        try:
+            if poly is None or poly.is_empty:
+                continue
+            patches[i] = _crop_patch(image, poly.bounds, H, W,
+                                     pad_frac=pad_frac, out_size=patch_size)
+        except Exception:
+            pass
+    return patches
+
+
+class RerankerEnsemble:
+    """Loaded reranker.  Wraps one or more `CNNReranker` checkpoints and
+    averages their per-polygon TP-probability outputs."""
+
+    def __init__(self, state_dicts, device, patch_size=PATCH_SIZE,
+                 pad_frac=BBOX_PAD_FRAC):
+        self.device = device
+        self.patch_size = int(patch_size)
+        self.pad_frac = float(pad_frac)
+        self.models = []
+        for sd in state_dicts:
+            m = CNNReranker().to(device)
+            m.load_state_dict(sd)
+            m.eval()
+            self.models.append(m)
+
+    def __len__(self):
+        return len(self.models)
+
+    def predict(self, image, polygons, batch_size=256):
+        """For each polygon, extract a patch and return the ensemble-mean
+        TP probability (numpy float32 array of length len(polygons))."""
+        if len(polygons) == 0:
+            return np.zeros(0, dtype=np.float32)
+        patches = extract_polygon_patches(image, polygons,
+                                          patch_size=self.patch_size,
+                                          pad_frac=self.pad_frac)
+        probs_sum = np.zeros(len(patches), dtype=np.float32)
+        with torch.no_grad():
+            for i in range(0, len(patches), batch_size):
+                p = patches[i:i+batch_size]
+                t = torch.from_numpy(p.copy()).permute(0, 3, 1, 2).float() / 255.0
+                t = (t - IMAGENET_MEAN) / IMAGENET_STD
+                t = t.to(self.device)
+                for m in self.models:
+                    probs_sum[i:i+batch_size] += torch.sigmoid(m(t)).cpu().numpy()
+        return probs_sum / float(len(self.models))
+
+
+def save_ensemble(state_dicts, path, patch_size=PATCH_SIZE,
+                  pad_frac=BBOX_PAD_FRAC, meta=None):
+    """Bundle one or more model state_dicts into a single checkpoint file.
+
+    Format:
+        {"state_dicts": [...], "patch_size": int, "pad_frac": float,
+         "model_class": "CNNReranker", "meta": dict-or-None}
+    """
+    path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save({
+        "state_dicts": [{k: v.cpu() for k, v in sd.items()} for sd in state_dicts],
+        "patch_size": int(patch_size),
+        "pad_frac": float(pad_frac),
+        "model_class": "CNNReranker",
+        "meta": meta or {},
+    }, path)
+
+
+def load_ensemble(path, device):
+    """Load a checkpoint saved by `save_ensemble` and return a
+    `RerankerEnsemble`."""
+    blob = torch.load(path, map_location="cpu", weights_only=False)
+    if blob.get("model_class") != "CNNReranker":
+        raise ValueError(f"Checkpoint {path} has incompatible model_class "
+                         f"{blob.get('model_class')!r}")
+    return RerankerEnsemble(
+        state_dicts=blob["state_dicts"],
+        device=device,
+        patch_size=blob.get("patch_size", PATCH_SIZE),
+        pad_frac=blob.get("pad_frac", BBOX_PAD_FRAC),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
 
@@ -387,6 +485,15 @@ def main():
     ap.add_argument("--batch-size", type=int, default=128)
     ap.add_argument("--val-frac", type=float, default=0.10,
                     help="Fraction of train tiles held out for in-training validation.")
+    ap.add_argument("--n-runs", type=int, default=1,
+                    help="Train this many random-init runs and ensemble their "
+                         "outputs.  Each run is trained sequentially; the final "
+                         "geojsons are written with the mean ensemble probability.")
+    ap.add_argument("--save-checkpoint", default=None,
+                    help="If set, save the trained ensemble's state_dicts to "
+                         "this path (.pt).  The file is loadable via "
+                         "cnn_reranker.load_ensemble() — e.g. by foxtrot.py "
+                         "with --reranker_checkpoint.")
     args = ap.parse_args()
 
     device = "mps" if torch.backends.mps.is_available() else (
@@ -432,21 +539,41 @@ def main():
 
     print(f"\n=== Training ResNet18 reranker ===")
     print(f"  epochs={args.epochs}  batch_size={args.batch_size}  device={device}")
+    print(f"  n_runs={args.n_runs}")
     pos_weight = float((1 - y_train[tr_rows].mean()) / y_train[tr_rows].mean())
     print(f"  pos_weight={pos_weight:.2f}")
-    model = CNNReranker().to(device)
-    model = train_model(model, train_loader, val_loader, device,
-                        epochs=args.epochs, pos_weight=pos_weight)
 
-    print(f"\n=== Inference on holdout patches ===")
-    probs = predict_all(model, eval_patches, device, batch_size=256)
+    # Train N ensemble members.  Per-run state_dicts are stashed in CPU
+    # memory and the predictions are averaged across them.
+    ensemble_state_dicts = []
+    probs_sum = np.zeros(len(eval_patches), dtype=np.float32)
+    for run in range(args.n_runs):
+        print(f"\n--- Run {run+1}/{args.n_runs} ---")
+        model = CNNReranker().to(device)
+        model = train_model(model, train_loader, val_loader, device,
+                            epochs=args.epochs, pos_weight=pos_weight)
+        ensemble_state_dicts.append(
+            {k: v.detach().cpu().clone() for k, v in model.state_dict().items()})
+        print(f"  inference on holdout patches...")
+        probs_sum += predict_all(model, eval_patches, device, batch_size=256)
+        del model
+
+    new_probs = probs_sum / float(args.n_runs)
     new_scores = {}
     for i, t in enumerate(eval_tiles):
         s, e = int(eval_offsets[i]), int(eval_offsets[i+1])
-        new_scores[t["stem"]] = probs[s:e]
+        new_scores[t["stem"]] = new_probs[s:e]
 
     print(f"\n=== Writing rescored geojsons -> {args.dst} ===")
     write_rescored_geojsons(eval_tiles, new_scores, args.dst)
+
+    if args.save_checkpoint:
+        save_ensemble(ensemble_state_dicts, args.save_checkpoint,
+                      patch_size=PATCH_SIZE, pad_frac=BBOX_PAD_FRAC,
+                      meta={"epochs": args.epochs, "n_runs": args.n_runs,
+                            "train_src": args.train_src})
+        print(f"=== Saved ensemble checkpoint -> {args.save_checkpoint} "
+              f"({len(ensemble_state_dicts)} member(s)) ===")
     print("Done.")
 
 

@@ -92,6 +92,12 @@ def parse_args():
                    help="Polygon-level containment: drop polygon ≥this fraction "
                         "inside a larger polygon. None → foxtrot default (0.9). "
                         "0 disables.")
+    p.add_argument("--reranker-checkpoint", default=None,
+                   help="Path to a CNN reranker checkpoint (.pt) saved by "
+                        "phase30/cnn_reranker.py --save-checkpoint.  Passed "
+                        "through to foxtrot so each polygon's deepforest_score "
+                        "is replaced with the reranker's TP-probability at "
+                        "inference time.")
     p.add_argument("--tiles", nargs="+", default=None,
                    help="Restrict to these tile stems (e.g. tcd_val_tile_0 tcd_val_tile_1).")
     p.add_argument("--tiles-file", default=None,
@@ -128,7 +134,8 @@ def _progress_suffix(times, total):
 def run_foxtrot(model_spec, mtype, image_path, out_dir, shadow_model,
                 abs_luma_max=None, df_confidence=None, area_weight=None,
                 df_tile_overlap=None, bbox_pad=None, skip_nms=False,
-                containment_threshold=None, poly_containment_threshold=None):
+                containment_threshold=None, poly_containment_threshold=None,
+                reranker_checkpoint=None):
     cmd = [sys.executable, str(REPO_ROOT / "foxtrot.py"),
            "--image_path", str(image_path),
            "--output_dir", str(out_dir),
@@ -152,6 +159,8 @@ def run_foxtrot(model_spec, mtype, image_path, out_dir, shadow_model,
         cmd += ["--containment_threshold", str(containment_threshold)]
     if poly_containment_threshold is not None:
         cmd += ["--poly_containment_threshold", str(poly_containment_threshold)]
+    if reranker_checkpoint is not None:
+        cmd += ["--reranker_checkpoint", str(reranker_checkpoint)]
     r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if r.returncode != 0:
         print(f"      ⚠  foxtrot failed: {r.stderr[-300:]}")
@@ -186,6 +195,7 @@ def run_inference(model_spec, mtype, holdout_dir, out_dir, shadow_model,
                   abs_luma_max=None, df_confidence=None, area_weight=None,
                   df_tile_overlap=None, bbox_pad=None, skip_nms=False,
                   containment_threshold=None, poly_containment_threshold=None,
+                  reranker_checkpoint=None,
                   skip_existing=False, tile_filter=None):
     tifs = sorted(Path(holdout_dir).glob("*.tif"))
     if tile_filter is not None:
@@ -215,7 +225,8 @@ def run_inference(model_spec, mtype, holdout_dir, out_dir, shadow_model,
                                   bbox_pad=bbox_pad,
                                   skip_nms=skip_nms,
                                   containment_threshold=containment_threshold,
-                                  poly_containment_threshold=poly_containment_threshold)
+                                  poly_containment_threshold=poly_containment_threshold,
+                                  reranker_checkpoint=reranker_checkpoint)
         times.append(time.monotonic() - t0)
         print(("✓" if success else "✗") + _progress_suffix(times, len(pending)))
         ok += success
@@ -663,6 +674,7 @@ def main():
                       skip_nms=args.skip_nms,
                       containment_threshold=args.containment_threshold,
                       poly_containment_threshold=args.poly_containment_threshold,
+                      reranker_checkpoint=args.reranker_checkpoint,
                       skip_existing=args.skip_existing,
                       tile_filter=tile_filter)
 

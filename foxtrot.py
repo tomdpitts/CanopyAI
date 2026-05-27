@@ -15,6 +15,7 @@ Usage:
 
 import argparse
 import os
+import sys
 import json
 import tempfile
 import gc
@@ -1461,7 +1462,7 @@ def mask_to_polygon(mask, simplify_tolerance=1.0):
 
 def save_results(
     cache_files, bboxes, deepforest_scores, output_dir, tif_stem, crs=None,
-    poly_containment_threshold=0.9,
+    poly_containment_threshold=0.9, reranker=None, image=None,
 ):
     """
     Save segmentation results as GeoJSON and visualization.
@@ -1477,6 +1478,12 @@ def save_results(
         poly_containment_threshold: Remove any polygon whose area is >=this
             fraction covered by the union of all larger polygons (default 0.9).
             Set to 0 to disable.
+        reranker: Optional `phase30.cnn_reranker.RerankerEnsemble` instance.
+            If provided, each surviving polygon's `deepforest_score` is
+            replaced with the reranker's calibrated TP-probability.  `image`
+            must also be provided.
+        image: Full tile RGB array (H, W, 3) uint8 — required when `reranker`
+            is provided so per-polygon patches can be extracted.
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1523,6 +1530,18 @@ def save_results(
             print(f"   Polygon containment suppression (thr={poly_containment_threshold}): "
                   f"removed {len(to_remove)} nested polygons")
         raw = [(p, s, b) for k, (p, s, b) in enumerate(raw) if k not in to_remove]
+
+    # Optional 3rd stage: CNN reranker rescoring.  Replaces each surviving
+    # polygon's deepforest_score with the ensemble's calibrated TP-probability.
+    if reranker is not None and raw:
+        if image is None:
+            raise ValueError("save_results: reranker requires the tile `image` "
+                             "to extract per-polygon patches.")
+        print(f"\n🔁 CNN reranker ({len(reranker)}-member ensemble): "
+              f"rescoring {len(raw)} polygons...")
+        polys_for_rr = [p for p, _, _ in raw]
+        new_scores = reranker.predict(image, polys_for_rr)
+        raw = [(p, float(new_scores[k]), b) for k, (p, _s, b) in enumerate(raw)]
 
     # Convert to GeoJSON features
     features = []
@@ -1728,6 +1747,24 @@ def main(args):
     print("📁 Loading image...")
     image, crs, transform, bounds = load_image_from_tif(tif_path)
 
+    # Optional: load the CNN reranker ensemble.  Skipped when the flag is
+    # absent — foxtrot then behaves as a 2-stage (DeepForest + SAM) pipeline.
+    reranker = None
+    if getattr(args, "reranker_checkpoint", None):
+        rr_path = Path(args.reranker_checkpoint)
+        if not rr_path.exists():
+            raise FileNotFoundError(f"❌ Reranker checkpoint not found: {rr_path}")
+        import torch as _torch
+        rr_device = ("mps" if _torch.backends.mps.is_available() else
+                     ("cuda" if _torch.cuda.is_available() else "cpu"))
+        # Late import to keep the phase30 dependency optional.
+        sys.path.insert(0, str(Path(__file__).resolve().parent / "phase30"))
+        from cnn_reranker import load_ensemble  # noqa: E402
+        print(f"\n🔁 Loading CNN reranker ensemble from {rr_path} "
+              f"(device={rr_device})...")
+        reranker = load_ensemble(rr_path, rr_device)
+        print(f"   ensemble size: {len(reranker)}  patch_size: {reranker.patch_size}")
+
     # Initialize SAM first (needed by unified function)
     print(f"\n🔧 Loading SAM model from {args.sam_checkpoint}...")
     if not Path(args.sam_checkpoint).exists():
@@ -1922,6 +1959,7 @@ def main(args):
     output_geojson_path, features = save_results(
         cache_files, valid_bboxes, valid_scores, args.output_dir, tif_path.stem, crs,
         poly_containment_threshold=0 if args.skip_nms else args.poly_containment_threshold,
+        reranker=reranker, image=image,
     )
     timings["Save GeoJSON"] = time.time() - save_start
 
@@ -2048,6 +2086,17 @@ def parse_args():
         help="Path to custom DeepForest model (.pth file). "
         "Can be either a standard DeepForest model or a FiLM-conditioned model "
         "(auto-detected). If not provided, uses default pretrained model.",
+    )
+
+    ap.add_argument(
+        "--reranker_checkpoint",
+        type=str,
+        default=None,
+        help="Optional path to a CNN reranker checkpoint (.pt) produced by "
+             "phase30/cnn_reranker.py --save-checkpoint.  When provided, the "
+             "per-polygon deepforest_score in the output GeoJSON is replaced "
+             "with the reranker ensemble's calibrated TP-probability.  Omit "
+             "this flag to skip the reranker stage entirely.",
     )
 
     ap.add_argument(
