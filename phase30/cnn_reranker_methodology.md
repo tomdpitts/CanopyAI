@@ -23,17 +23,11 @@ label exposure.
 
 ### 1. Score-based NMS (foxtrot pipeline)
 
-Foxtrot's NMS originally ranked candidates by bounding-box area, with
-the documented `--area_weight` flag silently ignored.  Low-confidence
-large detections were eating high-confidence small ones at every
-suppression stage.
-
-Wired `--area_weight` through to `apply_nms` and made score-first
-ordering the default:
-
-* `area_weight = 0` (default): pure-score sort
-* `area_weight > 0`: blended score × (area / median)**area_weight
-* `area_weight = +inf`: legacy pure-area sort
+Foxtrot's NMS originally ranked candidates by bounding-box area.
+Low-confidence large detections were eating high-confidence small ones
+at every suppression stage.  `apply_nms` now sorts strictly by
+descending confidence score; the survivor with the highest score wins
+every NMS / containment decision.
 
 This single change lifts mAP50 from 0.258 to 0.347.
 
@@ -108,7 +102,7 @@ python phase30/benchmark.py \
     --models kunqi5_epoch98.ckpt \
     --names  kunqi5_baseline \
     --output-root benchmark_results_holdout \
-    --df-confidence 0.0 --pred-score-thresh 0.0 --area-weight 0
+    --df-confidence 0.0 --pred-score-thresh 0.0
 
 # A2. Run foxtrot on a disjoint training sample (~600 tiles works).
 python phase30/benchmark.py \
@@ -117,7 +111,7 @@ python phase30/benchmark.py \
     --holdout-dir data/tcd/images/data/tcd/raw \
     --output-root benchmark_results_train \
     --tiles-file phase30/train_sample_seed42.txt \
-    --df-confidence 0.0 --pred-score-thresh 0.0 --area-weight 0
+    --df-confidence 0.0 --pred-score-thresh 0.0
 
 # A3. Train a 3-CNN ensemble in a single call and save the checkpoint.
 python phase30/cnn_reranker.py \
@@ -171,7 +165,6 @@ python phase30/benchmark.py \
     --models kunqi5_epoch98.ckpt \
     --names  kunqi5_end2end \
     --output-root benchmark_results_holdout \
-    --area-weight 0 \
     --reranker-checkpoint phase30/cnn_reranker_ens3.pt
 ```
 

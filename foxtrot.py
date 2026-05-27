@@ -125,32 +125,18 @@ def compute_iou(box1, box2):
     return iou, coverage1, coverage2
 
 
-def apply_nms(bboxes, scores, iou_threshold=0.5, coverage_threshold=0.5,
-              area_weight=None):
+def apply_nms(bboxes, scores, iou_threshold=0.5, coverage_threshold=0.5):
     """
     Apply Non-Maximum Suppression to remove overlapping detections.
     Suppresses if IoU > iou_threshold OR if one box is >coverage_threshold
     covered by another (handles small boxes inside larger ones).
-
-    Sort key behaviour, controlled by area_weight:
-      • area_weight is None  → pure area sort (largest first; legacy behaviour).
-      • area_weight == 0     → pure score sort (highest first).
-      • area_weight > 0      → blended: score * (area / median_area)**area_weight.
+    Survivors are chosen highest-score-first.
     """
     if len(bboxes) == 0:
         return []
 
-    areas  = np.array([(b[2]-b[0])*(b[3]-b[1]) for b in bboxes], dtype=float)
     scores = np.asarray(scores, dtype=float)
-    if area_weight is None:
-        key = areas
-    elif area_weight == 0:
-        key = scores
-    else:
-        med = float(np.median(areas)) if areas.size else 1.0
-        med = med if med > 0 else 1.0
-        key = scores * (areas / med) ** area_weight
-    indices = np.argsort(key)[::-1].tolist()
+    indices = np.argsort(scores)[::-1].tolist()
     keep = []
 
     while indices:
@@ -969,7 +955,6 @@ def segment_trees_sam(
     containment_threshold=0.8,
     bbox_pad=0.0,
     skip_nms=False,
-    area_weight=None,
 ):
     """
     Pass 2: Run SAM segmentation on 1024px tiles with batched bboxes.
@@ -1283,7 +1268,6 @@ def segment_trees_sam(
             all_processed_scores,
             iou_threshold=0.5,
             coverage_threshold=0.5,
-            area_weight=area_weight,
         )
         removed = len(all_bboxes_loaded) - len(keep_indices)
         print(f"   Removed {removed} overlapping detections")
@@ -1874,7 +1858,6 @@ def main(args):
         print(f"\n🔄 Applying NMS to {len(all_bboxes)} detections...")
         keep_indices = apply_nms(
             all_bboxes, all_scores, iou_threshold=0.5, coverage_threshold=0.5,
-            area_weight=args.area_weight,
         )
         valid_bboxes = [all_bboxes[i] for i in keep_indices]
         valid_scores = [all_scores[i] for i in keep_indices]
@@ -1903,7 +1886,6 @@ def main(args):
         containment_threshold=0 if args.skip_nms else args.containment_threshold,
         bbox_pad=args.bbox_pad,
         skip_nms=args.skip_nms,
-        area_weight=args.area_weight,
     )
     timings["SAM"] = time.time() - sam_start
 
@@ -2189,18 +2171,6 @@ def parse_args():
         help="Expand each detection bbox by this fraction of its width/height "
              "before passing to SAM as a prompt (default 0.25 = 25%%). "
              "Helps SAM see beyond clipped detection edges. Set to 0 to disable.",
-    )
-
-    ap.add_argument(
-        "--area_weight",
-        type=float,
-        default=0,
-        help="NMS sort-key behaviour. Default 0 → pure score sort, highest "
-             "first (validated +0.089 mAP50 vs pure-area on the OAM-TCD "
-             "holdout). Set to a positive float for blended sort: "
-             "score * (area/median_area)**area_weight (e.g. 0.5 ≈ "
-             "score × sqrt(area/median)). Pass a very large value to "
-             "restore the legacy pure-area sort.",
     )
 
     ap.add_argument(

@@ -73,10 +73,6 @@ def parse_args():
                    help="DeepForest detection confidence threshold passed to foxtrot "
                         "(None → foxtrot default of 0.35). Lower it (e.g. 0.05) to "
                         "diagnose models that under-predict.")
-    p.add_argument("--area-weight", type=float, default=0,
-                   help="NMS sort blending passed to foxtrot. Default 0 → "
-                        "pure-score sort. >0 → score * (area/median)^area_weight. "
-                        "Pass a very large value to restore legacy pure-area sort.")
     p.add_argument("--df-tile-overlap", type=float, default=None,
                    help="DeepForest tile overlap fraction. None → foxtrot default (0.5).")
     p.add_argument("--bbox-pad", type=float, default=None,
@@ -132,7 +128,7 @@ def _progress_suffix(times, total):
 
 
 def run_foxtrot(model_spec, mtype, image_path, out_dir, shadow_model,
-                abs_luma_max=None, df_confidence=None, area_weight=None,
+                abs_luma_max=None, df_confidence=None,
                 df_tile_overlap=None, bbox_pad=None, skip_nms=False,
                 containment_threshold=None, poly_containment_threshold=None,
                 reranker_checkpoint=None):
@@ -147,8 +143,6 @@ def run_foxtrot(model_spec, mtype, image_path, out_dir, shadow_model,
         cmd += ["--abs_luma_max", str(abs_luma_max)]
     if df_confidence is not None:
         cmd += ["--deepforest_confidence", str(df_confidence)]
-    if area_weight is not None:
-        cmd += ["--area_weight", str(area_weight)]
     if df_tile_overlap is not None:
         cmd += ["--df_tile_overlap", str(df_tile_overlap)]
     if bbox_pad is not None:
@@ -192,7 +186,7 @@ def run_detectree2_one(image_path, out_dir):
 
 
 def run_inference(model_spec, mtype, holdout_dir, out_dir, shadow_model,
-                  abs_luma_max=None, df_confidence=None, area_weight=None,
+                  abs_luma_max=None, df_confidence=None,
                   df_tile_overlap=None, bbox_pad=None, skip_nms=False,
                   containment_threshold=None, poly_containment_threshold=None,
                   reranker_checkpoint=None,
@@ -220,7 +214,6 @@ def run_inference(model_spec, mtype, holdout_dir, out_dir, shadow_model,
             success = run_foxtrot(model_spec, mtype, tif, out_dir,
                                   shadow_model, abs_luma_max=abs_luma_max,
                                   df_confidence=df_confidence,
-                                  area_weight=area_weight,
                                   df_tile_overlap=df_tile_overlap,
                                   bbox_pad=bbox_pad,
                                   skip_nms=skip_nms,
@@ -668,7 +661,6 @@ def main():
         run_inference(spec, mtype, holdout_dir, out_dir, args.shadow_model,
                       abs_luma_max=args.abs_luma_max,
                       df_confidence=args.df_confidence,
-                      area_weight=args.area_weight,
                       df_tile_overlap=args.df_tile_overlap,
                       bbox_pad=args.bbox_pad,
                       skip_nms=args.skip_nms,
