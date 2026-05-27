@@ -7,9 +7,9 @@ Single unified metric: all GT annotations (individual trees cat=2 + canopy blobs
 are pooled together. A prediction is TP if IoP ≥ iop_thresh against any GT polygon.
 
 Supported model specifiers:
-  weecology          → weecology/deepforest NEON pretrained   (inference/predict.py → SAM polygon)
+  weecology          → weecology/deepforest NEON pretrained   (foxtrot.py → SAM polygon)
   detectree2         → Detectree2 Mask R-CNN baseline         (infer_detectree2.py → polygon)
-  <path>.pth         → ShadowConditionedDeepForest checkpoint  (inference/predict.py → SAM polygon)
+  <path>.pth         → ShadowConditionedDeepForest checkpoint  (foxtrot.py → SAM polygon)
 
 Usage:
     # Step 1: download any missing checkpoints
@@ -151,6 +151,11 @@ def parse_args():
                    help="Skip tiles that already have a geojson in the output dir")
     p.add_argument("--abs-luma-max", type=float, default=None,
                    help="Shadow map luma ceiling passed to foxtrot (None → default 71)")
+    p.add_argument("--reranker-checkpoint", default=None,
+                   help="Path to a CNN reranker checkpoint (.pt) saved by "
+                        "phase30/cnn_reranker.py --save-checkpoint.  When set, "
+                        "foxtrot's deepforest_score is replaced inline with the "
+                        "reranker's calibrated TP-probability.")
     p.add_argument("--pr-save", default="benchmark_pr_curves.png",
                    help="Path to save PR curve figure")
     return p.parse_args()
@@ -169,8 +174,9 @@ def model_type(spec):
 
 # ── Inference ─────────────────────────────────────────────────────────────────
 
-def run_foxtrot(model_spec, mtype, image_path, out_dir, shadow_model, abs_luma_max=None):
-    cmd = [sys.executable, "inference/predict.py",
+def run_foxtrot(model_spec, mtype, image_path, out_dir, shadow_model,
+                abs_luma_max=None, reranker_checkpoint=None):
+    cmd = [sys.executable, "foxtrot.py",
            "--image_path", str(image_path),
            "--output_dir", str(out_dir),
            "--shadow_model", str(shadow_model),
@@ -179,6 +185,8 @@ def run_foxtrot(model_spec, mtype, image_path, out_dir, shadow_model, abs_luma_m
         cmd += ["--deepforest_model", model_spec]
     if abs_luma_max is not None:
         cmd += ["--abs_luma_max", str(abs_luma_max)]
+    if reranker_checkpoint is not None:
+        cmd += ["--reranker_checkpoint", str(reranker_checkpoint)]
     r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if r.returncode != 0:
         print(f"      ⚠  foxtrot failed: {r.stderr[-300:]}")
@@ -220,7 +228,7 @@ def run_detectree2(tcd_dir, out_dir, skip_existing=False, tile_filter=None, num_
 
 
 def run_inference(model_spec, mtype, tcd_dir, out_dir, shadow_model, abs_luma_max=None,
-                  skip_existing=False, tile_filter=None):
+                  reranker_checkpoint=None, skip_existing=False, tile_filter=None):
     if mtype == "detectree2":
         return run_detectree2(tcd_dir, out_dir, skip_existing, tile_filter)
 
@@ -239,7 +247,9 @@ def run_inference(model_spec, mtype, tcd_dir, out_dir, shadow_model, abs_luma_ma
         if mtype == "segformer":
             success = run_segformer(tif, out_dir)
         else:
-            success = run_foxtrot(model_spec, mtype, tif, out_dir, shadow_model, abs_luma_max)
+            success = run_foxtrot(model_spec, mtype, tif, out_dir, shadow_model,
+                                  abs_luma_max=abs_luma_max,
+                                  reranker_checkpoint=reranker_checkpoint)
         print("✓" if success else "✗")
         ok += success
     if skipped:
@@ -850,6 +860,7 @@ def main():
         print(f"{'─'*60}")
         run_inference(model_spec, mtype, args.tcd_dir, out_dir, args.shadow_model,
                       abs_luma_max=args.abs_luma_max,
+                      reranker_checkpoint=args.reranker_checkpoint,
                       skip_existing=args.skip_existing,
                       tile_filter=set(args.tiles) if args.tiles else None)
 

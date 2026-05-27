@@ -9,10 +9,14 @@ Fine-tuning a DeepForest (RetinaNet) model on the [Restor TCD dataset](https://h
 | `train.py` | Training launcher — call with CSV paths and checkpoint to start training |
 | `build_phase30_csvs.py` | Streams TCD from HuggingFace → writes train/val CSVs + canopy polygons JSON |
 | `visualise_canopy_policy.py` | Renders an explainer PNG showing how the canopy policy treats ITC vs canopy anchors |
-| `evaluate.py` | Evaluates a trained checkpoint against the TCD holdout test set |
+| `evaluate.py` | Cross-biome benchmark on the OAM-TCD raw tiles (pooled IoP-AP) |
+| `benchmark.py` | Restor-reference benchmark on the OAM-TCD holdout (pycocotools mAP50) |
+| `cnn_reranker.py` | Per-polygon CNN reranker — replaces deepforest_score with a calibrated TP-probability |
+| `cnn_reranker_methodology.md` | Reranker methodology + reproducer |
 | `lib/` | Internal modules: training loop, model definition, utilities, configs |
-| `inference/predict.py` | Two-stage inference pipeline: DeepForest → SAM segmentation |
 | `requirements.txt` | All Python dependencies |
+
+Detection + SAM segmentation is provided by [`../foxtrot.py`](../foxtrot.py) at the repo root.
 
 ---
 
@@ -132,10 +136,10 @@ Writes [phase30/canopy_policy_explainer.png](phase30/canopy_policy_explainer.png
 
 ## 8. Inference
 
-Run the two-stage DeepForest → SAM pipeline on a single tile:
+Run the DeepForest → SAM pipeline on a single tile (add `--reranker_checkpoint` to also apply the CNN reranker — see section 10):
 
 ```bash
-python inference/predict.py \
+python foxtrot.py \
     --image_path /path/to/tile.tif \
     --deepforest_model /path/to/checkpoint.pth \
     --output_dir ./output
