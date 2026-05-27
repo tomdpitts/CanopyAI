@@ -54,6 +54,7 @@ models/*
 zebra*
 foxtrot_output_test_film
 *.ckpt
+*.pt
 deepforest_custom/annotation*
 checkpoints/*
 debug_vis*

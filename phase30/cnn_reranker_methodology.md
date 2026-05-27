@@ -137,7 +137,19 @@ python phase30/benchmark.py \
 ```
 
 `phase30/cnn_reranker_ens3.pt` is now a self-contained reranker
-checkpoint (~150 MB for 3 × ResNet18 state_dicts).
+checkpoint (~130 MB for 3 × ResNet18 state_dicts).
+
+**Note on checkpoint storage:** `.pt` files are gitignored (too large
+for GitHub's 100 MB hard limit, no LFS configured).  The canonical
+trained ensemble is preserved out-of-band at:
+
+```
+~/Library/Mobile Documents/com~apple~CloudDocs/canopyai_artifacts/cnn_reranker_ens3_<date>.pt
+```
+
+(iCloud Drive auto-syncs this).  Reproducing the result from scratch
+takes ~75 min on M4 Max MPS using the recipe above; the trained file
+is just a convenience to skip the retraining step.
 
 ### B. Run foxtrot end-to-end with the saved reranker
 
