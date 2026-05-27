@@ -116,7 +116,7 @@ python phase30/benchmark.py \
     --names  kunqi5_train_for_reranker \
     --holdout-dir data/tcd/images/data/tcd/raw \
     --output-root benchmark_results_train \
-    --tiles-file train_sample.txt \
+    --tiles-file phase30/train_sample_seed42.txt \
     --df-confidence 0.0 --pred-score-thresh 0.0 --area-weight 0
 
 # A3. Train a 3-CNN ensemble in a single call and save the checkpoint.
