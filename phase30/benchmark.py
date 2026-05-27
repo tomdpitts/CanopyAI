@@ -77,8 +77,26 @@ def parse_args():
                    help="NMS sort blending passed to foxtrot. Default 0 → "
                         "pure-score sort. >0 → score * (area/median)^area_weight. "
                         "Pass a very large value to restore legacy pure-area sort.")
+    p.add_argument("--df-tile-overlap", type=float, default=None,
+                   help="DeepForest tile overlap fraction. None → foxtrot default (0.5).")
+    p.add_argument("--bbox-pad", type=float, default=None,
+                   help="Pad each detection bbox by this fraction before "
+                        "passing to SAM. None → foxtrot default (0.0).")
+    p.add_argument("--skip-nms", action="store_true",
+                   help="Skip foxtrot's NMS + containment stages entirely. "
+                        "Diagnostic only — usually produces huge FP counts.")
+    p.add_argument("--containment-threshold", type=float, default=None,
+                   help="Box-level containment: drop box ≥this fraction inside "
+                        "a larger box. None → foxtrot default (0.8). 0 disables.")
+    p.add_argument("--poly-containment-threshold", type=float, default=None,
+                   help="Polygon-level containment: drop polygon ≥this fraction "
+                        "inside a larger polygon. None → foxtrot default (0.9). "
+                        "0 disables.")
     p.add_argument("--tiles", nargs="+", default=None,
                    help="Restrict to these tile stems (e.g. tcd_val_tile_0 tcd_val_tile_1).")
+    p.add_argument("--tiles-file", default=None,
+                   help="Path to a file with one tile stem per line "
+                        "(use when --tiles would be too long for the shell).")
     p.add_argument("--skip-inference", action="store_true",
                    help="Skip Step 1; only re-evaluate existing geojsons under --output-root.")
     p.add_argument("--skip-existing", action="store_true",
@@ -108,7 +126,9 @@ def _progress_suffix(times, total):
 
 
 def run_foxtrot(model_spec, mtype, image_path, out_dir, shadow_model,
-                abs_luma_max=None, df_confidence=None, area_weight=None):
+                abs_luma_max=None, df_confidence=None, area_weight=None,
+                df_tile_overlap=None, bbox_pad=None, skip_nms=False,
+                containment_threshold=None, poly_containment_threshold=None):
     cmd = [sys.executable, str(REPO_ROOT / "foxtrot.py"),
            "--image_path", str(image_path),
            "--output_dir", str(out_dir),
@@ -122,6 +142,16 @@ def run_foxtrot(model_spec, mtype, image_path, out_dir, shadow_model,
         cmd += ["--deepforest_confidence", str(df_confidence)]
     if area_weight is not None:
         cmd += ["--area_weight", str(area_weight)]
+    if df_tile_overlap is not None:
+        cmd += ["--df_tile_overlap", str(df_tile_overlap)]
+    if bbox_pad is not None:
+        cmd += ["--bbox_pad", str(bbox_pad)]
+    if skip_nms:
+        cmd += ["--skip_nms"]
+    if containment_threshold is not None:
+        cmd += ["--containment_threshold", str(containment_threshold)]
+    if poly_containment_threshold is not None:
+        cmd += ["--poly_containment_threshold", str(poly_containment_threshold)]
     r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if r.returncode != 0:
         print(f"      ⚠  foxtrot failed: {r.stderr[-300:]}")
@@ -154,6 +184,8 @@ def run_detectree2_one(image_path, out_dir):
 
 def run_inference(model_spec, mtype, holdout_dir, out_dir, shadow_model,
                   abs_luma_max=None, df_confidence=None, area_weight=None,
+                  df_tile_overlap=None, bbox_pad=None, skip_nms=False,
+                  containment_threshold=None, poly_containment_threshold=None,
                   skip_existing=False, tile_filter=None):
     tifs = sorted(Path(holdout_dir).glob("*.tif"))
     if tile_filter is not None:
@@ -178,7 +210,12 @@ def run_inference(model_spec, mtype, holdout_dir, out_dir, shadow_model,
             success = run_foxtrot(model_spec, mtype, tif, out_dir,
                                   shadow_model, abs_luma_max=abs_luma_max,
                                   df_confidence=df_confidence,
-                                  area_weight=area_weight)
+                                  area_weight=area_weight,
+                                  df_tile_overlap=df_tile_overlap,
+                                  bbox_pad=bbox_pad,
+                                  skip_nms=skip_nms,
+                                  containment_threshold=containment_threshold,
+                                  poly_containment_threshold=poly_containment_threshold)
         times.append(time.monotonic() - t0)
         print(("✓" if success else "✗") + _progress_suffix(times, len(pending)))
         ok += success
@@ -602,7 +639,12 @@ def main():
     output_root = Path(args.output_root)
     output_root.mkdir(parents=True, exist_ok=True)
 
-    tile_filter = set(args.tiles) if args.tiles else None
+    tile_filter = None
+    if args.tiles:
+        tile_filter = set(args.tiles)
+    if args.tiles_file:
+        extra = {s.strip() for s in Path(args.tiles_file).read_text().splitlines() if s.strip()}
+        tile_filter = (tile_filter | extra) if tile_filter else extra
 
     # Step 1: inference per model
     for spec, name in zip(args.models, args.names):
@@ -616,6 +658,11 @@ def main():
                       abs_luma_max=args.abs_luma_max,
                       df_confidence=args.df_confidence,
                       area_weight=args.area_weight,
+                      df_tile_overlap=args.df_tile_overlap,
+                      bbox_pad=args.bbox_pad,
+                      skip_nms=args.skip_nms,
+                      containment_threshold=args.containment_threshold,
+                      poly_containment_threshold=args.poly_containment_threshold,
                       skip_existing=args.skip_existing,
                       tile_filter=tile_filter)
 

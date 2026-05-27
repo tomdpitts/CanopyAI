@@ -156,6 +156,31 @@ python evaluate.py \
 
 ---
 
+## 10. CNN reranker (post-detection score recalibration)
+
+A per-polygon image-patch classifier that replaces the foxtrot
+`deepforest_score` with a calibrated TP-probability.  Lifts mAP50 on the
+OAM-TCD 439-tile holdout from 0.347 (score-NMS baseline) to **0.515**
+(3-CNN ensemble, strict-independent), beating Restor's Mask-RCNN R50
+reference of 0.432.  No retraining of DeepForest or SAM.
+
+Full methodology and reproducer: [cnn_reranker_methodology.md](cnn_reranker_methodology.md).
+
+```bash
+python phase30/cnn_reranker.py \
+    --src       benchmark_results_holdout/<eval-folder> \
+    --holdout-dir data/tcd/images/data/tcd/val \
+    --train-src benchmark_results_train/<train-folder> \
+    --train-holdout-dir data/tcd/images/data/tcd/raw \
+    --dst       benchmark_results_holdout/<output-folder> \
+    --epochs 8 --batch-size 128
+```
+
+Ensemble multiple runs with [ensemble_geojsons.py](ensemble_geojsons.py).
+Per-tile mAP delta diagnostics: [compare_map50.py](compare_map50.py).
+
+---
+
 ## Notes
 
 - **Batch size**: 32 is set for A100-40GB. Reduce to 16 if you OOM.

@@ -1810,6 +1810,7 @@ def main(args):
         model_path=args.deepforest_model,
         shadow_vector=shadow_vector_tensor,
         tile_size=args.df_tile_size,
+        tile_overlap=args.df_tile_overlap,
         confidence_threshold=args.deepforest_confidence,
         debug_tile_dir=str(Path(args.output_dir) / "debug_tiles") if args.debug_tiles else None,
         shadow_map_path=(
@@ -2071,6 +2072,16 @@ def parse_args():
         default=400,
         help="DeepForest tile size in pixels (default: 400). "
         "DeepForest works best at 400px tiles.",
+    )
+
+    ap.add_argument(
+        "--df_tile_overlap",
+        type=float,
+        default=0.5,
+        help="DeepForest tile overlap as a fraction of tile_size "
+             "(default: 0.5).  Higher overlap means each tree gets "
+             "proposed from more crop positions, which can lift recall "
+             "on small/edge crowns at the cost of slower inference.",
     )
 
     ap.add_argument(

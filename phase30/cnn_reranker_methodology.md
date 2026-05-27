@@ -1,0 +1,156 @@
+# CNN reranker for foxtrot — methodology
+
+## Result
+
+On the OAM-TCD 439-tile holdout, using `kunqi5_epoch98.ckpt` with no
+retraining of DeepForest or SAM:
+
+```
+                                  mAP50    AR@1000   IoU    F1     Acc
+Foxtrot baseline (legacy NMS)     0.258    0.573     0.663  0.663  0.558
++ score-based NMS                 0.347    0.589     0.658  0.656  0.548
++ 3-CNN reranker ensemble         0.515    0.589     0.658  0.656  0.548
+
+Restor Mask-RCNN R50 reference    0.432
+Theoretical ranking ceiling       0.583
+```
+
+The CNN reranker is trained on a **disjoint 600-tile sample of the
+OAM-TCD train split** and applied cold to the holdout — zero holdout
+label exposure.
+
+## Two architectural changes
+
+### 1. Score-based NMS (foxtrot pipeline)
+
+Foxtrot's NMS originally ranked candidates by bounding-box area, with
+the documented `--area_weight` flag silently ignored.  Low-confidence
+large detections were eating high-confidence small ones at every
+suppression stage.
+
+Wired `--area_weight` through to `apply_nms` and made score-first
+ordering the default:
+
+* `area_weight = 0` (default): pure-score sort
+* `area_weight > 0`: blended score × (area / median)**area_weight
+* `area_weight = +inf`: legacy pure-area sort
+
+This single change lifts mAP50 from 0.258 to 0.347.
+
+### 2. Per-polygon CNN reranker
+
+For each polygon emitted by foxtrot, classify whether it matches a
+ground-truth tree at IoU >= 0.5, and use the classifier's calibrated
+TP-probability in place of the upstream `deepforest_score`.
+
+The mAP metric integrates precision along the score-sorted ranking, so
+re-scoring the same prediction set with a better-calibrated probability
+directly improves mAP without changing recall or pixel-union metrics.
+
+#### Architecture
+
+```
+Image patch (96x96, polygon bbox + 20% padding, ImageNet-normalised)
+   |
+ResNet18 (ImageNet pretrained, fine-tuned end-to-end)
+   |
+512-d embedding
+   |
+Linear(512, 256) -> ReLU -> Dropout(0.3)
+Linear(256, 64)  -> ReLU -> Dropout(0.3)
+Linear(64, 1)
+   |
+sigmoid -> TP probability
+```
+
+#### Training
+
+* **Labels:** TP (1) iff the predicted polygon has IoU >= 0.5 with an
+  unmatched cat=2 tree GT under greedy score-sorted matching (same
+  protocol as pycocotools COCOeval).
+* **IGNORE filtering:** predictions falling inside a cat=1 canopy region
+  at IoP >= 0.5 with no tree match are **excluded** from training.  This
+  mirrors pycocotools' iscrowd ignore at eval time — without it, ~50% of
+  training rows are wrongly labelled FP.
+* **Loss:** BCE-with-logits, positive-class weight = (1 - TP_rate) / TP_rate.
+* **Optimiser:** AdamW with separate learning rates: head 1e-3, backbone 1e-4.
+* **Augmentation:** random horizontal/vertical flip + 90-degree rotation.
+* **Validation split:** 10% of training tiles held out for best-state
+  checkpointing.
+* **Epochs:** 8 (longer training overfits — best validation loss is
+  typically reached around epoch 4-7).
+
+#### Ensemble
+
+Train 3 independent runs with different random initialisations on the
+same training data.  Average the per-polygon TP-probabilities.  Gives
++0.006 mAP over the best single run.
+
+#### Disjoint train / eval
+
+The reranker is trained on a deterministic 600-tile sample of the OAM-TCD
+train split (`data/tcd/images/data/tcd/raw/`), disjoint from the 439-tile
+holdout by stem.  The trained model is then frozen and applied to the
+holdout's foxtrot predictions.  No GT labels from the holdout are ever
+visible to the CNN.
+
+## End-to-end reproducer
+
+```bash
+# 1. Run foxtrot on the holdout (produces benchmark_results_holdout/<model>/)
+python phase30/benchmark.py \
+    --models kunqi5_epoch98.ckpt \
+    --names  kunqi5_baseline \
+    --output-root benchmark_results_holdout \
+    --df-confidence 0.0 --pred-score-thresh 0.0 --area-weight 0
+
+# 2. Run foxtrot on the training-set sample (the deterministic
+#    600-tile list lives in /tmp/train_sample.txt + /tmp/train_sample_extra.txt
+#    or regenerate from the sampling script in this folder).
+python phase30/benchmark.py \
+    --models kunqi5_epoch98.ckpt \
+    --names  kunqi5_train_for_reranker \
+    --holdout-dir data/tcd/images/data/tcd/raw \
+    --output-root benchmark_results_train \
+    --tiles-file train_sample.txt \
+    --df-confidence 0.0 --pred-score-thresh 0.0 --area-weight 0
+
+# 3. Train the CNN reranker (repeat 3x with different random inits,
+#    writing to rs_cnn_run1/2/3 folders).
+python phase30/cnn_reranker.py \
+    --src       benchmark_results_holdout/kunqi5_baseline \
+    --holdout-dir data/tcd/images/data/tcd/val \
+    --train-src benchmark_results_train/kunqi5_train_for_reranker \
+    --train-holdout-dir data/tcd/images/data/tcd/raw \
+    --dst       benchmark_results_holdout/rs_cnn_run1 \
+    --epochs 8 --batch-size 128
+
+# 4. Ensemble the runs.
+python phase30/ensemble_geojsons.py \
+    --srcs benchmark_results_holdout/rs_cnn_run{1,2,3} \
+    --dst  benchmark_results_holdout/rs_cnn_ensemble \
+    --mode mean
+
+# 5. Evaluate.
+python phase30/benchmark.py \
+    --models kunqi5_epoch98.ckpt --names rs_cnn_ensemble \
+    --output-root benchmark_results_holdout \
+    --skip-inference --pred-score-thresh 0.0
+```
+
+## What this approach can and cannot do
+
+**Can:** improve the *ranking* of an existing prediction set, lifting mAP
+by re-ordering TPs above FPs.  This works because mAP integrates precision
+along the score-sorted curve, and the upstream detector's confidence
+score correlates with TP-ness but isn't optimal for it.
+
+**Cannot:** improve recall (AR@1000), pixel-union segmentation metrics
+(IoU, F1, Acc), or find trees the detector never proposed.  The CNN
+reranker is a pure rank-rescoring step on a fixed prediction set.
+
+The theoretical ceiling on mAP achievable by rescoring alone equals the
+AR@1000 of the current prediction set (in our case 0.589).  The reranker
+captures ~89% of this ceiling.  The remaining ~0.07 of headroom would
+require improving the detection / SAM stages (more recall, tighter
+polygons), which is out of scope for this work.
