@@ -214,6 +214,49 @@ harder than average).  Deltas are what generalise.
   given the threshold of "no significant complexity for 0.01 mAP that
   doesn't generalise."
 
+## Canopy augmentation (binary F1 booster, free for mAP)
+
+Foxtrot is an instance detector — it finds individual tree crowns but
+on dense uniform canopy it produces few detections, leaving canopy
+pixels uncovered.  On the OAM-TCD holdout, **86% of GT pixel area is
+canopy-only regions**, and the baseline pipeline covers only ~51% of
+those pixels.  This caps binary F1 around 0.66 even with a perfect
+tree reranker.
+
+The `phase30/canopy_augment.py` step recovers canopy pixels by running
+SAM's automatic mask generator (no prompts — samples a grid of points)
+on each tile, then filters the masks using a principled tree-density
+proxy: a SAM mask is kept iff the existing tree predictions cluster
+densely enough inside it.
+
+**Filter:** trees_inside >= max(3, mask_area / 30_000).  A small mask
+(100k px) needs 3 trees inside; a tile-spanning mask (3M px) needs 100
+trees.  This separates real canopy (dense tree clusters) from sky /
+buildings / bare ground (which have few or no tree detections).
+
+**Score:** canopy polys are written with `deepforest_score = 0.001`,
+so pycocotools sorts them to the bottom of the ranking.  They get
+IGNOREd at instance eval via the cat=1 iscrowd matching, and
+contribute pixels to the binary union via the rasterised mask.  Net
+effect: free F1 lift with **zero mAP cost**.
+
+| metric | baseline | + canopy augment | Δ |
+|---|---|---|---|
+| Macro IoU | 0.658 | 0.692 | +0.034 |
+| F1 (tree) | 0.656 | 0.714 | +0.058 |
+| Acc (tree-recall) | 0.548 | 0.687 | +0.139 |
+| mAP50 | 0.513 | **0.513** | 0.000 |
+| AR@1000 | 0.589 | 0.589 | 0.000 |
+
+Cost: ~3.5 sec per tile on CPU (SAM auto-mask requires float64 not
+supported by MPS) for SAM-B.  Adds one CLI invocation between
+`cnn_reranker.py` and `benchmark.py --skip-inference`.
+
+**Honest limit:** F1 still caps at ~0.71.  Restor SegFormer's F1=0.902
+is achievable only with a true semantic-segmentation architecture (a
+different model class entirely), not with bolt-on tricks to an
+instance detector.
+
 ## What this approach can and cannot do
 
 **Can:** improve the *ranking* of an existing prediction set, lifting mAP
