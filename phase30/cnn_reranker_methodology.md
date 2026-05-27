@@ -171,6 +171,15 @@ python phase30/benchmark.py \
 No separate post-processing step.  The output geojsons already carry
 the rescored probabilities.
 
+## Ablations recorded for the record
+
+* **ResNet50 backbone** vs ResNet18: 1-run mAP50 = 0.508 (R50) vs
+  0.507–0.509 (R18).  Indistinguishable.  ResNet50 has 2.1x the
+  parameters but the 96x96 patch is too small for the deeper feature
+  hierarchy to pay off, and the binary task doesn't need 1000-way
+  ImageNet capacity.  **Default stays at ResNet18.**
+  (`--backbone resnet50` still available for future ablations.)
+
 ## What this approach can and cannot do
 
 **Can:** improve the *ranking* of an existing prediction set, lifting mAP

@@ -244,13 +244,24 @@ class PatchDataset(Dataset):
         return t, self.labels[idx]
 
 
+BACKBONE_REGISTRY = {
+    "resnet18": (models.resnet18, models.ResNet18_Weights.DEFAULT),
+    "resnet50": (models.resnet50, models.ResNet50_Weights.DEFAULT),
+}
+
+
 class CNNReranker(nn.Module):
-    def __init__(self, dropout=0.3):
+    def __init__(self, backbone="resnet18", dropout=0.3):
         super().__init__()
-        backbone = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
-        embed_dim = backbone.fc.in_features
-        backbone.fc = nn.Identity()
-        self.backbone = backbone
+        self.backbone_name = backbone
+        if backbone not in BACKBONE_REGISTRY:
+            raise ValueError(f"Unknown backbone: {backbone!r}.  "
+                             f"Choose from {list(BACKBONE_REGISTRY)}.")
+        factory, weights = BACKBONE_REGISTRY[backbone]
+        bb = factory(weights=weights)
+        embed_dim = bb.fc.in_features
+        bb.fc = nn.Identity()
+        self.backbone = bb
         self.head = nn.Sequential(
             nn.Linear(embed_dim, 256),
             nn.ReLU(inplace=True),
@@ -296,13 +307,14 @@ class RerankerEnsemble:
     averages their per-polygon TP-probability outputs."""
 
     def __init__(self, state_dicts, device, patch_size=PATCH_SIZE,
-                 pad_frac=BBOX_PAD_FRAC):
+                 pad_frac=BBOX_PAD_FRAC, backbone="resnet18"):
         self.device = device
         self.patch_size = int(patch_size)
         self.pad_frac = float(pad_frac)
+        self.backbone = backbone
         self.models = []
         for sd in state_dicts:
-            m = CNNReranker().to(device)
+            m = CNNReranker(backbone=backbone).to(device)
             m.load_state_dict(sd)
             m.eval()
             self.models.append(m)
@@ -331,18 +343,19 @@ class RerankerEnsemble:
 
 
 def save_ensemble(state_dicts, path, patch_size=PATCH_SIZE,
-                  pad_frac=BBOX_PAD_FRAC, meta=None):
+                  pad_frac=BBOX_PAD_FRAC, backbone="resnet18", meta=None):
     """Bundle one or more model state_dicts into a single checkpoint file.
 
     Format:
         {"state_dicts": [...], "patch_size": int, "pad_frac": float,
-         "model_class": "CNNReranker", "meta": dict-or-None}
+         "backbone": str, "model_class": "CNNReranker", "meta": dict-or-None}
     """
     path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)
     torch.save({
         "state_dicts": [{k: v.cpu() for k, v in sd.items()} for sd in state_dicts],
         "patch_size": int(patch_size),
         "pad_frac": float(pad_frac),
+        "backbone": backbone,
         "model_class": "CNNReranker",
         "meta": meta or {},
     }, path)
@@ -350,7 +363,8 @@ def save_ensemble(state_dicts, path, patch_size=PATCH_SIZE,
 
 def load_ensemble(path, device):
     """Load a checkpoint saved by `save_ensemble` and return a
-    `RerankerEnsemble`."""
+    `RerankerEnsemble`.  Backwards compatible with checkpoints that
+    pre-date the multi-backbone refactor (they default to resnet18)."""
     blob = torch.load(path, map_location="cpu", weights_only=False)
     if blob.get("model_class") != "CNNReranker":
         raise ValueError(f"Checkpoint {path} has incompatible model_class "
@@ -360,6 +374,7 @@ def load_ensemble(path, device):
         device=device,
         patch_size=blob.get("patch_size", PATCH_SIZE),
         pad_frac=blob.get("pad_frac", BBOX_PAD_FRAC),
+        backbone=blob.get("backbone", "resnet18"),
     )
 
 
@@ -494,6 +509,11 @@ def main():
                          "this path (.pt).  The file is loadable via "
                          "cnn_reranker.load_ensemble() — e.g. by foxtrot.py "
                          "with --reranker_checkpoint.")
+    ap.add_argument("--backbone", choices=list(BACKBONE_REGISTRY),
+                    default="resnet18",
+                    help="CNN backbone (default: resnet18).  resnet50 is "
+                         "available for ablation but the checkpoint is "
+                         "larger and inference is slower.")
     args = ap.parse_args()
 
     device = "mps" if torch.backends.mps.is_available() else (
@@ -539,7 +559,7 @@ def main():
 
     print(f"\n=== Training ResNet18 reranker ===")
     print(f"  epochs={args.epochs}  batch_size={args.batch_size}  device={device}")
-    print(f"  n_runs={args.n_runs}")
+    print(f"  n_runs={args.n_runs}  backbone={args.backbone}")
     pos_weight = float((1 - y_train[tr_rows].mean()) / y_train[tr_rows].mean())
     print(f"  pos_weight={pos_weight:.2f}")
 
@@ -549,7 +569,7 @@ def main():
     probs_sum = np.zeros(len(eval_patches), dtype=np.float32)
     for run in range(args.n_runs):
         print(f"\n--- Run {run+1}/{args.n_runs} ---")
-        model = CNNReranker().to(device)
+        model = CNNReranker(backbone=args.backbone).to(device)
         model = train_model(model, train_loader, val_loader, device,
                             epochs=args.epochs, pos_weight=pos_weight)
         ensemble_state_dicts.append(
@@ -570,7 +590,9 @@ def main():
     if args.save_checkpoint:
         save_ensemble(ensemble_state_dicts, args.save_checkpoint,
                       patch_size=PATCH_SIZE, pad_frac=BBOX_PAD_FRAC,
+                      backbone=args.backbone,
                       meta={"epochs": args.epochs, "n_runs": args.n_runs,
+                            "backbone": args.backbone,
                             "train_src": args.train_src})
         print(f"=== Saved ensemble checkpoint -> {args.save_checkpoint} "
               f"({len(ensemble_state_dicts)} member(s)) ===")

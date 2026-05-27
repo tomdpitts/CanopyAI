@@ -94,6 +94,13 @@ def parse_args():
                         "through to foxtrot so each polygon's deepforest_score "
                         "is replaced with the reranker's TP-probability at "
                         "inference time.")
+    p.add_argument("--sam-model", default=None,
+                   choices=["vit_b", "vit_l", "vit_h"],
+                   help="SAM backbone passed to foxtrot (default: foxtrot's "
+                        "vit_b).  Pair with --sam-checkpoint.")
+    p.add_argument("--sam-checkpoint", default=None,
+                   help="Path to the SAM .pth checkpoint matching --sam-model "
+                        "(default: foxtrot's sam_vit_b_01ec64.pth).")
     p.add_argument("--tiles", nargs="+", default=None,
                    help="Restrict to these tile stems (e.g. tcd_val_tile_0 tcd_val_tile_1).")
     p.add_argument("--tiles-file", default=None,
@@ -131,7 +138,8 @@ def run_foxtrot(model_spec, mtype, image_path, out_dir, shadow_model,
                 abs_luma_max=None, df_confidence=None,
                 df_tile_overlap=None, bbox_pad=None, skip_nms=False,
                 containment_threshold=None, poly_containment_threshold=None,
-                reranker_checkpoint=None):
+                reranker_checkpoint=None,
+                sam_model=None, sam_checkpoint=None):
     cmd = [sys.executable, str(REPO_ROOT / "foxtrot.py"),
            "--image_path", str(image_path),
            "--output_dir", str(out_dir),
@@ -155,6 +163,10 @@ def run_foxtrot(model_spec, mtype, image_path, out_dir, shadow_model,
         cmd += ["--poly_containment_threshold", str(poly_containment_threshold)]
     if reranker_checkpoint is not None:
         cmd += ["--reranker_checkpoint", str(reranker_checkpoint)]
+    if sam_model is not None:
+        cmd += ["--sam_model", str(sam_model)]
+    if sam_checkpoint is not None:
+        cmd += ["--sam_checkpoint", str(sam_checkpoint)]
     r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if r.returncode != 0:
         print(f"      ⚠  foxtrot failed: {r.stderr[-300:]}")
@@ -190,6 +202,7 @@ def run_inference(model_spec, mtype, holdout_dir, out_dir, shadow_model,
                   df_tile_overlap=None, bbox_pad=None, skip_nms=False,
                   containment_threshold=None, poly_containment_threshold=None,
                   reranker_checkpoint=None,
+                  sam_model=None, sam_checkpoint=None,
                   skip_existing=False, tile_filter=None):
     tifs = sorted(Path(holdout_dir).glob("*.tif"))
     if tile_filter is not None:
@@ -219,7 +232,9 @@ def run_inference(model_spec, mtype, holdout_dir, out_dir, shadow_model,
                                   skip_nms=skip_nms,
                                   containment_threshold=containment_threshold,
                                   poly_containment_threshold=poly_containment_threshold,
-                                  reranker_checkpoint=reranker_checkpoint)
+                                  reranker_checkpoint=reranker_checkpoint,
+                                  sam_model=sam_model,
+                                  sam_checkpoint=sam_checkpoint)
         times.append(time.monotonic() - t0)
         print(("✓" if success else "✗") + _progress_suffix(times, len(pending)))
         ok += success
@@ -667,6 +682,8 @@ def main():
                       containment_threshold=args.containment_threshold,
                       poly_containment_threshold=args.poly_containment_threshold,
                       reranker_checkpoint=args.reranker_checkpoint,
+                      sam_model=args.sam_model,
+                      sam_checkpoint=args.sam_checkpoint,
                       skip_existing=args.skip_existing,
                       tile_filter=tile_filter)
 
