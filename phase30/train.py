@@ -45,6 +45,10 @@ if __name__ == "__main__":
     p.add_argument("--canopy-loss-scale", type=float, default=1.0,
                    help="Dampener for summed canopy cls contribution. "
                         "1.0 = full positive, 0.0 = iscrowd-like ignore.")
+    p.add_argument("--shadow-loss-weight", type=float, default=2.0,
+                   help="Focal-loss multiplier for shadow-casting GT anchors "
+                        "(default 2.0).  0.0 = shadow boxes ignored, 1.0 = no "
+                        "reweighting, >1 = upweight shadow boxes.")
     args = p.parse_args()
 
     train_deepforest(
@@ -58,7 +62,7 @@ if __name__ == "__main__":
         lr=args.lr,
         patience=args.patience,
         shadow_loss_reweight=True,
-        shadow_loss_weight=2.0,
+        shadow_loss_weight=args.shadow_loss_weight,
         canopy_polygons_path=args.canopy_polygons,
         canopy_loss_scale=args.canopy_loss_scale,
         augmentations=TCD_AUGMENTATIONS_COLOUR,
