@@ -112,6 +112,10 @@ def parse_args():
                    help="During inference, skip tiles whose geojson is already on disk.")
     p.add_argument("--pred-score-thresh", type=float, default=0.0,
                    help="Drop predictions below this confidence before metric computation.")
+    p.add_argument("--max-dets", type=int, default=1000,
+                   help="Detections-per-image cap for pycocotools mAP (maxDets[2] "
+                        "slice).  Default 1000.  Use 512 for an apples-to-apples "
+                        "comparison with Restor's Mask-RCNN (DETECTIONS_PER_IMAGE=512).")
     return p.parse_args()
 
 
@@ -454,10 +458,15 @@ def _eval_tile_worker(args):
 
 # ── COCO mAP50 ────────────────────────────────────────────────────────────────
 
-def _coco_map50(images, gt_anns, dets):
+def _coco_map50(images, gt_anns, dets, max_dets=1000):
     """
     Run pycocotools COCOeval segm with IoU=0.5 only.
-    Returns (mAP50, AR_at_100).  Returns (None, None) if there is no GT or dets.
+    Returns (mAP50, AR_at_maxdets).  Returns (None, None) if there is no GT or dets.
+
+    max_dets sets the detections-per-image cap (the COCOeval maxDets[2] slice
+    we read).  Default 1000.  Restor's Mask-RCNN reference uses 512
+    (DETECTIONS_PER_IMAGE=512) — set max_dets=512 for an apples-to-apples
+    comparison with their reported mAP50=43.22.
     """
     if not gt_anns or not dets:
         return None, None
@@ -479,7 +488,7 @@ def _coco_map50(images, gt_anns, dets):
 
         ev = COCOeval(coco_gt, coco_dt, iouType="segm")
         ev.params.iouThrs = np.array([0.5])
-        ev.params.maxDets = [1, 10, 1000]
+        ev.params.maxDets = [1, 10, int(max_dets)]
         ev.params.areaRng     = [[0, 1e10]]
         ev.params.areaRngLbl  = ["all"]
         ev.evaluate()
@@ -499,7 +508,8 @@ def _coco_map50(images, gt_anns, dets):
 
 # ── Evaluation orchestration ──────────────────────────────────────────────────
 
-def evaluate_model(name, out_dir, holdout_dir, score_thresh, tile_filter=None):
+def evaluate_model(name, out_dir, holdout_dir, score_thresh, tile_filter=None,
+                   max_dets=1000):
     holdout_dir = Path(holdout_dir)
     out_dir = Path(out_dir)
     metas = sorted(holdout_dir.glob("*_meta.json"))
@@ -570,7 +580,7 @@ def evaluate_model(name, out_dir, holdout_dir, score_thresh, tile_filter=None):
     n_pred_total = sum(r["n_pred"] for r in results)
     n_gt_tree    = sum(r["n_gt_tree"] for r in results)
 
-    map50, ar = _coco_map50(images, gt_anns, dets)
+    map50, ar = _coco_map50(images, gt_anns, dets, max_dets=max_dets)
 
     return {
         "n_tiles": len(results),
@@ -693,7 +703,8 @@ def main():
         out_dir = output_root / name
         print(f"\n  Evaluating {name} ...")
         res = evaluate_model(name, out_dir, holdout_dir,
-                             args.pred_score_thresh, tile_filter=tile_filter)
+                             args.pred_score_thresh, tile_filter=tile_filter,
+                             max_dets=args.max_dets)
         all_results[name] = res
         if res is not None:
             save_tile_csv(name, res["per_tile"],
