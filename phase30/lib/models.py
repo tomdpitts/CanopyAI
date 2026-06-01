@@ -557,32 +557,45 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
                     )
                     if integral_stack is not None:
                         # Anchor qualifies as canopy-positive iff its own-area
-                        # share inside a single polygon clears iop_thr — taken
-                        # as the max IoP across per-polygon masks (computed in
-                        # one batched kernel from the stacked integral images).
-                        integral_stack_t = torch.from_numpy(integral_stack).to(device)
+                        # share inside a single polygon clears iop_thr — the max
+                        # IoP across per-polygon integral images.
+                        #
+                        # This whole determination is non-differentiable label
+                        # assignment, so it runs on CPU — and that is essential,
+                        # not incidental.  The IoP kernel's (P, N) shape carries a
+                        # data-dependent P (polygons-per-tile) and the NMS-pool
+                        # gather is data-dependent too; on MPS every new shape
+                        # forces a fresh Metal graph compile + cache entry,
+                        # leaking unified memory until jetsam.  CPU torch is eager
+                        # (no per-shape compilation), and only the final
+                        # fixed-shape (N,) masks cross back to the device.
+                        anchors_cpu = anchors_per_image.detach().to("cpu")
+                        fg_cpu      = foreground_idxs.detach().to("cpu")
+                        integral_stack_t = torch.from_numpy(integral_stack)   # stays on CPU
                         max_iop = model_ref._anchor_max_iop_from_stack(
-                            anchors_per_image, integral_stack_t, post_h, post_w
+                            anchors_cpu, integral_stack_t, post_h, post_w
                         )
-                        canopy_raw_mask = max_iop >= iop_thr
+                        raw_cpu = max_iop >= iop_thr
+                        pos_cpu = torch.zeros_like(raw_cpu)
+                        sup_cpu = torch.zeros_like(raw_cpu)
 
                         # Size-aware IoSmaller suppression: keep the largest
                         # anchor in each overlap cluster, suppress smaller
                         # redundants.  GT-matched anchors stay out of the pool
                         # so labelled ITCs keep their fg supervision.
-                        nms_pool = canopy_raw_mask & ~foreground_idxs
+                        nms_pool = raw_cpu & ~fg_cpu
                         if nms_pool.any():
                             pool_idx   = nms_pool.nonzero(as_tuple=True)[0]
-                            pool_boxes = anchors_per_image[pool_idx]
+                            pool_boxes = anchors_cpu[pool_idx]
                             keep_in_pool = model_ref._ios_greedy_suppress(
                                 pool_boxes, model_ref.CANOPY_NMS_IOU
                             )
-                            survivors = torch.zeros_like(canopy_raw_mask)
-                            survivors[pool_idx[keep_in_pool]] = True
-                            canopy_positive_mask   = survivors
-                            canopy_suppressed_mask = (
-                                canopy_raw_mask & ~foreground_idxs & ~survivors
-                            )
+                            pos_cpu[pool_idx[keep_in_pool]] = True
+                            sup_cpu = raw_cpu & ~fg_cpu & ~pos_cpu
+
+                        canopy_raw_mask        = raw_cpu.to(device)
+                        canopy_positive_mask   = pos_cpu.to(device)
+                        canopy_suppressed_mask = sup_cpu.to(device)
 
                 diag_n_anchors    += N_anchors
                 diag_n_canopy_raw += int(canopy_raw_mask.sum().item())
@@ -614,41 +627,56 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
                 if canopy_positive_mask.any() and not canopy_acts_as_ignore:
                     gt_classes_target[canopy_positive_mask, 0] = 1.0
 
+                # Dense focal loss over ALL anchors → fixed shape (N, C), then
+                # masked to zero outside effective_valid.  This is exactly equal
+                # to gathering cls_logits[effective_valid] first: the masked-out
+                # terms contribute 0 to the sum and carry 0 gradient.  But the
+                # tensor shape is now CONSTANT across tiles, so MPS compiles the
+                # loss graph once instead of recompiling per data-dependent
+                # valid-anchor count (the count swings because canopy suppression
+                # removes a variable number of anchors → the MPS graph-cache leak).
+                valid_f = effective_valid.to(cls_logits_per_image.dtype)   # (N,)
                 per_anchor_loss = sigmoid_focal_loss(
-                    cls_logits_per_image[effective_valid],
-                    gt_classes_target[effective_valid],
+                    cls_logits_per_image,
+                    gt_classes_target,
                     reduction="none",
-                ).sum(dim=-1)
+                ).sum(dim=-1) * valid_f                                     # (N,)
 
-                anchor_weights = torch.ones_like(per_anchor_loss)
+                anchor_weights = torch.ones_like(per_anchor_loss)          # (N,)
 
-                # Shadow weights for foreground anchors
+                # Shadow weights for foreground anchors.  All GT-matched anchors
+                # are in effective_valid (foreground ⊆ valid, never suppressed),
+                # so weighting them full-length is exact.  No variable gather.
                 if shadow_gt_weights is not None and img_idx < len(shadow_gt_weights):
-                    w           = shadow_gt_weights[img_idx].to(device)
-                    fg_in_valid = foreground_idxs[effective_valid]
-                    matched_gt  = matched_idxs_per_image[effective_valid][fg_in_valid]
-                    valid_match = matched_gt < len(w)
-                    fg_valid_pos = fg_in_valid.nonzero(as_tuple=True)[0]
-                    anchor_weights[fg_valid_pos[valid_match]] = w[matched_gt[valid_match]]
+                    w = shadow_gt_weights[img_idx].to(device)
+                    if len(w) > 0:
+                        matched_gt = matched_idxs_per_image.clamp(min=0)   # (N,)
+                        in_range   = foreground_idxs & (matched_gt < len(w))
+                        gathered   = w[matched_gt.clamp(max=len(w) - 1)]   # (N,)
+                        anchor_weights = torch.where(in_range, gathered, anchor_weights)
+
+                weighted = per_anchor_loss * anchor_weights                # (N,)
 
                 # Canopy contribution can be dampened by canopy_loss_scale (≤1.0)
                 # to stop large polygons from outvoting ITC anchors.
                 if canopy_acts_as_ignore:
                     n_canopy_pos = 0  # excluded from both numerator and denominator
-                    total_loss   = (per_anchor_loss * anchor_weights).sum()
+                    total_loss   = weighted.sum()
                 else:
-                    positive_in_valid = canopy_positive_mask[effective_valid]
+                    positive_in_valid = canopy_positive_mask & effective_valid
                     n_canopy_pos      = int(positive_in_valid.sum().item())
 
                     if n_canopy_pos > 0 and model_ref.canopy_loss_scale != 1.0:
-                        non_canopy = ~positive_in_valid
-                        non_canopy_sum = (per_anchor_loss[non_canopy] *
-                                          anchor_weights[non_canopy]).sum()
-                        canopy_sum     = (per_anchor_loss[positive_in_valid] *
-                                          anchor_weights[positive_in_valid]).sum()
-                        total_loss = non_canopy_sum + canopy_sum * model_ref.canopy_loss_scale
+                        # Scale only the canopy-positive anchors' loss; ×1 elsewhere
+                        # (masked-out anchors are already 0, so ×1 keeps them 0).
+                        scale_vec = torch.where(
+                            positive_in_valid,
+                            weighted.new_full((), model_ref.canopy_loss_scale),
+                            weighted.new_ones(()),
+                        )
+                        total_loss = (weighted * scale_vec).sum()
                     else:
-                        total_loss = (per_anchor_loss * anchor_weights).sum()
+                        total_loss = weighted.sum()
 
                 norm = max(1, num_foreground + n_canopy_pos)
                 cls_losses.append(total_loss / norm)
