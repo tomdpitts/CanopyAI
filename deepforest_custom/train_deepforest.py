@@ -12,8 +12,14 @@ On Modal:
 """
 
 import argparse
+import os
 import sys
 from pathlib import Path
+
+# DataLoader worker count — env-overridable.  Default 8 (cluster/CUDA), but on
+# macOS num_workers=8 + persistent workers exhausts file descriptors ("Bad file
+# descriptor" / Abort trap: 6), so set DF_NUM_WORKERS=0 to load in-process.
+_NW = int(os.environ.get("DF_NUM_WORKERS", "8"))
 
 # Ensure project root is on sys.path so utils.py is importable when this
 # script is run directly (e.g. python deepforest_custom/train_deepforest.py)
@@ -827,9 +833,9 @@ def train_deepforest(
                 batch_size=dl.batch_size,
                 shuffle=True,
                 collate_fn=ds.collate_fn,
-                num_workers=8,
+                num_workers=_NW,
                 pin_memory=pin_memory,
-                persistent_workers=True,
+                persistent_workers=(_NW > 0),
             )
 
         model.train_dataloader = types.MethodType(_train_dataloader_with_empties, model)
@@ -875,9 +881,9 @@ def train_deepforest(
                     batch_size=dl.batch_size,
                     shuffle=False,
                     collate_fn=ds.collate_fn,
-                    num_workers=8,
+                    num_workers=_NW,
                     pin_memory=pin_memory,
-                    persistent_workers=True,
+                    persistent_workers=(_NW > 0),
                 )
 
             model.val_dataloader = types.MethodType(_val_dataloader_with_empties, model)
@@ -891,7 +897,7 @@ def train_deepforest(
                 tiled_ds = _SingleCropValDataset(dl.dataset, patch_size=CROP_SIZE, min_visibility=MIN_VIS)
                 return DataLoader(tiled_ds, batch_size=dl.batch_size, shuffle=False,
                                   collate_fn=dl.dataset.collate_fn,
-                                  num_workers=8, pin_memory=pin_memory, persistent_workers=True)
+                                  num_workers=_NW, pin_memory=pin_memory, persistent_workers=(_NW > 0))
             model.val_dataloader = types.MethodType(_val_dataloader_tiled, model)
 
         print(f"\n📊 Loading validation data from {val_csv}...")

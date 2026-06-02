@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -826,6 +827,18 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
                         if sm_np[y0c:y1c, x0c:x1c].max() >= self._SLR_SHADOW_THRESH:
                             weights[i] = self.shadow_loss_weight
                             break   # one hit is enough
+
+            # Negative control (SHADOW_BLIND_CONTROL=1): keep the same NUMBER of
+            # upweighted boxes per image as the shadow logic selected, but choose
+            # them at RANDOM (shadow-blind).  If this reproduces the shadow gain,
+            # the effect is generic hard-example upweighting, not shadow-specific.
+            if os.environ.get("SHADOW_BLIND_CONTROL") == "1":
+                k = int((weights != 1.0).sum().item())
+                weights = torch.ones(N_gt, dtype=torch.float32)
+                if k > 0:
+                    idx = np.random.default_rng().choice(N_gt, size=min(k, N_gt),
+                                                         replace=False)
+                    weights[idx] = self.shadow_loss_weight
 
             result.append(weights)
         return result

@@ -80,6 +80,10 @@ Prediction_*.json
 *val.csv
 phase30/phase30_tcd_canopy_polygons.json
 phase30/debug
+phase30/shadow_eval
+phase30/zeroshot/*_filt.csv
+phase30/zeroshot/*.log
+
 
 benchmark_results/*
 benchmark_results_holdout/*
