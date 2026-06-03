@@ -537,6 +537,11 @@ def train_deepforest(
     BBOX_PARAMS = A.BboxParams(format="pascal_voc", label_fields=["category_ids"],
                                clip=True, min_visibility=MIN_VIS)
     crop_t      = A.RandomCrop(height=CROP_SIZE, width=CROP_SIZE, p=1.0)
+    # Some BRU/WON/NEON tiles are smaller than the crop in a dimension (e.g. 200×400);
+    # pad up to the crop size first so RandomCrop never raises CropSizeError. No-op for
+    # the all-400 TCD tiles. Black constant pad — avoids reflecting fake crowns.
+    pad_t       = A.PadIfNeeded(min_height=CROP_SIZE, min_width=CROP_SIZE,
+                                border_mode=0, fill=0, p=1.0)
 
     # Spatial augmentations are not safe when canopy is enabled because the
     # _CanopyAwareTrainDataset wrapper performs its own crop and stores polygon
@@ -556,7 +561,7 @@ def train_deepforest(
             cls    = getattr(A, name, None)
             if cls is not None:
                 aug_list.append(cls(**params) if params else cls())
-        prefix = [crop_t] if include_crop else []
+        prefix = [pad_t, crop_t] if include_crop else []
         return A.Compose(prefix + aug_list + [ToTensorV2()], bbox_params=BBOX_PARAMS)
 
     if augmentations is not None:
@@ -730,6 +735,11 @@ def train_deepforest(
     if val_csv:
         callbacks.append(EarlyStopping(
             monitor=_monitor, patience=patience, mode="max", verbose=True,
+            # Without min_delta (=0.0) any +1e-4 wiggle on a plateau resets patience
+            # and the run never stops (tcd_s4 ran to ep96 flat at 0.412). Require a
+            # real gain to count as improvement. ModelCheckpoint still saves the true
+            # best, so this only changes WHEN we stop, not WHICH ckpt is kept.
+            min_delta=0.002,
         ))
 
     class MetrixPrinter(pl.Callback):

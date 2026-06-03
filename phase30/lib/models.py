@@ -154,7 +154,7 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
 
     def _compute_shadow_map(self, img_t, shadow_vector):
         """Compute shadow probability map for one [3,H,W] float tensor. Returns [1,H,W]."""
-        img_np    = (img_t.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+        img_np    = (img_t.permute(1, 2, 0).float().cpu().numpy() * 255).astype(np.uint8)
         angle_deg = float(np.degrees(np.arctan2(float(shadow_vector[0]), float(shadow_vector[1]))))
         shadow_np = generate_shadow_map(img_np, angle_deg)
         return torch.from_numpy(shadow_np).unsqueeze(0)   # [1, H, W]
@@ -195,13 +195,14 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
             sdy = -float(sv[1])
 
             shadow_t = self._compute_shadow_map(img_t, sv)
-            sm_np    = shadow_t[0].cpu().numpy()
+            sm_np    = shadow_t[0].float().cpu().numpy()
             H, W     = sm_np.shape
 
-            cx = ((boxes[:, 0] + boxes[:, 2]) / 2).cpu().numpy()
-            cy = ((boxes[:, 1] + boxes[:, 3]) / 2).cpu().numpy()
-            bw = (boxes[:, 2] - boxes[:, 0]).cpu().numpy()
-            bh = (boxes[:, 3] - boxes[:, 1]).cpu().numpy()
+            # .float() guards against bf16-mixed autocast — numpy has no bfloat16
+            cx = ((boxes[:, 0] + boxes[:, 2]) / 2).float().cpu().numpy()
+            cy = ((boxes[:, 1] + boxes[:, 3]) / 2).float().cpu().numpy()
+            bw = (boxes[:, 2] - boxes[:, 0]).float().cpu().numpy()
+            bh = (boxes[:, 3] - boxes[:, 1]).float().cpu().numpy()
 
             r = self._SLR_PROBE_RADIUS
             for i in range(N_gt):
@@ -310,7 +311,7 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
             return boxes.new_zeros(0, dtype=torch.long)
 
         device = boxes.device
-        boxes_np = boxes.detach().cpu().numpy()
+        boxes_np = boxes.detach().float().cpu().numpy()   # .float(): numpy has no bf16
         areas_np = (
             np.clip(boxes_np[:, 2] - boxes_np[:, 0], 1.0, None)
             * np.clip(boxes_np[:, 3] - boxes_np[:, 1], 1.0, None)
@@ -815,7 +816,13 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
         it any more (LR scheduler now monitors train_loss_epoch; EarlyStopping
         and ModelCheckpoint both monitor map).  Skipping it ~halves val cost.
         """
+        # bf16-mixed autocast makes predictions bf16, which DeepForest's
+        # format_boxes / torchmetrics convert via .numpy() — numpy has no bfloat16.
+        # Validation is cheap and infrequent; run it in fp32 (autocast off on CUDA).
         if not self.canopy_enabled:
+            if self.device.type == "cuda":
+                with torch.autocast("cuda", enabled=False):
+                    return super().validation_step(batch, batch_idx)
             return super().validation_step(batch, batch_idx)
 
         from torchvision.ops import box_iou
@@ -823,10 +830,14 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
 
         images, targets, image_names = batch
 
-        # Prediction pass (eval-mode forward).
+        # Prediction pass (eval-mode forward) — fp32, see note above.
         self.model.eval()
         with torch.no_grad():
-            preds = self.model.forward(images, targets)
+            if self.device.type == "cuda":
+                with torch.autocast("cuda", enabled=False):
+                    preds = self.model.forward(images, targets)
+            else:
+                preds = self.model.forward(images, targets)
 
         # Filter predictions: drop in-canopy detections with no ITC GT match.
         iop_thr = self.CANOPY_IOP_THRESH

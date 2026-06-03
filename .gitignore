@@ -87,4 +87,5 @@ phase30/zeroshot/*.log
 
 benchmark_results/*
 benchmark_results_holdout/*
-benchmark_results_train/*
+benchmark_results_train/*phase30/modal/data_csvs/
+phase30/modal/__pycache__/
