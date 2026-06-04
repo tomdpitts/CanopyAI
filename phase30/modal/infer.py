@@ -10,12 +10,13 @@ Examples
     # one-time: pull SAM weights onto the checkpoints volume
     modal run phase30/modal/infer.py::download_sam --variant vit_h
 
-    # full 0.515-style pipeline (vit_h + reranker) on two trained runs
+    # full 0.515-style pipeline (vit_h + reranker) on trained runs
+    #   modal bool flags: --reranker / --no-reranker  (NOT --reranker true)
     modal run --detach phase30/modal/infer.py \
-        --models comb_s2,bwn_s4 --sam vit_h --reranker true --names comb_s2_full,bwn_s4_full
+        --models ablation_tcd_s4,ablation_tcd_s2 --sam vit_h --reranker --names s4,s2
 
     # reranker-off ablation
-    modal run --detach phase30/modal/infer.py --models comb_s2 --sam vit_h --reranker false
+    modal run --detach phase30/modal/infer.py --models ablation_tcd_s4 --sam vit_h --no-reranker
 
     # pull results
     modal volume get canopyai-benchmark-results /comb_s2_full benchmark_results_holdout/comb_s2_full
@@ -75,7 +76,7 @@ def download_sam(variant: str = "vit_h"):
 def benchmark(models: str, sam: str = "vit_h", reranker: bool = True,
               names: str = None, df_confidence: float = 0.05,
               max_dets: int = 512, pred_score_thresh: float = 0.0,
-              holdout_dir: str = "/data/holdout"):
+              holdout_dir: str = "/data/holdout", tiles: str = None):
     import os, glob, subprocess, sys
     os.chdir("/root/canopyAI")
 
@@ -103,6 +104,8 @@ def benchmark(models: str, sam: str = "vit_h", reranker: bool = True,
            "--holdout-dir", holdout_dir, "--output-root", "/results"]
     if reranker:
         cmd += ["--reranker-checkpoint", "/checkpoints/cnn_reranker_ens3.pt"]
+    if tiles:                       # restrict to a few tile stems (eval smoke)
+        cmd += ["--tiles", *tiles.split()]
     print("RUN:", " ".join(cmd), flush=True)
     subprocess.run(cmd, check=True)
     res_vol.commit()
@@ -110,7 +113,8 @@ def benchmark(models: str, sam: str = "vit_h", reranker: bool = True,
 
 @app.local_entrypoint()
 def main(models: str, sam: str = "vit_h", reranker: bool = True, names: str = None,
-         df_confidence: float = 0.05, max_dets: int = 512, pred_score_thresh: float = 0.0):
+         df_confidence: float = 0.05, max_dets: int = 512, pred_score_thresh: float = 0.0,
+         tiles: str = None):
     benchmark.remote(models=models, sam=sam, reranker=reranker, names=names,
                      df_confidence=df_confidence, max_dets=max_dets,
-                     pred_score_thresh=pred_score_thresh)
+                     pred_score_thresh=pred_score_thresh, tiles=tiles)

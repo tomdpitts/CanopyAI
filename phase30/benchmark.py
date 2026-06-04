@@ -112,10 +112,10 @@ def parse_args():
                    help="During inference, skip tiles whose geojson is already on disk.")
     p.add_argument("--pred-score-thresh", type=float, default=0.0,
                    help="Drop predictions below this confidence before metric computation.")
-    p.add_argument("--max-dets", type=int, default=1000,
+    p.add_argument("--max-dets", type=int, default=512,
                    help="Detections-per-image cap for pycocotools mAP (maxDets[2] "
-                        "slice).  Default 1000.  Use 512 for an apples-to-apples "
-                        "comparison with Restor's Mask-RCNN (DETECTIONS_PER_IMAGE=512).")
+                        "slice).  Default 512 to match Restor's Mask-RCNN "
+                        "(DETECTIONS_PER_IMAGE=512 / paper: 'increased predictions to 512').")
     return p.parse_args()
 
 

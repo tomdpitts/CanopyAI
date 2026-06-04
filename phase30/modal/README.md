@@ -57,11 +57,12 @@ other two start immediately. See `ablation_grid.sh` for the exact commands.
 bash phase30/modal/ablation_grid.sh        # prints/launches the 4 trains in dependency order
 ```
 
-**6. Evaluate** (vit_h + reranker = the 0.515 pipeline; flip `--reranker false` for the ablation):
+**6. Evaluate** (vit_h + reranker = the 0.515 pipeline; use `--no-reranker` for the ablation).
+Note modal bool flags: `--reranker` / `--no-reranker` (NOT `--reranker true`):
 ```bash
 modal run --detach phase30/modal/infer.py \
   --models phase21_baseline,ablation_pre_s2,phase22_B_L4,ablation_tcd_s0,ablation_tcd_s2,ablation_tcd_s4 \
-  --sam vit_h --reranker true
+  --sam vit_h --reranker
 modal volume get canopyai-benchmark-results /<name> benchmark_results_holdout/<name>
 ```
 
