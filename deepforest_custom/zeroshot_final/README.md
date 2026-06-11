@@ -89,9 +89,17 @@ caffeinate -i ./venv310/bin/python phase30/benchmark.py \
   --holdout-dir data/tcd/images/data/tcd/val \
   --shadow-model solar/shadow_regression/output/shadow_model_combined_best.pth \
   --sam-model vit_l --sam-checkpoint sam_vit_l_0b3195.pth \
-  --df-confidence 0.001 --max-dets 512 --pred-score-thresh 0.0 \
+  --df-confidence 0.001 --max-dets 512 --max-boxes-sam 512 --pred-score-thresh 0.0 \
   --skip-existing --output-root benchmark_results_holdout
 ```
+- **`--max-boxes-sam 512` is REQUIRED for feasibility.** At `--df-confidence 0.001` DeepForest
+  emits ~1000 boxes/tile and SAM (~0.6 s/box) made eval ~8 min/tile (infeasible). Capping to the
+  top-512 by score before SAM is lossless for mAP (pycocotools maxDets=512) and cuts it to
+  ~40 s/tile. Drops only the low-confidence tail.
+- **SAM vit_l confirmed by test (2026-06-12).** Head-to-head on s4 (24 tiles, capped): vit_l vs
+  vit_h identical within noise (all metric deltas <0.005, vit_h marginally *worse*). So vit_l —
+  3× faster, same numbers. This also makes the fine-tuned Section-B vit_h vs zero-shot vit_l
+  difference immaterial (the SAMs are empirically equivalent).
 - **Scorer: `phase30/benchmark.py`, NOT `benchmark_tcd.py`.** Decided 2026-06-11. The paper's
   contribution is competitiveness vs SOTA (Restor, detectree2), so we report Restor Table-1 metrics:
   pycocotools mAP50 (tree, canopy=iscrowd) + micro-pixel IoU/F1/Acc. The older `benchmark_tcd.py`
