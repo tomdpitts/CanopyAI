@@ -839,6 +839,18 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
                     idx = np.random.default_rng().choice(N_gt, size=min(k, N_gt),
                                                          replace=False)
                     weights[idx] = self.shadow_loss_weight
+                # One-time provenance line: confirm the random-reweight branch
+                # actually fired (and upweighted the SAME count the shadow logic
+                # chose), so a blind run is verifiable from its log — not a silent
+                # no-op. Mirrors phase30/lib/models.py.
+                if not getattr(self, "_blind_control_announced", False):
+                    import sys as _sys
+                    n_up = int((weights != 1.0).sum().item())
+                    print(f"   🎲 SHADOW_BLIND_CONTROL active: random reweight branch "
+                          f"taken (shadow-selected k={k}, randomly upweighted={n_up}/"
+                          f"{N_gt} boxes @ weight={self.shadow_loss_weight}x)",
+                          file=_sys.stderr, flush=True)
+                    self._blind_control_announced = True
 
             result.append(weights)
         return result
