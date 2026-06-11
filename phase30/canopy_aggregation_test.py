@@ -50,6 +50,7 @@ Usage
 
 import io
 import json
+import os
 import sys
 import time
 from contextlib import redirect_stdout
@@ -67,12 +68,15 @@ sys.path.insert(0, str(REPO_ROOT))
 import benchmark as B  # noqa: E402  (phase30/benchmark.py)
 
 HOLDOUT_DIR = REPO_ROOT / "data" / "tcd" / "images" / "data" / "tcd" / "val"
-PRED_DIR = REPO_ROOT / "benchmark_results_holdout" / "ablation_tcd_s0"
+# Model selected via env var so ProcessPoolExecutor (spawn) workers, which
+# re-import this module, all agree on the same prediction dir.
+AGG_MODEL = os.environ.get("AGG_MODEL", "ablation_tcd_s0")
+PRED_DIR = REPO_ROOT / "benchmark_results_holdout" / AGG_MODEL
 
 # Category ids exactly as in the OAM-TCD GT.
 CAT_CANOPY = 1
 CAT_TREE = 2
-TREE_ONLY_REFERENCE = 0.535
+TREE_ONLY_REFERENCE = float(os.environ.get("AGG_TREE_REF", "0.535"))
 RESTOR_2CAT = 0.432
 
 MAX_DETS = 512
@@ -424,7 +428,7 @@ def main():
             for (T, tree_ap, canopy_ap, mean_ap, n_canopy_dets) in table_rows
         },
     }
-    out_path = REPO_ROOT / "benchmark_results_holdout" / "canopy_aggregation_oracle.json"
+    out_path = REPO_ROOT / "benchmark_results_holdout" / f"canopy_aggregation_oracle_{AGG_MODEL}.json"
     with open(out_path, "w") as f:
         json.dump(summary, f, indent=2)
     print(f"\nSaved: {out_path}")
