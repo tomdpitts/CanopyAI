@@ -11,6 +11,9 @@ eval2
 __pycache__
 archive*
 
+# Large result dirs (predictions/checkpoints — regenerable, provenance via _run.json)
+benchmark_results_stock_detectron2/
+
 # Docker/Singularity images (large binary files)
 *.tar.gz
 *.sif
@@ -89,5 +92,10 @@ benchmark_results/*
 benchmark_results_holdout/*
 benchmark_results_holdout_noRR/*
 benchmark_results_train/*
+benchmark_results_restor/*
+benchmark_results_restor_tta/*
+benchmark_results_blind_*/
+benchmark_results_noRR_*/
+benchmark_results_tta_*/
 phase30/modal/data_csvs/
 phase30/modal/__pycache__/
