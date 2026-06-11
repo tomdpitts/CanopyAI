@@ -668,10 +668,40 @@ def save_tile_csv(name, per_tile, out_path):
     print(f"  📊 per-tile CSV: {out_path}")
 
 
-def _write_run_provenance(out_dir, args, model_spec, name):
-    """Drop a _run.json beside each model's predictions so the EXACT pipeline that
-    produced them is never lost (SAM model, reranker, score thresholds, git SHA)."""
-    import subprocess, datetime
+def _now_iso():
+    """Current local datetime, ISO-8601 with explicit UTC offset."""
+    import datetime
+    return datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _metrics_block(r):
+    if r is None:
+        return None
+    return {
+        "n_tiles":  r["n_tiles"],
+        "n_gt_tree": r["n_gt_tree"],
+        "n_pred":   r["n_pred"],
+        "tp": r["tp"], "fp": r["fp"], "fn": r["fn"], "tn": r["tn"],
+        "macro_iou":   r["macro_iou"],
+        "f1_tree":     r["f1_tree"],
+        "tree_recall": r["tree_recall"],
+        "iou_tree":    r["iou_tree"],
+        "iou_bg":      r["iou_bg"],
+        "pixel_acc":   r["pixel_acc"],
+        "map50":   r["map50"],   "ar1000": r["ar1000"],
+    }
+
+
+def _write_summary_provenance(out_dir, args, model_spec, name,
+                              started, ended=None, results=None):
+    """Write summary.json beside the model's geojsons so the EXACT pipeline that
+    produced them is never lost: FULL resolved args (SAM model, reranker, score
+    thresholds, ...), the scored results, start/end datetimes (ISO-8601 with
+    timezone) and git SHA.  Written provisionally right after inference
+    (results/ended pending) and finalised after scoring, so provenance survives
+    a crash in between.  A --skip-inference rescore goes to summary_rescore.json
+    instead — it must never overwrite the record of how the geojsons were made."""
+    import subprocess
     try:
         sha = subprocess.check_output(
             ["git", "rev-parse", "--short", "HEAD"],
@@ -679,27 +709,23 @@ def _write_run_provenance(out_dir, args, model_spec, name):
             stderr=subprocess.DEVNULL).decode().strip()
     except Exception:
         sha = "unknown"
-    prov = {
+    doc = {
         "name": name,
         "model": str(model_spec),
-        "generated_utc": datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "started": started,
+        "ended": ended,
         "git_sha": sha,
         "argv": sys.argv,
-        "config": {
-            "sam_model": args.sam_model, "sam_checkpoint": args.sam_checkpoint,
-            "df_confidence": args.df_confidence,
-            "reranker_checkpoint": args.reranker_checkpoint,
-            "pred_score_thresh": args.pred_score_thresh, "max_dets": args.max_dets,
-            "bbox_pad": args.bbox_pad, "df_tile_overlap": args.df_tile_overlap,
-            "df_tta": args.df_tta, "df_tta_scales": args.df_tta_scales,
-            "holdout_dir": str(args.holdout_dir),
-        },
+        "args": vars(args),
+        "results": results,
     }
+    fname = "summary_rescore.json" if args.skip_inference else "summary.json"
+    path = Path(out_dir) / fname
     try:
-        (Path(out_dir) / "_run.json").write_text(json.dumps(prov, indent=2))
-        print(f"  🧾 provenance: {Path(out_dir) / '_run.json'}")
+        path.write_text(json.dumps(doc, indent=2, default=str))
+        print(f"  🧾 provenance: {path}")
     except Exception as e:
-        print(f"  ⚠️  could not write _run.json: {e}")
+        print(f"  ⚠️  could not write {fname}: {e}")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -724,10 +750,12 @@ def main():
         tile_filter = (tile_filter | extra) if tile_filter else extra
 
     # Step 1: inference per model
+    started_at = {}  # name -> ISO start time (inference start, or eval start under --skip-inference)
     for spec, name in zip(args.models, args.names):
         mtype = model_type(spec)
         out_dir = output_root / name
         out_dir.mkdir(exist_ok=True)
+        started_at[name] = _now_iso()
         if args.skip_inference:
             continue
         print(f"\n{'─'*60}\n  Inference: {name}  [{mtype}]\n{'─'*60}")
@@ -745,7 +773,8 @@ def main():
                       skip_existing=args.skip_existing,
                       tile_filter=tile_filter,
                       df_tta=args.df_tta, df_tta_scales=args.df_tta_scales)
-        _write_run_provenance(out_dir, args, spec, name)
+        # provisional provenance (results pending) — survives a crash during scoring
+        _write_summary_provenance(out_dir, args, spec, name, started_at[name])
 
     # Step 2: evaluation
     all_results = {}
@@ -756,6 +785,9 @@ def main():
                              args.pred_score_thresh, tile_filter=tile_filter,
                              max_dets=args.max_dets)
         all_results[name] = res
+        _write_summary_provenance(out_dir, args, spec, name, started_at[name],
+                                  ended=_now_iso(),
+                                  results={name: _metrics_block(res)})
         if res is not None:
             save_tile_csv(name, res["per_tile"],
                           output_root / f"{name}_holdout_tiles.csv")
@@ -768,22 +800,7 @@ def main():
 
     summary = {
         "args": vars(args),
-        "results": {
-            name: (None if r is None else {
-                "n_tiles":  r["n_tiles"],
-                "n_gt_tree": r["n_gt_tree"],
-                "n_pred":   r["n_pred"],
-                "tp": r["tp"], "fp": r["fp"], "fn": r["fn"], "tn": r["tn"],
-                "macro_iou":   r["macro_iou"],
-                "f1_tree":     r["f1_tree"],
-                "tree_recall": r["tree_recall"],
-                "iou_tree":    r["iou_tree"],
-                "iou_bg":      r["iou_bg"],
-                "pixel_acc":   r["pixel_acc"],
-                "map50":   r["map50"],   "ar1000": r["ar1000"],
-            })
-            for name, r in all_results.items()
-        },
+        "results": {name: _metrics_block(r) for name, r in all_results.items()},
     }
     summary_path = output_root / "benchmark_holdout_summary.json"
     with open(summary_path, "w") as f:
