@@ -30,10 +30,12 @@ gain is generic hard-example mining; if shadow > blind, the shadow prior is doin
 
 ## Pinned recipe (identical for all five — the canonical family-A recipe)
 - base: weecology/deepforest-tree (HF pretrained), no `--checkpoint`
-- 50 epochs · **EarlyStopping(monitor=val `map`, patience 10)** · `save_top_k=1` (best epoch)
+- 50 epochs · **EarlyStopping(monitor=val `map`, patience 5)** · `save_top_k=1` (best epoch)
 - validation fires every **3** epochs (`check_val_every_n_epoch=3`, trainer-hardcoded — same as
-  the original runs, hence historical best-ckpt epochs ≡ 2 mod 3); patience therefore counts
-  val *checks*, ≈ up to 30 epochs of grace
+  the original runs, hence historical best-ckpt epochs ≡ 2 mod 3); patience counts val *checks*,
+  so **patience 5 ≈ 15 epochs** of no-improvement grace. NOTE: this differs from the historical
+  phase21/22 runs (patience 10); chosen here so early-stop actually engages on the small bwn set.
+  Best-checkpoint selection (global-max val-mAP) is unaffected by the patience value.
 - lr 1e-3 · batch 16 · RandomCrop 400 only (no flip, no photometric) · ToTensorV2
 - **WON bbox-shrink ON** (deepforest_custom default; WON GT boxes → 50 % area)
 - shadow angle auto-derived from the CSV `shadow_angle` column

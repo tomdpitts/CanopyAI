@@ -177,8 +177,11 @@ these models used. Net augmentation by model:
 
 To complete a single-variable zero-shot ablation **matched to the `phase22_B_L4` headline**, retrain
 the missing cells with **`deepforest_custom/train_deepforest.py`** (NOT phase30/lib), locally on MPS,
-using the §2 recipe exactly: weecology base, 50 epochs, **patience 10 with early stopping**, lr 1e-3,
-batch 16, crop-only augmentation, WON-shrink on, on `phase22_train_filt.csv` / `phase22_val_filt.csv`.
+using the §2 recipe: weecology base, 50 epochs, early stopping, lr 1e-3, batch 16, crop-only
+augmentation, WON-shrink on, on `phase22_train_filt.csv` / `phase22_val_filt.csv`. **One deliberate
+deviation from the historical recipe: patience 5 (≈15 epochs) instead of 10**, so early-stop
+actually engages on the small bwn set — this changes only *when* training stops, not the
+best-checkpoint selection (global-max val-mAP), and is applied identically to all five cells.
 
 | cell to (re)train | weight | `--blind` | purpose |
 |---|---|---|---|

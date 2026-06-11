@@ -4,7 +4,7 @@
 #
 # All five cells use deepforest_custom/train_deepforest.py with the canonical
 # family-A recipe (the phase22_B_L4 recipe): weecology base, 50 epochs,
-# EarlyStopping(val mAP, patience 10), lr 1e-3, batch 16, crop-400 only (no
+# EarlyStopping(val mAP, patience 5 val-checks ≈ 15 epochs), lr 1e-3, batch 16, crop-400 only (no
 # flip, no photometric), WON bbox-shrink ON. Local MPS. Single variable across
 # cells = the shadow loss weight (+ the blind toggle for the controls).
 #
@@ -27,13 +27,21 @@ PY=./venv310/bin/python
 TRAIN=deepforest_custom/zeroshot_final/train.csv
 VAL=deepforest_custom/zeroshot_final/val.csv
 OUT=checkpoints/zsfinal
-COMMON="--epochs 50 --patience 10 --lr 0.001 --batch_size 16 --accelerator mps --shadow-loss-reweight"
+# patience counts VALIDATION checks (validation runs every 3 epochs) → 5 checks ≈ 15 epochs.
+COMMON="--epochs 50 --patience 5 --lr 0.001 --batch_size 16 --accelerator mps --shadow-loss-reweight"
 
 # DF_NUM_WORKERS=0 — macOS MPS DataLoader file-descriptor fix (see trainer header).
 export DF_NUM_WORKERS=0
 
 run () {  # run <run_name> <weight> <blind:0|1>
   local name="$1" weight="$2" blind="$3"
+  # Skip a cell only if it FINISHED (deepforest_best.pth written). A half-trained
+  # dir is NOT skipped — to get a clean patience-5 run, delete it first (the
+  # trainer would otherwise auto-resume the old trajectory). See README.
+  if [[ -f "${OUT}/${name}/deepforest_best.pth" ]]; then
+    echo "=== SKIP ${name} (deepforest_best.pth already exists) ==="
+    return 0
+  fi
   echo -e "\n=== [$(date '+%Y-%m-%d %H:%M:%S %Z')] TRAIN ${name}  weight=${weight} blind=${blind} ==="
   SHADOW_BLIND_CONTROL="${blind}" $PY deepforest_custom/train_deepforest.py \
     --train_csv "$TRAIN" --val_csv "$VAL" \
