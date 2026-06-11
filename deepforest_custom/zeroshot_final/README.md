@@ -56,18 +56,29 @@ caffeinate -i bash deepforest_custom/zeroshot_final/train_all.sh       # ~30–4
 Checkpoints → `checkpoints/zsfinal/zsfinal_<cell>/` (best-mAP epoch kept; auto-resumes).
 
 ## Eval (after training) — outputs to benchmark_results_holdout/
-Re-infer every cell through ONE pinned foxtrot→SAM pipeline (SAM model + score-floor patch
-per `phase30/zeroshot/REINFER_PLAN_vitl.md`), writing geojsons + the automatic `summary.json`
-provenance to **`benchmark_results_holdout/zsfinal_<cell>/`**, e.g.:
+Re-infer every cell through ONE pinned foxtrot→SAM pipeline, writing geojsons + the automatic
+`summary.json` provenance to **`benchmark_results_holdout/zsfinal_<cell>/`**, e.g.:
 ```bash
 caffeinate -i ./venv310/bin/python phase30/benchmark.py \
   --models checkpoints/zsfinal/zsfinal_w4/deepforest_final.pth \
   --names  zsfinal_w4 \
   --holdout-dir data/tcd/images/data/tcd/val \
   --shadow-model solar/shadow_regression/output/shadow_model_combined_best.pth \
-  --sam-model <vit_h|vit_l> --sam-checkpoint <weights> \
+  --sam-model vit_l --sam-checkpoint sam_vit_l_0b3195.pth \
   --df-confidence 0.001 --max-dets 512 --pred-score-thresh 0.0 \
   --skip-existing --output-root benchmark_results_holdout
 ```
-(SAM model + the score-floor patch are still an open eval decision — see the reinfer plan.)
+- **SAM: pinned `vit_l`** (`sam_vit_l_0b3195.pth`, repo root) — Tom's decision 2026-06-11. All
+  cells use the same SAM, so it is a constant across the ablation, not a confound.
+- **Score floor (DISTINCT from `--df-confidence`) — must be addressed before eval.** The DeepForest
+  RetinaNet has its OWN internal `score_thresh = 0.1`, applied *inside* `df_model.model(...)`
+  (`foxtrot.py:854`) and so BEFORE foxtrot's post-filter `score >= confidence_threshold`
+  (`foxtrot.py:859`, fed by `--df-confidence`). `--df-confidence` can only remove boxes that already
+  cleared 0.1 — it cannot recover the sub-0.1 PR tail that mAP integration needs. Until the model's
+  `score_thresh` is lowered (set `df_model.model.score_thresh ≈ 0.001` after build/eval in BOTH
+  load branches), every cell is truncated at 0.1. Within zsfinal this is *internally* fair (all five
+  cells floored identically), but it understates absolute mAP and is not comparable to the old
+  phase22 0.498 (whose geojsons reach ~0.001). Recommendation: apply the patch so the numbers are
+  faithful and comparable. See `phase30/zeroshot/REINFER_PLAN_vitl.md` §4.
+
 Then add the rows to `benchmark_results_holdout/ALL_models_holdout_table.md`.
