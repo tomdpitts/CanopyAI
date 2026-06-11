@@ -617,11 +617,19 @@ def train_deepforest(
     train_df    = pd.read_csv(train_csv)
     _empty_mask = train_df["xmin"].isna() | (train_df["xmin"].astype(str).str.strip() == "")
     _empty_image_paths = train_df.loc[_empty_mask, "image_path"].unique().tolist()
+    import os as _os
     import types
     from deepforest.datasets.training import BoxDataset
     from torch.utils.data import DataLoader
 
     pin_memory = torch.cuda.is_available()
+
+    # DataLoader worker count is configurable via DF_NUM_WORKERS (default 8).
+    # On macOS/MPS, multi-worker dataloaders with the default FD sharing strategy
+    # hit "Bad file descriptor" / Abort traps, so local MPS runs set DF_NUM_WORKERS=0.
+    # persistent_workers is only valid when num_workers > 0.
+    _NUM_WORKERS        = int(_os.environ.get("DF_NUM_WORKERS", "8"))
+    _PERSISTENT_WORKERS = _NUM_WORKERS > 0
 
     def _maybe_wrap_canopy(ds, model_ref):
         """If canopy is enabled, wrap the BoxDataset so __getitem__ also
@@ -654,8 +662,8 @@ def train_deepforest(
                   f"(total: {len(ds.image_names)} images)")
             ds = _maybe_wrap_canopy(ds, self_model)
             return DataLoader(ds, batch_size=dl.batch_size, shuffle=True,
-                              collate_fn=ds.collate_fn, num_workers=8,
-                              pin_memory=pin_memory, persistent_workers=True)
+                              collate_fn=ds.collate_fn, num_workers=_NUM_WORKERS,
+                              pin_memory=pin_memory, persistent_workers=_PERSISTENT_WORKERS)
 
         model.train_dataloader = types.MethodType(_train_dataloader_with_empties, model)
     else:
@@ -669,8 +677,8 @@ def train_deepforest(
                 if wrapped is dl.dataset:
                     return dl
                 return DataLoader(wrapped, batch_size=dl.batch_size, shuffle=True,
-                                  collate_fn=wrapped.collate_fn, num_workers=8,
-                                  pin_memory=pin_memory, persistent_workers=True)
+                                  collate_fn=wrapped.collate_fn, num_workers=_NUM_WORKERS,
+                                  pin_memory=pin_memory, persistent_workers=_PERSISTENT_WORKERS)
             model.train_dataloader = types.MethodType(_train_dataloader_with_transform, model)
 
     print(f"\n📊 Training data: {len(train_df[~_empty_mask])} boxes, "
@@ -698,8 +706,8 @@ def train_deepforest(
                 tiled_ds = _TiledValDataset(ds, patch_size=CROP_SIZE, min_visibility=MIN_VIS,
                                             canopy_polygons_by_key=cp)
                 return DataLoader(tiled_ds, batch_size=dl.batch_size, shuffle=False,
-                                  collate_fn=ds.collate_fn, num_workers=8,
-                                  pin_memory=pin_memory, persistent_workers=True)
+                                  collate_fn=ds.collate_fn, num_workers=_NUM_WORKERS,
+                                  pin_memory=pin_memory, persistent_workers=_PERSISTENT_WORKERS)
             model.val_dataloader = types.MethodType(_val_dataloader_with_empties, model)
         else:
             def _val_dataloader_tiled(self_model):
@@ -708,8 +716,8 @@ def train_deepforest(
                 tiled_ds = _TiledValDataset(dl.dataset, patch_size=CROP_SIZE, min_visibility=MIN_VIS,
                                             canopy_polygons_by_key=cp)
                 return DataLoader(tiled_ds, batch_size=dl.batch_size, shuffle=False,
-                                  collate_fn=dl.dataset.collate_fn, num_workers=8,
-                                  pin_memory=pin_memory, persistent_workers=True)
+                                  collate_fn=dl.dataset.collate_fn, num_workers=_NUM_WORKERS,
+                                  pin_memory=pin_memory, persistent_workers=_PERSISTENT_WORKERS)
             model.val_dataloader = types.MethodType(_val_dataloader_tiled, model)
 
         print(f"   Validation data: {len(val_df[~_val_empty_mask])} boxes, "

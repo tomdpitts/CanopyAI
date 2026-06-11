@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 
+import os
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -221,6 +222,30 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
                         if sm_np[y0c:y1c, x0c:x1c].max() >= self._SLR_SHADOW_THRESH:
                             weights[i] = self.shadow_loss_weight
                             break
+
+            # Negative control (SHADOW_BLIND_CONTROL=1): keep the same NUMBER of
+            # upweighted boxes per image as the shadow logic chose, but pick them
+            # at RANDOM. If this reproduces the shadow gain, the effect is generic
+            # hard-example upweighting, not shadow-specific. (Mirrors the existing
+            # control in deepforest_custom/models.py.)
+            if os.environ.get("SHADOW_BLIND_CONTROL") == "1":
+                k = int((weights != 1.0).sum().item())
+                weights = torch.ones(N_gt, dtype=torch.float32)
+                if k > 0:
+                    idx = np.random.default_rng().choice(N_gt, size=min(k, N_gt),
+                                                         replace=False)
+                    weights[idx] = self.shadow_loss_weight
+                # One-time sanity: confirm the random-reweight branch fired and
+                # that it upweights the SAME count of boxes the shadow logic chose
+                # (k), so the control is genuinely comparable — not a silent no-op.
+                if not getattr(self, "_blind_control_announced", False):
+                    import sys as _sys
+                    n_up = int((weights != 1.0).sum().item())
+                    print(f"   🎲 SHADOW_BLIND_CONTROL active: random reweight branch "
+                          f"taken (shadow-selected k={k}, randomly upweighted={n_up}/"
+                          f"{N_gt} boxes @ weight={self.shadow_loss_weight}x)",
+                          file=_sys.stderr, flush=True)
+                    self._blind_control_announced = True
 
             result.append(weights)
         return result
