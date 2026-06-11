@@ -1,0 +1,68 @@
+{
+  "run_name": "zsfinal_blind_s2",
+  "started": "2026-06-11T20:52:49+10:00",
+  "ended": "2026-06-11T21:02:00+10:00",
+  "git_sha": "e53c07c",
+  "git_dirty": true,
+  "argv": [
+    "deepforest_custom/train_deepforest.py",
+    "--train_csv",
+    "deepforest_custom/zeroshot_final/train.csv",
+    "--val_csv",
+    "deepforest_custom/zeroshot_final/val.csv",
+    "--run_name",
+    "zsfinal_blind_s2",
+    "--output_dir",
+    "checkpoints/zsfinal",
+    "--epochs",
+    "50",
+    "--patience",
+    "5",
+    "--lr",
+    "0.001",
+    "--batch_size",
+    "16",
+    "--accelerator",
+    "mps",
+    "--shadow-loss-reweight",
+    "--shadow-loss-weight",
+    "2"
+  ],
+  "params": {
+    "epochs": 50,
+    "patience": 5,
+    "lr": 0.001,
+    "batch_size": 16,
+    "pretrained": true,
+    "base_checkpoint": null,
+    "shadow_loss_reweight": true,
+    "shadow_loss_weight": 2.0,
+    "shadow_blind_control": true,
+    "won_bbox_shrink": true,
+    "shadow_channel": false,
+    "shadow_cross_attention": false,
+    "augmentations": null,
+    "accelerator": "mps",
+    "precision": null,
+    "df_num_workers": 0,
+    "fast_dev_run": false
+  },
+  "data": {
+    "train_csv": "deepforest_custom/zeroshot_final/train.csv",
+    "val_csv": "deepforest_custom/zeroshot_final/val.csv",
+    "train": {
+      "rows": 1402,
+      "images": 128
+    },
+    "val": {
+      "rows": 443,
+      "images": 36
+    }
+  },
+  "best_checkpoint": "deepforest-epoch=02-map=0.41.ckpt",
+  "best_val_map": 0.40807944536209106,
+  "exports": {
+    "deepforest_best.pth": "sha256:17d3cbb337acad1da32d56f59d1a2972b984c9b2882727c0c6e606afbf332e1d",
+    "deepforest_final.pth": "sha256:21add8685cab39bd6b43c676c72ec30110be546a81494dd20383841a5373b75b"
+  }
+}
