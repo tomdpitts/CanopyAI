@@ -23,6 +23,13 @@
 set -uo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
+# Ctrl-C aborts the WHOLE driver, not just the current cell. PyTorch Lightning
+# traps SIGINT and shuts the current model down "gracefully" (exits non-killed),
+# so without this trap bash would treat the interrupt as handled and fall through
+# to the next run() — which is why a single Ctrl-C used to just skip to the next
+# model. Press Ctrl-C twice quickly if Lightning's graceful teardown is slow.
+trap 'echo; echo "⛔ Interrupted — aborting train_all.sh."; exit 130' INT
+
 PY=./venv310/bin/python
 TRAIN=deepforest_custom/zeroshot_final/train.csv
 VAL=deepforest_custom/zeroshot_final/val.csv
