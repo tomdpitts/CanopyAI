@@ -1026,6 +1026,26 @@ def train_deepforest(
     else:
         torch.save(model.model.state_dict(), str(final_model_path))
 
+    # Also export the BEST checkpoint (top-1 val-mAP) as deepforest_best.pth, in the
+    # same format as deepforest_final.pth. deepforest_final is the LAST epoch — with
+    # early stopping that is up to `patience` epochs past the best, so benchmarks
+    # should load deepforest_best.pth.
+    try:
+        best_ckpt = getattr(checkpoint_callback, "best_model_path", "")
+        if best_ckpt and Path(best_ckpt).exists():
+            best_sd = torch.load(best_ckpt, map_location="cpu")["state_dict"]
+            if not use_wrapper:
+                best_sd = {k[len("model."):]: v for k, v in best_sd.items()
+                           if k.startswith("model.")}
+            best_path = Path(run_output_dir) / "deepforest_best.pth"
+            torch.save(best_sd, str(best_path))
+            print(f"💾 Saved BEST (top-1 val-mAP) model to {best_path}  "
+                  f"(from {Path(best_ckpt).name})")
+        else:
+            print("⚠️  No best checkpoint recorded — deepforest_best.pth not written")
+    except Exception as e:
+        print(f"⚠️  Could not export deepforest_best.pth: {e}")
+
     return model, None
 
 

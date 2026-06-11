@@ -31,6 +31,9 @@ gain is generic hard-example mining; if shadow > blind, the shadow prior is doin
 ## Pinned recipe (identical for all five — the canonical family-A recipe)
 - base: weecology/deepforest-tree (HF pretrained), no `--checkpoint`
 - 50 epochs · **EarlyStopping(monitor=val `map`, patience 10)** · `save_top_k=1` (best epoch)
+- validation fires every **3** epochs (`check_val_every_n_epoch=3`, trainer-hardcoded — same as
+  the original runs, hence historical best-ckpt epochs ≡ 2 mod 3); patience therefore counts
+  val *checks*, ≈ up to 30 epochs of grace
 - lr 1e-3 · batch 16 · RandomCrop 400 only (no flip, no photometric) · ToTensorV2
 - **WON bbox-shrink ON** (deepforest_custom default; WON GT boxes → 50 % area)
 - shadow angle auto-derived from the CSV `shadow_angle` column
@@ -66,13 +69,13 @@ Checkpoints → `checkpoints/zsfinal/zsfinal_<cell>/` (best-mAP epoch kept; auto
 ## Eval (after training) — outputs to benchmark_results_holdout/
 Re-infer every cell through ONE pinned foxtrot→SAM pipeline, writing geojsons + the automatic
 `summary.json` provenance to **`benchmark_results_holdout/zsfinal_<cell>/`**, e.g.:
-**Eval the BEST checkpoint (`deepforest-epoch=*.ckpt`, top-1 val-mAP), NOT `deepforest_final.pth`** —
-the latter is the in-memory model at the *last* epoch, up to `patience`=10 epochs past the best
-(the trainer never reloads the best weights before saving it). `save_top_k=1` guarantees exactly
-one `deepforest-epoch=*.ckpt` per cell, so a glob resolves it:
+**Eval `deepforest_best.pth` (top-1 val-mAP), NOT `deepforest_final.pth`** — final is the
+in-memory model at the *last* epoch, past the best. The trainer now exports the best
+checkpoint as `deepforest_best.pth` in the same format as the historical phase21/22 `.pth`s
+(verified: loads 301/301 keys through foxtrot's load path).
 ```bash
 caffeinate -i ./venv310/bin/python phase30/benchmark.py \
-  --models checkpoints/zsfinal/zsfinal_s4/deepforest-epoch=*.ckpt \
+  --models checkpoints/zsfinal/zsfinal_s4/deepforest_best.pth \
   --names  zsfinal_s4 \
   --holdout-dir data/tcd/images/data/tcd/val \
   --shadow-model solar/shadow_regression/output/shadow_model_combined_best.pth \
