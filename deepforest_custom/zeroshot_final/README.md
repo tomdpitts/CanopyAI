@@ -71,17 +71,17 @@ caffeinate -i ./venv310/bin/python phase30/benchmark.py \
   --df-confidence 0.001 --max-dets 512 --pred-score-thresh 0.0 \
   --skip-existing --output-root benchmark_results_holdout
 ```
-- **SAM: pinned `vit_l`** (`sam_vit_l_0b3195.pth`, repo root) — Tom's decision 2026-06-11. All
-  cells use the same SAM, so it is a constant across the ablation, not a confound.
-- **Score floor (DISTINCT from `--df-confidence`) — must be addressed before eval.** The DeepForest
-  RetinaNet has its OWN internal `score_thresh = 0.1`, applied *inside* `df_model.model(...)`
-  (`foxtrot.py:854`) and so BEFORE foxtrot's post-filter `score >= confidence_threshold`
-  (`foxtrot.py:859`, fed by `--df-confidence`). `--df-confidence` can only remove boxes that already
-  cleared 0.1 — it cannot recover the sub-0.1 PR tail that mAP integration needs. Until the model's
-  `score_thresh` is lowered (set `df_model.model.score_thresh ≈ 0.001` after build/eval in BOTH
-  load branches), every cell is truncated at 0.1. Within zsfinal this is *internally* fair (all five
-  cells floored identically), but it understates absolute mAP and is not comparable to the old
-  phase22 0.498 (whose geojsons reach ~0.001). Recommendation: apply the patch so the numbers are
-  faithful and comparable. See `phase30/zeroshot/REINFER_PLAN_vitl.md` §4.
+- **Scorer: `phase30/benchmark.py`, NOT `benchmark_tcd.py`.** Decided 2026-06-11. The paper's
+  contribution is competitiveness vs SOTA (Restor, detectree2), so we report Restor Table-1 metrics:
+  pycocotools mAP50 (tree, canopy=iscrowd) + micro-pixel IoU/F1/Acc. The older `benchmark_tcd.py`
+  scores a non-standard IoP≥0.4 AP over *pooled* canopy+tree GT — more lenient and **not comparable
+  to Restor's published 0.432 / 0.902**, so it cannot back the head-to-head claim. (Both scorers read
+  the same foxtrot geojsons — the detections are identical; only the metric differs.)
+- **SAM: pinned `vit_l`** (`sam_vit_l_0b3195.pth`, repo root) — all cells use the same SAM, so it's a
+  constant across the ablation, not a confound.
+- **Score floor — fixed (commit 49f543f).** foxtrot now lowers the RetinaNet's internal
+  `score_thresh` to `--df-confidence` in both load branches, so `--df-confidence 0.001` returns the
+  full sub-0.1 PR tail that mAP needs (was floored at 0.1). Verified: tile_0 @ vit_l → score min
+  0.00104. Just pass `--df-confidence 0.001`.
 
 Then add the rows to `benchmark_results_holdout/ALL_models_holdout_table.md`.
