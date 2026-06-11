@@ -59,7 +59,12 @@ foxtrot_output_test_film
 *.ckpt
 *.pt
 deepforest_custom/annotation*
-checkpoints/*
+checkpoints/**
+# …but descend into run dirs (any depth) to track tiny training-provenance text
+# files; the .pth/.ckpt/version_* stay ignored (only the two globs are re-included).
+!checkpoints/**/
+!checkpoints/**/train_summary.json
+!checkpoints/**/*.train.log
 debug_vis*
 *training_vis*
 *shadow_map*
@@ -89,6 +94,9 @@ phase30/zeroshot/*.log
 # zsfinal generated manifests (machine-specific abs paths; build_csvs.py is the source)
 deepforest_custom/zeroshot_final/train.csv
 deepforest_custom/zeroshot_final/val.csv
+# Track training provenance (tiny text) while .pth/.ckpt stay ignored
+!checkpoints/**/train_summary.json
+!checkpoints/**/*.train.log
 
 
 benchmark_results/*

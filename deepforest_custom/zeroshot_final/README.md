@@ -66,6 +66,13 @@ caffeinate -i bash deepforest_custom/zeroshot_final/train_all.sh       # ~30–4
 ```
 Checkpoints → `checkpoints/zsfinal/zsfinal_<cell>/` (best-mAP epoch kept; auto-resumes).
 
+**Training provenance:** each run dir gets a `train_summary.json` (git SHA + dirty flag, full
+resolved params incl. shadow weight / blind / WON-shrink, train/val row+image counts, best
+val-mAP, start/end times, and SHA-256 of the exported `.pth`s). It is **git-tracked** (the
+`.gitignore` whitelists `train_summary.json` + `*.train.log` while `.pth`/`.ckpt` stay ignored),
+so 4 months on the exact training config is recoverable from git, not just the local checkpoint
+dir. **Commit before launching** so `git_dirty` reads `false`.
+
 ## Eval (after training) — outputs to benchmark_results_holdout/
 Re-infer every cell through ONE pinned foxtrot→SAM pipeline, writing geojsons + the automatic
 `summary.json` provenance to **`benchmark_results_holdout/zsfinal_<cell>/`**, e.g.:

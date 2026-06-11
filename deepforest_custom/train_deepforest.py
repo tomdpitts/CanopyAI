@@ -12,6 +12,7 @@ On Modal:
 """
 
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
@@ -585,6 +586,9 @@ def train_deepforest(
     run_output_dir = str(Path(output_dir) / run_name)
     Path(run_output_dir).mkdir(parents=True, exist_ok=True)
 
+    import datetime as _dt
+    _train_started = _dt.datetime.now().astimezone().isoformat(timespec="seconds")
+
     print("\n" + "=" * 60)
     print(f"🌲 DeepForest Training: {run_name}")
     print("=" * 60)
@@ -1045,6 +1049,84 @@ def train_deepforest(
             print("⚠️  No best checkpoint recorded — deepforest_best.pth not written")
     except Exception as e:
         print(f"⚠️  Could not export deepforest_best.pth: {e}")
+
+    # ── Training provenance ───────────────────────────────────────────────
+    # Self-describing record beside the checkpoints: exact params, the code commit,
+    # data fingerprint, and best val-mAP — so a checkpoint's training is recoverable
+    # months later without trusting that the driver script was unedited. Whitelisted
+    # in .gitignore (train_summary.json) so it is committed; the .pth/.ckpt are not.
+    try:
+        import hashlib as _hashlib
+        import subprocess as _sp
+
+        def _sha256(path, _cap=512 * 1024 * 1024):
+            try:
+                h, n = _hashlib.sha256(), 0
+                with open(path, "rb") as fh:
+                    for chunk in iter(lambda: fh.read(1 << 20), b""):
+                        h.update(chunk); n += len(chunk)
+                        if n > _cap:
+                            return f"sha256-partial-{_cap}B:{h.hexdigest()}"
+                return f"sha256:{h.hexdigest()}"
+            except Exception:
+                return None
+
+        def _rows(path):
+            try:
+                df = pd.read_csv(path)
+                return {"rows": int(len(df)),
+                        "images": int(df["image_path"].nunique()) if "image_path" in df else None}
+            except Exception:
+                return None
+
+        try:
+            _git_sha = _sp.check_output(["git", "rev-parse", "--short", "HEAD"],
+                                        cwd=str(Path(__file__).resolve().parent),
+                                        stderr=_sp.DEVNULL).decode().strip()
+            _git_dirty = bool(_sp.check_output(["git", "status", "--porcelain"],
+                                               cwd=str(Path(__file__).resolve().parent),
+                                               stderr=_sp.DEVNULL).decode().strip())
+        except Exception:
+            _git_sha, _git_dirty = "unknown", None
+
+        _best_ckpt = getattr(checkpoint_callback, "best_model_path", "") or None
+        _best_score = getattr(checkpoint_callback, "best_model_score", None)
+        prov = {
+            "run_name": run_name,
+            "started": _train_started,
+            "ended": _dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+            "git_sha": _git_sha,
+            "git_dirty": _git_dirty,
+            "argv": sys.argv,
+            "params": {
+                "epochs": epochs, "patience": patience, "lr": lr, "batch_size": batch_size,
+                "pretrained": pretrained, "base_checkpoint": checkpoint,
+                "shadow_loss_reweight": shadow_loss_reweight,
+                "shadow_loss_weight": shadow_loss_weight,
+                "shadow_blind_control": os.environ.get("SHADOW_BLIND_CONTROL") == "1",
+                "won_bbox_shrink": won_bbox_shrink,
+                "shadow_channel": shadow_channel, "shadow_cross_attention": shadow_cross_attention,
+                "augmentations": augmentations, "accelerator": accelerator, "precision": precision,
+                "df_num_workers": int(os.environ.get("DF_NUM_WORKERS", "8")),
+                "fast_dev_run": fast_dev_run,
+            },
+            "data": {
+                "train_csv": str(train_csv), "val_csv": str(val_csv) if val_csv else None,
+                "train": _rows(train_csv), "val": _rows(val_csv) if val_csv else None,
+            },
+            "best_checkpoint": Path(_best_ckpt).name if _best_ckpt else None,
+            "best_val_map": float(_best_score) if _best_score is not None else None,
+            "exports": {
+                "deepforest_best.pth": _sha256(Path(run_output_dir) / "deepforest_best.pth")
+                    if (Path(run_output_dir) / "deepforest_best.pth").exists() else None,
+                "deepforest_final.pth": _sha256(final_model_path),
+            },
+        }
+        _prov_path = Path(run_output_dir) / "train_summary.json"
+        _prov_path.write_text(json.dumps(prov, indent=2, default=str))
+        print(f"🧾 Training provenance → {_prov_path}")
+    except Exception as e:
+        print(f"⚠️  Could not write train_summary.json: {e}")
 
     return model, None
 
