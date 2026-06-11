@@ -30,10 +30,20 @@ summary, so this file records what we could reconstruct — and, honestly, what 
 | `phase21_baseline` | DeepForest no-shadow, zero-shot, 439 | **UNKNOWN** | off (base ablation) | ~0 (full tail) | older pipeline (NOT current benchmark.py) |
 | `phase22_B_L4` | DeepForest shadow×4, zero-shot, 439 | **UNKNOWN** | off | ~0 | older pipeline |
 | `ablation_pre_s2` | DeepForest shadow×2, zero-shot, 439 | **UNKNOWN** (memory flagged unconfirmed) | off | ~0 | older pipeline |
-| `ablation_tcd_s0/s2/s4` | DeepForest fine-tuned on TCD, 439 | **UNKNOWN** | off | ~0 | older pipeline |
+| `ablation_tcd_s0/s2/s4` | DeepForest fine-tuned on TCD, 439 | **vit_h** (reconstructed — see note) | off | ~0 | `phase30/modal/infer.py` |
 | `detectree2_stock_100m_px` | detectree2 @100m, geo→pixel | n/a (native masks) | n/a | n/a | `infer_detectree2.py` (conda `tcd` env), pixel-transformed |
 | `restor_mrcnn` | Restor MRCNN re-inference, TREE-only export | n/a (MRCNN masks) | n/a | n/a | `phase30/restor_baseline/run_restor.py` (CPU detectron2) |
 | `s0_ttaR` | ablation_tcd_s0 + TTA + reranker | vit_h | **ON** (`cnn_reranker_ens3.pt`) | — | `phase30/zeroshot/run_tta_s0.sh` |
+
+> **`ablation_tcd_s0/s2/s4` SAM = vit_h (reconstructed 2026-06-11, not logged).** No `_run.json`/
+> `summary.json` exists in those dirs, but their inference driver `phase30/modal/infer.py` defaults
+> to `sam: str = "vit_h"` and uses `--sam vit_h` in every usage example; the sibling `s0_ttaR`
+> (same s0 model + TTA) is explicitly vit_h. Vertex signature corroborates a distinct pipeline:
+> the fine-tuned trio sits at 21–22 median verts/polygon (s0_ttaR 23) vs the zero-shot
+> `phase21/22` at 17. **Implication for the table:** Section B (fine-tuned) is vit_h, while the new
+> Section A `zsfinal` zero-shot run is vit_l — SAM differs *between* categories A and B. That's
+> acceptable (they're different regimes, already cross-category-caveated), but do not imply a
+> shared SAM across the whole table.
 
 ## DEAD / discarded
 - `blindzero_w2`, `blindzero_w4` **geojson dirs** — the 2026-06-11 eval of the blind
