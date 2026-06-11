@@ -116,6 +116,10 @@ def parse_args():
                    help="Detections-per-image cap for pycocotools mAP (maxDets[2] "
                         "slice).  Default 512 to match Restor's Mask-RCNN "
                         "(DETECTIONS_PER_IMAGE=512 / paper: 'increased predictions to 512').")
+    p.add_argument("--max-boxes-sam", type=int, default=0,
+                   help="Cap detections fed to SAM to top-N by score (forwarded to "
+                        "foxtrot --max_boxes_sam; 0=off). Bounds SAM runtime at low "
+                        "--df-confidence; lossless for mAP up to --max-dets.")
     p.add_argument("--df-tta", action="store_true",
                    help="Enable DeepForest multi-scale test-time augmentation "
                         "(forwarded to foxtrot.py --df_tta).")
@@ -151,12 +155,14 @@ def run_foxtrot(model_spec, mtype, image_path, out_dir, shadow_model,
                 containment_threshold=None, poly_containment_threshold=None,
                 reranker_checkpoint=None,
                 sam_model=None, sam_checkpoint=None,
-                df_tta=False, df_tta_scales=None):
+                df_tta=False, df_tta_scales=None, max_boxes_sam=0):
     cmd = [sys.executable, str(REPO_ROOT / "foxtrot.py"),
            "--image_path", str(image_path),
            "--output_dir", str(out_dir),
            "--shadow_model", str(shadow_model),
            "--no_viz"]
+    if max_boxes_sam and int(max_boxes_sam) > 0:
+        cmd += ["--max_boxes_sam", str(int(max_boxes_sam))]
     if df_tta:
         cmd += ["--df_tta"]
         if df_tta_scales is not None:
@@ -220,7 +226,7 @@ def run_inference(model_spec, mtype, holdout_dir, out_dir, shadow_model,
                   reranker_checkpoint=None,
                   sam_model=None, sam_checkpoint=None,
                   skip_existing=False, tile_filter=None,
-                  df_tta=False, df_tta_scales=None):
+                  df_tta=False, df_tta_scales=None, max_boxes_sam=0):
     tifs = sorted(Path(holdout_dir).glob("*.tif"))
     if tile_filter is not None:
         tifs = [t for t in tifs if t.stem in tile_filter]
@@ -252,7 +258,8 @@ def run_inference(model_spec, mtype, holdout_dir, out_dir, shadow_model,
                                   reranker_checkpoint=reranker_checkpoint,
                                   sam_model=sam_model,
                                   sam_checkpoint=sam_checkpoint,
-                                  df_tta=df_tta, df_tta_scales=df_tta_scales)
+                                  df_tta=df_tta, df_tta_scales=df_tta_scales,
+                                  max_boxes_sam=max_boxes_sam)
         times.append(time.monotonic() - t0)
         print(("✓" if success else "✗") + _progress_suffix(times, len(pending)))
         ok += success
@@ -772,7 +779,8 @@ def main():
                       sam_checkpoint=args.sam_checkpoint,
                       skip_existing=args.skip_existing,
                       tile_filter=tile_filter,
-                      df_tta=args.df_tta, df_tta_scales=args.df_tta_scales)
+                      df_tta=args.df_tta, df_tta_scales=args.df_tta_scales,
+                      max_boxes_sam=args.max_boxes_sam)
         # provisional provenance (results pending) — survives a crash during scoring
         _write_summary_provenance(out_dir, args, spec, name, started_at[name])
 

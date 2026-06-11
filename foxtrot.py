@@ -1932,6 +1932,19 @@ def main(args):
         print(f"   Removed {removed} overlapping detections")
         print(f"   Keeping {len(valid_bboxes)} unique trees")
 
+    # Cap detections fed to SAM to the top-N by score. SAM + mask→polygon is
+    # ~0.5-0.7 s/box, so at a low --deepforest_confidence (e.g. 0.001 → ~1000
+    # boxes/tile) segmentation dominates runtime. Keeping the top-N highest-score
+    # boxes is LOSSLESS for COCO mAP (pycocotools scores only the top maxDets,
+    # 512 here) and drops only the lowest-confidence tail. Off by default (0).
+    max_boxes_sam = getattr(args, "max_boxes_sam", 0) or 0
+    if max_boxes_sam > 0 and len(valid_bboxes) > max_boxes_sam:
+        n_before = len(valid_bboxes)
+        order = np.argsort(valid_scores)[::-1][:max_boxes_sam]
+        valid_bboxes = [valid_bboxes[i] for i in order]
+        valid_scores = [valid_scores[i] for i in order]
+        print(f"   ✂️  Capped {n_before} → top {max_boxes_sam} boxes by score before SAM")
+
     # Debug: limit to single box
     if args.debug_single_box and len(valid_bboxes) > 0:
         print("\n⚠️  DEBUG: Limiting to single bbox")
@@ -2205,6 +2218,15 @@ def parse_args():
         default=1024,
         help="SAM tile size in pixels (default: 1024). "
         "SAM internally uses 1024x1024, so this matches its native resolution.",
+    )
+
+    ap.add_argument(
+        "--max_boxes_sam",
+        type=int,
+        default=0,
+        help="Cap detections fed to SAM to the top-N by score (0 = no cap). "
+             "Bounds SAM runtime at low --deepforest_confidence; lossless for COCO "
+             "mAP up to the pycocotools maxDets (drops only the lowest-score tail).",
     )
 
     ap.add_argument(
