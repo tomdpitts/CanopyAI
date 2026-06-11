@@ -1,5 +1,12 @@
 # Zero-shot shadow-loss-weight ablation
 
+> **➡️ For the FINAL paper comparison, start at [`deepforest_custom/zeroshot_final/`](../../deepforest_custom/zeroshot_final/README.md).**
+> That `zsfinal` run supersedes the mixed checkpoints described here: it retrains all
+> cells through ONE trainer (`deepforest_custom`, WON-shrink on) on one manifest, removing
+> the trainer/augmentation/WON-shrink confounds in this older sweep. This folder remains the
+> record of the exploratory sweeps (`zs_*` seeds, `pr_sweep`, the area-F1 finding). Rationale:
+> `paper/zeroshot_training_provenance.md`.
+
 Tests whether `shadow_loss_weight` is a valid lever in the **zero-shot** regime:
 train on the phase22 data (BRU/WON/NEON, non-TCD, dense per-box shadow vectors)
 and evaluate **zero-shot on the TCD holdout** — the model never sees TCD in
