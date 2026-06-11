@@ -15,11 +15,14 @@ on vs off) documented in the provenance report.
 ## The five cells
 | run_name | weight | blind | role |
 |---|---|---|---|
-| `zsfinal_w1` | 1 | no | no-shadow baseline (×1 = no reweighting) |
-| `zsfinal_w2` | 2 | no | shadow |
-| `zsfinal_w4` | 4 | no | shadow (same weight as the old phase22_B_L4) |
-| `zsfinal_blind2` | 2 | yes | specificity control @ w2 |
-| `zsfinal_blind4` | 4 | yes | specificity control @ w4 |
+| `zsfinal_s1` | 1 | no | no-shadow baseline (×1 = no reweighting) |
+| `zsfinal_s2` | 2 | no | shadow |
+| `zsfinal_s4` | 4 | no | shadow (same weight as the old phase22_B_L4) |
+| `zsfinal_blind_s2` | 2 | yes | specificity control @ weight 2 |
+| `zsfinal_blind_s4` | 4 | yes | specificity control @ weight 4 |
+
+(`sN` = shadow loss weight N, matching the `ablation_tcd_s0/s2/s4` convention.
+`s1` is the neutral no-shadow baseline — weight 1, not the old weight-0 "s0".)
 
 `blind` = `SHADOW_BLIND_CONTROL=1`: upweight the same NUMBER of GT boxes per image as the
 shadow logic would, but chosen at random (re-drawn every step). If blind ≈ shadow, the
@@ -60,8 +63,8 @@ Re-infer every cell through ONE pinned foxtrot→SAM pipeline, writing geojsons 
 `summary.json` provenance to **`benchmark_results_holdout/zsfinal_<cell>/`**, e.g.:
 ```bash
 caffeinate -i ./venv310/bin/python phase30/benchmark.py \
-  --models checkpoints/zsfinal/zsfinal_w4/deepforest_final.pth \
-  --names  zsfinal_w4 \
+  --models checkpoints/zsfinal/zsfinal_s4/deepforest_final.pth \
+  --names  zsfinal_s4 \
   --holdout-dir data/tcd/images/data/tcd/val \
   --shadow-model solar/shadow_regression/output/shadow_model_combined_best.pth \
   --sam-model vit_l --sam-checkpoint sam_vit_l_0b3195.pth \

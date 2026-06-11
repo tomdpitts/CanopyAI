@@ -8,11 +8,11 @@
 # flip, no photometric), WON bbox-shrink ON. Local MPS. Single variable across
 # cells = the shadow loss weight (+ the blind toggle for the controls).
 #
-#   zsfinal_w1      weight 1  — neutral (no-shadow baseline; ×1 = no reweight)
-#   zsfinal_w2      weight 2  — shadow
-#   zsfinal_w4      weight 4  — shadow (matches phase22_B_L4's weight)
-#   zsfinal_blind2  weight 2  + SHADOW_BLIND_CONTROL=1 — specificity control
-#   zsfinal_blind4  weight 4  + SHADOW_BLIND_CONTROL=1 — specificity control
+#   zsfinal_s1        weight 1  — neutral (no-shadow baseline; ×1 = no reweight)
+#   zsfinal_s2        weight 2  — shadow
+#   zsfinal_s4        weight 4  — shadow (matches phase22_B_L4's weight)
+#   zsfinal_blind_s2  weight 2  + SHADOW_BLIND_CONTROL=1 — specificity control
+#   zsfinal_blind_s4  weight 4  + SHADOW_BLIND_CONTROL=1 — specificity control
 #
 # Resumable: each cell's checkpoint dir is created under checkpoints/zsfinal/;
 # the trainer auto-resumes if a checkpoint already exists there. Comment out
@@ -44,10 +44,10 @@ run () {  # run <run_name> <weight> <blind:0|1>
 }
 
 mkdir -p "$OUT"
-run zsfinal_w1     1 0
-run zsfinal_w2     2 0
-run zsfinal_w4     4 0
-run zsfinal_blind2 2 1
-run zsfinal_blind4 4 1
+run zsfinal_s1       1 0
+run zsfinal_s2       2 0
+run zsfinal_s4       4 0
+run zsfinal_blind_s2 2 1
+run zsfinal_blind_s4 4 1
 
 echo -e "\nAll cells done. Checkpoints in ${OUT}/zsfinal_*/. Next: eval (see README §Eval)."
