@@ -116,6 +116,13 @@ def parse_args():
                    help="Detections-per-image cap for pycocotools mAP (maxDets[2] "
                         "slice).  Default 512 to match Restor's Mask-RCNN "
                         "(DETECTIONS_PER_IMAGE=512 / paper: 'increased predictions to 512').")
+    p.add_argument("--df-tta", action="store_true",
+                   help="Enable DeepForest multi-scale test-time augmentation "
+                        "(forwarded to foxtrot.py --df_tta).")
+    p.add_argument("--df-tta-scales", default=None,
+                   help="Comma-separated resize factors for --df-tta "
+                        "(forwarded to foxtrot.py --df_tta_scales; default there "
+                        "is '0.75,1.0,1.25,1.5').")
     return p.parse_args()
 
 
@@ -143,12 +150,17 @@ def run_foxtrot(model_spec, mtype, image_path, out_dir, shadow_model,
                 df_tile_overlap=None, bbox_pad=None, skip_nms=False,
                 containment_threshold=None, poly_containment_threshold=None,
                 reranker_checkpoint=None,
-                sam_model=None, sam_checkpoint=None):
+                sam_model=None, sam_checkpoint=None,
+                df_tta=False, df_tta_scales=None):
     cmd = [sys.executable, str(REPO_ROOT / "foxtrot.py"),
            "--image_path", str(image_path),
            "--output_dir", str(out_dir),
            "--shadow_model", str(shadow_model),
            "--no_viz"]
+    if df_tta:
+        cmd += ["--df_tta"]
+        if df_tta_scales is not None:
+            cmd += ["--df_tta_scales", str(df_tta_scales)]
     if mtype == "checkpoint":
         cmd += ["--deepforest_model", model_spec]
     if abs_luma_max is not None:
@@ -207,7 +219,8 @@ def run_inference(model_spec, mtype, holdout_dir, out_dir, shadow_model,
                   containment_threshold=None, poly_containment_threshold=None,
                   reranker_checkpoint=None,
                   sam_model=None, sam_checkpoint=None,
-                  skip_existing=False, tile_filter=None):
+                  skip_existing=False, tile_filter=None,
+                  df_tta=False, df_tta_scales=None):
     tifs = sorted(Path(holdout_dir).glob("*.tif"))
     if tile_filter is not None:
         tifs = [t for t in tifs if t.stem in tile_filter]
@@ -238,7 +251,8 @@ def run_inference(model_spec, mtype, holdout_dir, out_dir, shadow_model,
                                   poly_containment_threshold=poly_containment_threshold,
                                   reranker_checkpoint=reranker_checkpoint,
                                   sam_model=sam_model,
-                                  sam_checkpoint=sam_checkpoint)
+                                  sam_checkpoint=sam_checkpoint,
+                                  df_tta=df_tta, df_tta_scales=df_tta_scales)
         times.append(time.monotonic() - t0)
         print(("✓" if success else "✗") + _progress_suffix(times, len(pending)))
         ok += success
@@ -654,6 +668,40 @@ def save_tile_csv(name, per_tile, out_path):
     print(f"  📊 per-tile CSV: {out_path}")
 
 
+def _write_run_provenance(out_dir, args, model_spec, name):
+    """Drop a _run.json beside each model's predictions so the EXACT pipeline that
+    produced them is never lost (SAM model, reranker, score thresholds, git SHA)."""
+    import subprocess, datetime
+    try:
+        sha = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=str(Path(__file__).resolve().parent),
+            stderr=subprocess.DEVNULL).decode().strip()
+    except Exception:
+        sha = "unknown"
+    prov = {
+        "name": name,
+        "model": str(model_spec),
+        "generated_utc": datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "git_sha": sha,
+        "argv": sys.argv,
+        "config": {
+            "sam_model": args.sam_model, "sam_checkpoint": args.sam_checkpoint,
+            "df_confidence": args.df_confidence,
+            "reranker_checkpoint": args.reranker_checkpoint,
+            "pred_score_thresh": args.pred_score_thresh, "max_dets": args.max_dets,
+            "bbox_pad": args.bbox_pad, "df_tile_overlap": args.df_tile_overlap,
+            "df_tta": args.df_tta, "df_tta_scales": args.df_tta_scales,
+            "holdout_dir": str(args.holdout_dir),
+        },
+    }
+    try:
+        (Path(out_dir) / "_run.json").write_text(json.dumps(prov, indent=2))
+        print(f"  🧾 provenance: {Path(out_dir) / '_run.json'}")
+    except Exception as e:
+        print(f"  ⚠️  could not write _run.json: {e}")
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -695,7 +743,9 @@ def main():
                       sam_model=args.sam_model,
                       sam_checkpoint=args.sam_checkpoint,
                       skip_existing=args.skip_existing,
-                      tile_filter=tile_filter)
+                      tile_filter=tile_filter,
+                      df_tta=args.df_tta, df_tta_scales=args.df_tta_scales)
+        _write_run_provenance(out_dir, args, spec, name)
 
     # Step 2: evaluation
     all_results = {}

@@ -942,6 +942,44 @@ def detect_trees_deepforest(
     return all_bboxes, all_scores
 
 
+def detect_trees_deepforest_tta(image, scales, **kwargs):
+    """Multi-scale test-time augmentation around ``detect_trees_deepforest``.
+
+    Runs detection on the image resized by each factor in ``scales``, maps the
+    boxes back to native pixel coordinates, and returns the UNION of all
+    boxes/scores.  The caller's existing NMS (``apply_nms`` in main) then
+    de-duplicates the union — exactly how the 50%-overlap tiling already fuses
+    multi-position detections, now extended along the scale axis.
+
+    SCALE ONLY (no flips): resizing is orientation-preserving, so ``shadow_vector``
+    and the per-tile shadow maps stay valid for shadow-conditioned models.  Flips
+    would rotate the shadow geometry and are deliberately excluded.
+
+    Treats ``detect_trees_deepforest`` as a black box (no internal changes).
+    Per-scale shadow-map / debug side-outputs are suppressed for s != 1.0 to
+    avoid clobbering the single-scale artefacts.
+    """
+    union_boxes, union_scores = [], []
+    for s in scales:
+        if abs(s - 1.0) < 1e-6:
+            img_s, kw = image, kwargs
+        else:
+            interp = cv2.INTER_AREA if s < 1.0 else cv2.INTER_LINEAR
+            img_s = cv2.resize(image, None, fx=s, fy=s, interpolation=interp)
+            kw = dict(kwargs)
+            kw["shadow_map_path"] = None
+            kw["geo_meta"] = None
+            kw["debug_tile_dir"] = None
+        print(f"\n🔁 TTA scale {s:.2f}  (image {img_s.shape[1]}x{img_s.shape[0]})")
+        boxes_s, scores_s = detect_trees_deepforest(img_s, **kw)
+        inv = 1.0 / s
+        for (x1, y1, x2, y2), sc in zip(boxes_s, scores_s):
+            union_boxes.append([x1 * inv, y1 * inv, x2 * inv, y2 * inv])
+            union_scores.append(sc)
+    print(f"\n🔁 TTA union: {len(union_boxes)} boxes from scales {scales}")
+    return union_boxes, union_scores
+
+
 def segment_trees_sam(
     image,
     sam_predictor,
@@ -1826,8 +1864,7 @@ def main(args):
 
     # Pass 1: DeepForest detection at native 400px tiles
     df_start = time.time()
-    all_bboxes, all_scores = detect_trees_deepforest(
-        image,
+    _det_kwargs = dict(
         model_path=args.deepforest_model,
         shadow_vector=shadow_vector_tensor,
         tile_size=args.df_tile_size,
@@ -1842,6 +1879,13 @@ def main(args):
         shadow_input_only=args.shadow_input_only,
         abs_luma_max=args.abs_luma_max,
     )
+    if getattr(args, "df_tta", False):
+        _scales = [float(x) for x in args.df_tta_scales.split(",") if x.strip()]
+        print(f"\n🔁 DeepForest multi-scale TTA enabled: scales={_scales}")
+        all_bboxes, all_scores = detect_trees_deepforest_tta(
+            image, _scales, **_det_kwargs)
+    else:
+        all_bboxes, all_scores = detect_trees_deepforest(image, **_det_kwargs)
     timings["DeepForest"] = time.time() - df_start
 
     if len(all_bboxes) == 0:
@@ -2113,6 +2157,23 @@ def parse_args():
              "(default: 0.5).  Higher overlap means each tree gets "
              "proposed from more crop positions, which can lift recall "
              "on small/edge crowns at the cost of slower inference.",
+    )
+
+    ap.add_argument(
+        "--df_tta",
+        action="store_true",
+        help="Multi-scale test-time augmentation at the DeepForest stage: run "
+             "detection at each --df_tta_scales factor, union the boxes (back-"
+             "mapped to native coords), then the usual NMS de-dupes. Scale-only "
+             "(shadow-safe). Off by default; existing runs are unaffected.",
+    )
+
+    ap.add_argument(
+        "--df_tta_scales",
+        type=str,
+        default="0.75,1.0,1.25,1.5",
+        help="Comma-separated resize factors for --df_tta (must include 1.0). "
+             "Default '0.75,1.0,1.25,1.5'.",
     )
 
     ap.add_argument(
