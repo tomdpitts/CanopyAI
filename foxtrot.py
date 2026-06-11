@@ -421,6 +421,27 @@ def predict_shadow_vector(
     return mean_vector, stats
 
 
+def _set_model_score_thresh(df_model, confidence_threshold):
+    """Lower the DeepForest RetinaNet's INTERNAL score_thresh to the requested
+    confidence.
+
+    torchvision RetinaNet applies ``self.score_thresh`` (DeepForest default 0.1)
+    inside ``model(...)`` — i.e. BEFORE foxtrot's post-filter ``score >=
+    confidence_threshold``. So without this, ``--deepforest_confidence`` can only
+    filter ABOVE 0.1 and the sub-0.1 PR tail (needed for honest mAP) is never
+    returned. Setting the model threshold == the requested confidence makes the
+    model emit the full tail and the post-filter a consistent no-op. Idempotent;
+    a no-op when confidence_threshold is None.
+    """
+    if confidence_threshold is None:
+        return
+    try:
+        df_model.model.score_thresh = float(confidence_threshold)
+        print(f"   🔧 RetinaNet model.score_thresh set to {df_model.model.score_thresh}")
+    except Exception as e:
+        print(f"   ⚠️  could not set model.score_thresh: {e}")
+
+
 def detect_trees_deepforest(
     image,
     model_path=None,
@@ -582,6 +603,7 @@ def detect_trees_deepforest(
 
         df_model.to(device)
         df_model.eval()
+        _set_model_score_thresh(df_model, confidence_threshold)
 
         # Bug 2 fix: derive shadow_angle (float degrees) from shadow_vector parameter
         # so the tile loop can call generate_shadow_map(tile, shadow_angle).
@@ -621,6 +643,7 @@ def detect_trees_deepforest(
 
         df_model.model.to(device)
         df_model.model.eval()
+        _set_model_score_thresh(df_model, confidence_threshold)
         use_shadow_channel = False   # standard DF never uses shadow channel
 
     print(f"   🖥️  Device: {device}")
