@@ -1,0 +1,538 @@
+{
+  "phase22_B_L4": {
+    "model": "phase22_B_L4",
+    "n_tiles": 439,
+    "tree_only_control_ap50": 0.4976845010213401,
+    "tree_only_reference": 0.498,
+    "restor_2cat_ap50": 0.432,
+    "oracle_reference": {
+      "tree_only": 0.498,
+      "oracle_2cat": 0.428
+    },
+    "n_gt_tree_scored": 25604,
+    "n_gt_canopy_scored": 4582,
+    "params": {
+      "proposer1_density": {
+        "N_list": [
+          2,
+          3,
+          4
+        ],
+        "area_floor_px": 64,
+        "overlap_frac": 0.3
+      },
+      "proposer2_cluster": {
+        "tau_list": [
+          0.1,
+          0.25
+        ],
+        "K_list": [
+          3,
+          5
+        ],
+        "edge_metric": "intersection_over_smaller"
+      }
+    },
+    "results": [
+      {
+        "proposer": "density",
+        "param": "N=2",
+        "tree_ap50": 0.30614246887373603,
+        "canopy_ap50": 0.0006851258345281769,
+        "twocat_mean_ap50": 0.1534137973541321,
+        "n_canopy_dets": 24846
+      },
+      {
+        "proposer": "density",
+        "param": "N=3",
+        "tree_ap50": 0.30614246887373603,
+        "canopy_ap50": 0.0009000900090009002,
+        "twocat_mean_ap50": 0.15352127944136845,
+        "n_canopy_dets": 610
+      },
+      {
+        "proposer": "density",
+        "param": "N=4",
+        "tree_ap50": 0.30614246887373603,
+        "canopy_ap50": 0.0,
+        "twocat_mean_ap50": 0.15307123443686801,
+        "n_canopy_dets": 7
+      },
+      {
+        "proposer": "cluster",
+        "param": "tau=0.1,K=3",
+        "tree_ap50": 0.30614246887373603,
+        "canopy_ap50": 0.002524513231506456,
+        "twocat_mean_ap50": 0.15433349105262123,
+        "n_canopy_dets": 10456
+      },
+      {
+        "proposer": "cluster",
+        "param": "tau=0.1,K=5",
+        "tree_ap50": 0.30614246887373603,
+        "canopy_ap50": 0.000942951438000943,
+        "twocat_mean_ap50": 0.15354271015586848,
+        "n_canopy_dets": 2073
+      },
+      {
+        "proposer": "cluster",
+        "param": "tau=0.25,K=3",
+        "tree_ap50": 0.30614246887373603,
+        "canopy_ap50": 0.0015076220420160928,
+        "twocat_mean_ap50": 0.15382504545787606,
+        "n_canopy_dets": 5876
+      },
+      {
+        "proposer": "cluster",
+        "param": "tau=0.25,K=5",
+        "tree_ap50": 0.30614246887373603,
+        "canopy_ap50": 0.0014144271570014143,
+        "twocat_mean_ap50": 0.15377844801536872,
+        "n_canopy_dets": 610
+      }
+    ],
+    "best_per_proposer": {
+      "density": {
+        "param": "N=3",
+        "tree_ap50": 0.30614246887373603,
+        "canopy_ap50": 0.0009000900090009002,
+        "twocat_mean_ap50": 0.15352127944136845,
+        "n_canopy_dets": 610
+      },
+      "cluster": {
+        "param": "tau=0.1,K=3",
+        "tree_ap50": 0.30614246887373603,
+        "canopy_ap50": 0.002524513231506456,
+        "twocat_mean_ap50": 0.15433349105262123,
+        "n_canopy_dets": 10456
+      }
+    }
+  },
+  "ablation_tcd_s0": {
+    "model": "ablation_tcd_s0",
+    "n_tiles": 439,
+    "tree_only_control_ap50": 0.5352340552619891,
+    "tree_only_reference": 0.535,
+    "restor_2cat_ap50": 0.432,
+    "oracle_reference": {
+      "tree_only": 0.535,
+      "oracle_2cat": 0.447
+    },
+    "n_gt_tree_scored": 25604,
+    "n_gt_canopy_scored": 4582,
+    "params": {
+      "proposer1_density": {
+        "N_list": [
+          2,
+          3,
+          4
+        ],
+        "area_floor_px": 64,
+        "overlap_frac": 0.3
+      },
+      "proposer2_cluster": {
+        "tau_list": [
+          0.1,
+          0.25
+        ],
+        "K_list": [
+          3,
+          5
+        ],
+        "edge_metric": "intersection_over_smaller"
+      }
+    },
+    "results": [
+      {
+        "proposer": "density",
+        "param": "N=2",
+        "tree_ap50": 0.34607079470959456,
+        "canopy_ap50": 0.0035044741587560812,
+        "twocat_mean_ap50": 0.17478763443417533,
+        "n_canopy_dets": 5635
+      },
+      {
+        "proposer": "density",
+        "param": "N=3",
+        "tree_ap50": 0.34607079470959456,
+        "canopy_ap50": 0.0,
+        "twocat_mean_ap50": 0.17303539735479728,
+        "n_canopy_dets": 75
+      },
+      {
+        "proposer": "density",
+        "param": "N=4",
+        "tree_ap50": 0.34607079470959456,
+        "canopy_ap50": 0.0,
+        "twocat_mean_ap50": 0.17303539735479728,
+        "n_canopy_dets": 0
+      },
+      {
+        "proposer": "cluster",
+        "param": "tau=0.1,K=3",
+        "tree_ap50": 0.34607079470959456,
+        "canopy_ap50": 0.005038878651272068,
+        "twocat_mean_ap50": 0.1755548366804333,
+        "n_canopy_dets": 1581
+      },
+      {
+        "proposer": "cluster",
+        "param": "tau=0.1,K=5",
+        "tree_ap50": 0.34607079470959456,
+        "canopy_ap50": 0.0019801980198019802,
+        "twocat_mean_ap50": 0.17402549636469827,
+        "n_canopy_dets": 180
+      },
+      {
+        "proposer": "cluster",
+        "param": "tau=0.25,K=3",
+        "tree_ap50": 0.34607079470959456,
+        "canopy_ap50": 0.0035781426243890217,
+        "twocat_mean_ap50": 0.1748244686669918,
+        "n_canopy_dets": 888
+      },
+      {
+        "proposer": "cluster",
+        "param": "tau=0.25,K=5",
+        "tree_ap50": 0.34607079470959456,
+        "canopy_ap50": 0.0005211047420531526,
+        "twocat_mean_ap50": 0.17329594972582385,
+        "n_canopy_dets": 40
+      }
+    ],
+    "best_per_proposer": {
+      "density": {
+        "param": "N=2",
+        "tree_ap50": 0.34607079470959456,
+        "canopy_ap50": 0.0035044741587560812,
+        "twocat_mean_ap50": 0.17478763443417533,
+        "n_canopy_dets": 5635
+      },
+      "cluster": {
+        "param": "tau=0.1,K=3",
+        "tree_ap50": 0.34607079470959456,
+        "canopy_ap50": 0.005038878651272068,
+        "twocat_mean_ap50": 0.1755548366804333,
+        "n_canopy_dets": 1581
+      }
+    }
+  },
+  "phase21_baseline": {
+    "model": "phase21_baseline",
+    "n_tiles": 439,
+    "tree_only_control_ap50": 0.4401041552554624,
+    "tree_only_reference": 0.44,
+    "restor_2cat_ap50": 0.432,
+    "oracle_reference": {},
+    "n_gt_tree_scored": 25604,
+    "n_gt_canopy_scored": 4582,
+    "params": {
+      "proposer1_density": {
+        "N_list": [
+          2,
+          3,
+          4
+        ],
+        "area_floor_px": 64,
+        "overlap_frac": 0.3
+      },
+      "proposer2_cluster": {
+        "tau_list": [
+          0.1,
+          0.25
+        ],
+        "K_list": [
+          3,
+          5
+        ],
+        "edge_metric": "intersection_over_smaller"
+      }
+    },
+    "results": [
+      {
+        "proposer": "density",
+        "param": "N=2",
+        "tree_ap50": 0.26867442467795405,
+        "canopy_ap50": 0.002161832108269375,
+        "twocat_mean_ap50": 0.1354181283931117,
+        "n_canopy_dets": 24035
+      },
+      {
+        "proposer": "density",
+        "param": "N=3",
+        "tree_ap50": 0.26867442467795405,
+        "canopy_ap50": 0.0,
+        "twocat_mean_ap50": 0.13433721233897702,
+        "n_canopy_dets": 615
+      },
+      {
+        "proposer": "density",
+        "param": "N=4",
+        "tree_ap50": 0.26867442467795405,
+        "canopy_ap50": 0.0,
+        "twocat_mean_ap50": 0.13433721233897702,
+        "n_canopy_dets": 6
+      },
+      {
+        "proposer": "cluster",
+        "param": "tau=0.1,K=3",
+        "tree_ap50": 0.26867442467795405,
+        "canopy_ap50": 0.0013253868281306778,
+        "twocat_mean_ap50": 0.13499990575304235,
+        "n_canopy_dets": 10200
+      },
+      {
+        "proposer": "cluster",
+        "param": "tau=0.1,K=5",
+        "tree_ap50": 0.26867442467795405,
+        "canopy_ap50": 0.0007072135785007071,
+        "twocat_mean_ap50": 0.1346908191282274,
+        "n_canopy_dets": 2229
+      },
+      {
+        "proposer": "cluster",
+        "param": "tau=0.25,K=3",
+        "tree_ap50": 0.26867442467795405,
+        "canopy_ap50": 0.0009704706274572466,
+        "twocat_mean_ap50": 0.13482244765270565,
+        "n_canopy_dets": 5913
+      },
+      {
+        "proposer": "cluster",
+        "param": "tau=0.25,K=5",
+        "tree_ap50": 0.26867442467795405,
+        "canopy_ap50": 0.001563314226159458,
+        "twocat_mean_ap50": 0.13511886945205676,
+        "n_canopy_dets": 707
+      }
+    ],
+    "best_per_proposer": {
+      "density": {
+        "param": "N=2",
+        "tree_ap50": 0.26867442467795405,
+        "canopy_ap50": 0.002161832108269375,
+        "twocat_mean_ap50": 0.1354181283931117,
+        "n_canopy_dets": 24035
+      },
+      "cluster": {
+        "param": "tau=0.25,K=5",
+        "tree_ap50": 0.26867442467795405,
+        "canopy_ap50": 0.001563314226159458,
+        "twocat_mean_ap50": 0.13511886945205676,
+        "n_canopy_dets": 707
+      }
+    }
+  },
+  "ablation_pre_s2": {
+    "model": "ablation_pre_s2",
+    "n_tiles": 439,
+    "tree_only_control_ap50": 0.4930599829691433,
+    "tree_only_reference": 0.493,
+    "restor_2cat_ap50": 0.432,
+    "oracle_reference": {},
+    "n_gt_tree_scored": 25604,
+    "n_gt_canopy_scored": 4582,
+    "params": {
+      "proposer1_density": {
+        "N_list": [
+          2,
+          3,
+          4
+        ],
+        "area_floor_px": 64,
+        "overlap_frac": 0.3
+      },
+      "proposer2_cluster": {
+        "tau_list": [
+          0.1,
+          0.25
+        ],
+        "K_list": [
+          3,
+          5
+        ],
+        "edge_metric": "intersection_over_smaller"
+      }
+    },
+    "results": [
+      {
+        "proposer": "density",
+        "param": "N=2",
+        "tree_ap50": 0.30141672871147496,
+        "canopy_ap50": 0.0045116312873523376,
+        "twocat_mean_ap50": 0.15296417999941364,
+        "n_canopy_dets": 19951
+      },
+      {
+        "proposer": "density",
+        "param": "N=3",
+        "tree_ap50": 0.30141672871147496,
+        "canopy_ap50": 0.0,
+        "twocat_mean_ap50": 0.15070836435573748,
+        "n_canopy_dets": 471
+      },
+      {
+        "proposer": "density",
+        "param": "N=4",
+        "tree_ap50": 0.30141672871147496,
+        "canopy_ap50": 0.0,
+        "twocat_mean_ap50": 0.15070836435573748,
+        "n_canopy_dets": 3
+      },
+      {
+        "proposer": "cluster",
+        "param": "tau=0.1,K=3",
+        "tree_ap50": 0.30141672871147496,
+        "canopy_ap50": 0.0018416091732654826,
+        "twocat_mean_ap50": 0.15162916894237022,
+        "n_canopy_dets": 8169
+      },
+      {
+        "proposer": "cluster",
+        "param": "tau=0.1,K=5",
+        "tree_ap50": 0.30141672871147496,
+        "canopy_ap50": 0.00046592894583576003,
+        "twocat_mean_ap50": 0.15094132882865535,
+        "n_canopy_dets": 1539
+      },
+      {
+        "proposer": "cluster",
+        "param": "tau=0.25,K=3",
+        "tree_ap50": 0.30141672871147496,
+        "canopy_ap50": 0.0017985172901526605,
+        "twocat_mean_ap50": 0.15160762300081382,
+        "n_canopy_dets": 4380
+      },
+      {
+        "proposer": "cluster",
+        "param": "tau=0.25,K=5",
+        "tree_ap50": 0.30141672871147496,
+        "canopy_ap50": 0.00024446889133357777,
+        "twocat_mean_ap50": 0.15083059880140426,
+        "n_canopy_dets": 421
+      }
+    ],
+    "best_per_proposer": {
+      "density": {
+        "param": "N=2",
+        "tree_ap50": 0.30141672871147496,
+        "canopy_ap50": 0.0045116312873523376,
+        "twocat_mean_ap50": 0.15296417999941364,
+        "n_canopy_dets": 19951
+      },
+      "cluster": {
+        "param": "tau=0.1,K=3",
+        "tree_ap50": 0.30141672871147496,
+        "canopy_ap50": 0.0018416091732654826,
+        "twocat_mean_ap50": 0.15162916894237022,
+        "n_canopy_dets": 8169
+      }
+    }
+  },
+  "detectree2_stock_100m_px": {
+    "model": "detectree2_stock_100m_px",
+    "n_tiles": 439,
+    "tree_only_control_ap50": 0.03219788562569223,
+    "tree_only_reference": 0.032,
+    "restor_2cat_ap50": 0.432,
+    "oracle_reference": {},
+    "n_gt_tree_scored": 25604,
+    "n_gt_canopy_scored": 4582,
+    "params": {
+      "proposer1_density": {
+        "N_list": [
+          2,
+          3,
+          4
+        ],
+        "area_floor_px": 64,
+        "overlap_frac": 0.3
+      },
+      "proposer2_cluster": {
+        "tau_list": [
+          0.1,
+          0.25
+        ],
+        "K_list": [
+          3,
+          5
+        ],
+        "edge_metric": "intersection_over_smaller"
+      }
+    },
+    "results": [
+      {
+        "proposer": "density",
+        "param": "N=2",
+        "tree_ap50": 0.018789331660378765,
+        "canopy_ap50": 0.0013898950870696826,
+        "twocat_mean_ap50": 0.010089613373724224,
+        "n_canopy_dets": 3753
+      },
+      {
+        "proposer": "density",
+        "param": "N=3",
+        "tree_ap50": 0.018789331660378765,
+        "canopy_ap50": 0.0,
+        "twocat_mean_ap50": 0.009394665830189382,
+        "n_canopy_dets": 69
+      },
+      {
+        "proposer": "density",
+        "param": "N=4",
+        "tree_ap50": 0.018789331660378765,
+        "canopy_ap50": 0.0,
+        "twocat_mean_ap50": 0.009394665830189382,
+        "n_canopy_dets": 0
+      },
+      {
+        "proposer": "cluster",
+        "param": "tau=0.1,K=3",
+        "tree_ap50": 0.018789331660378765,
+        "canopy_ap50": 0.0024752475247524753,
+        "twocat_mean_ap50": 0.01063228959256562,
+        "n_canopy_dets": 1272
+      },
+      {
+        "proposer": "cluster",
+        "param": "tau=0.1,K=5",
+        "tree_ap50": 0.018789331660378765,
+        "canopy_ap50": 0.0049504950495049506,
+        "twocat_mean_ap50": 0.011869913354941858,
+        "n_canopy_dets": 202
+      },
+      {
+        "proposer": "cluster",
+        "param": "tau=0.25,K=3",
+        "tree_ap50": 0.018789331660378765,
+        "canopy_ap50": 0.0014144271570014143,
+        "twocat_mean_ap50": 0.01010187940869009,
+        "n_canopy_dets": 809
+      },
+      {
+        "proposer": "cluster",
+        "param": "tau=0.25,K=5",
+        "tree_ap50": 0.018789331660378765,
+        "canopy_ap50": 0.0099009900990099,
+        "twocat_mean_ap50": 0.014345160879694332,
+        "n_canopy_dets": 84
+      }
+    ],
+    "best_per_proposer": {
+      "density": {
+        "param": "N=2",
+        "tree_ap50": 0.018789331660378765,
+        "canopy_ap50": 0.0013898950870696826,
+        "twocat_mean_ap50": 0.010089613373724224,
+        "n_canopy_dets": 3753
+      },
+      "cluster": {
+        "param": "tau=0.25,K=5",
+        "tree_ap50": 0.018789331660378765,
+        "canopy_ap50": 0.0099009900990099,
+        "twocat_mean_ap50": 0.014345160879694332,
+        "n_canopy_dets": 84
+      }
+    }
+  }
+}

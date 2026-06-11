@@ -1,0 +1,21 @@
+{
+  "tree_only_control_ap50": 0.5150167367175769,
+  "tree_only_reference": 0.515,
+  "restor_2cat_ap50": 0.432,
+  "n_gt_tree_scored": 25604,
+  "n_gt_canopy_scored": 4582,
+  "thresholds": {
+    "T=0.5": {
+      "tree_ap50": 0.3372631895675608,
+      "canopy_ap50": 0.5395185755397477,
+      "twocat_mean_ap50": 0.4383908825536542,
+      "n_canopy_dets": 3820
+    },
+    "T=0.7": {
+      "tree_ap50": 0.3372631895675608,
+      "canopy_ap50": 0.5009725728747911,
+      "twocat_mean_ap50": 0.419117881221176,
+      "n_canopy_dets": 3637
+    }
+  }
+}

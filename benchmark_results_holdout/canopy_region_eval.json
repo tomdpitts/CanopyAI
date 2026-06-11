@@ -1,0 +1,45 @@
+{
+  "ckpt": "/tmp/shadow_semseg/runs/canopyreg_p22/best.pt",
+  "tree_only_control": 0.5352340552619891,
+  "gate_thr": 0.5,
+  "n_gt_tree": 25604,
+  "n_gt_canopy": 4582,
+  "results": [
+    {
+      "thr": 0.5,
+      "area_floor": 256,
+      "tree_ap_ungated": 0.34607079470959456,
+      "tree_ap_gated": 0.33508635302462464,
+      "canopy_ap": 0.16145502722315125,
+      "twocat_ungated": 0.25376291096637293,
+      "twocat_gated": 0.24827069012388794
+    },
+    {
+      "thr": 0.5,
+      "area_floor": 1024,
+      "tree_ap_ungated": 0.34607079470959456,
+      "tree_ap_gated": 0.3356362915954408,
+      "canopy_ap": 0.1618373408539695,
+      "twocat_ungated": 0.25395406778178203,
+      "twocat_gated": 0.24873681622470514
+    },
+    {
+      "thr": 0.4,
+      "area_floor": 1024,
+      "tree_ap_ungated": 0.34607079470959456,
+      "tree_ap_gated": 0.33511374286727225,
+      "canopy_ap": 0.17096571215909767,
+      "twocat_ungated": 0.2585182534343461,
+      "twocat_gated": 0.25303972751318493
+    },
+    {
+      "thr": 0.6,
+      "area_floor": 1024,
+      "tree_ap_ungated": 0.34607079470959456,
+      "tree_ap_gated": 0.3489639104905278,
+      "canopy_ap": 0.15627841042530413,
+      "twocat_ungated": 0.25117460256744933,
+      "twocat_gated": 0.25262116045791594
+    }
+  ]
+}

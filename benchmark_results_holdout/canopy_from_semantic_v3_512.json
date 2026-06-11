@@ -1,0 +1,53 @@
+{
+  "ckpt": "shadow_semseg/saved/v3/best.pt",
+  "tree_model": "ablation_tcd_s0",
+  "n_tiles": 439,
+  "tree_only_control_ap50": 0.5352340552619891,
+  "tree_ref": 0.535,
+  "n_gt_tree_scored": 25604,
+  "n_gt_canopy_scored": 4582,
+  "restor_published_2cat": 0.432,
+  "restor_ourharness_2cat": 0.343,
+  "results": [
+    {
+      "thr": 0.5,
+      "area_floor": 64,
+      "tree_ap": 0.34607079470959456,
+      "canopy_ap": 0.0762526068615654,
+      "twocat_mean": 0.21116170078558,
+      "n_canopy_dets": 15105
+    },
+    {
+      "thr": 0.5,
+      "area_floor": 256,
+      "tree_ap": 0.34607079470959456,
+      "canopy_ap": 0.07539955580879722,
+      "twocat_mean": 0.21073517525919588,
+      "n_canopy_dets": 10941
+    },
+    {
+      "thr": 0.4,
+      "area_floor": 256,
+      "tree_ap": 0.34607079470959456,
+      "canopy_ap": 0.07756120230544852,
+      "twocat_mean": 0.21181599850752153,
+      "n_canopy_dets": 10917
+    },
+    {
+      "thr": 0.6,
+      "area_floor": 256,
+      "tree_ap": 0.34607079470959456,
+      "canopy_ap": 0.07542577222537301,
+      "twocat_mean": 0.21074828346748378,
+      "n_canopy_dets": 11153
+    },
+    {
+      "thr": 0.5,
+      "area_floor": 1024,
+      "tree_ap": 0.34607079470959456,
+      "canopy_ap": 0.07699601041264227,
+      "twocat_mean": 0.2115334025611184,
+      "n_canopy_dets": 6736
+    }
+  ]
+}

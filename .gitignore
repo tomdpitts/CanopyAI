@@ -90,6 +90,16 @@ phase30/zeroshot/*.log
 
 benchmark_results/*
 benchmark_results_holdout/*
+# …but track the lightweight provenance artifacts in the holdout deliverable:
+# tables/ledger (.md), run summaries, and the 2-cat scorer outputs. Model dirs
+# are re-included as dirs, their geojsons re-ignored, summaries kept.
+!benchmark_results_holdout/*.md
+!benchmark_results_holdout/*summary*.json
+!benchmark_results_holdout/canopy_*.json
+!benchmark_results_holdout/*/
+benchmark_results_holdout/*/*
+!benchmark_results_holdout/*/summary*.json
+!benchmark_results_holdout/*/_run.json
 benchmark_results_holdout_noRR/*
 benchmark_results_train/*
 benchmark_results_restor/*

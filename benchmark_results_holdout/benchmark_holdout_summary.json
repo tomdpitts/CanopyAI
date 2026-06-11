@@ -1,0 +1,69 @@
+{
+  "args": {
+    "models": [
+      "checkpoints/blindzero_w2/deepforest-epoch=29-map=0.48.ckpt",
+      "checkpoints/blindzero_w4/deepforest-epoch=23-map=0.47.ckpt"
+    ],
+    "names": [
+      "blindzero_w2",
+      "blindzero_w4"
+    ],
+    "holdout_dir": "data/tcd/images/data/tcd/val",
+    "output_root": "benchmark_results_holdout",
+    "shadow_model": "solar/shadow_regression/output/shadow_model_combined_best.pth",
+    "abs_luma_max": null,
+    "df_confidence": 0.05,
+    "df_tile_overlap": null,
+    "bbox_pad": null,
+    "skip_nms": false,
+    "containment_threshold": null,
+    "poly_containment_threshold": null,
+    "reranker_checkpoint": null,
+    "sam_model": "vit_h",
+    "sam_checkpoint": "sam_vit_h_4b8939.pth",
+    "tiles": null,
+    "tiles_file": null,
+    "skip_inference": false,
+    "skip_existing": true,
+    "pred_score_thresh": 0.0,
+    "max_dets": 512,
+    "df_tta": false,
+    "df_tta_scales": null
+  },
+  "results": {
+    "blindzero_w2": {
+      "n_tiles": 439,
+      "n_gt_tree": 25700,
+      "n_pred": 371493,
+      "tp": 283745875,
+      "fp": 364471574,
+      "fn": 187619617,
+      "tn": 1005462390,
+      "macro_iou": 0.4925073117173538,
+      "f1_tree": 0.5068778106721796,
+      "tree_recall": 0.6019657353279481,
+      "iou_tree": 0.3394751041107813,
+      "iou_bg": 0.6455395193239263,
+      "pixel_acc": 0.700162192955104,
+      "map50": 0.09807326242949224,
+      "ar1000": 0.3476264591439689
+    },
+    "blindzero_w4": {
+      "n_tiles": 439,
+      "n_gt_tree": 25700,
+      "n_pred": 405344,
+      "tp": 308497006,
+      "fp": 438840878,
+      "fn": 162868486,
+      "tn": 931093086,
+      "macro_iou": 0.4731878859998405,
+      "f1_tree": 0.5062708647161407,
+      "tree_recall": 0.6544751604345275,
+      "iou_tree": 0.33893083609159974,
+      "iou_bg": 0.6074449359080814,
+      "pixel_acc": 0.6732148255193967,
+      "map50": 0.09712662409824672,
+      "ar1000": 0.3354474708171206
+    }
+  }
+}

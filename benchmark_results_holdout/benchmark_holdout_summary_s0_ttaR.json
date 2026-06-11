@@ -1,0 +1,50 @@
+{
+  "args": {
+    "models": [
+      "checkpoints/ablation_tcd_s0/deepforest-epoch=71-map=0.45.ckpt"
+    ],
+    "names": [
+      "s0_ttaR"
+    ],
+    "holdout_dir": "data/tcd/images/data/tcd/val",
+    "output_root": "benchmark_results_holdout",
+    "shadow_model": "solar/shadow_regression/output/shadow_model_combined_best.pth",
+    "abs_luma_max": null,
+    "df_confidence": null,
+    "df_tile_overlap": null,
+    "bbox_pad": null,
+    "skip_nms": false,
+    "containment_threshold": null,
+    "poly_containment_threshold": null,
+    "reranker_checkpoint": null,
+    "sam_model": null,
+    "sam_checkpoint": null,
+    "tiles": null,
+    "tiles_file": null,
+    "skip_inference": true,
+    "skip_existing": false,
+    "pred_score_thresh": 0.0,
+    "max_dets": 512,
+    "df_tta": false,
+    "df_tta_scales": null
+  },
+  "results": {
+    "s0_ttaR": {
+      "n_tiles": 439,
+      "n_gt_tree": 25700,
+      "n_pred": 66778,
+      "tp": 336501499,
+      "fp": 99100341,
+      "fn": 134863993,
+      "tn": 1270833623,
+      "macro_iou": 0.7171962660639521,
+      "f1_tree": 0.7420366470266649,
+      "tree_recall": 0.7138865799705169,
+      "iou_tree": 0.5898714340706186,
+      "iou_bg": 0.8445210980572856,
+      "pixel_acc": 0.8729352071236369,
+      "map50": 0.4039184707065622,
+      "ar1000": 0.4677431906614786
+    }
+  }
+}
