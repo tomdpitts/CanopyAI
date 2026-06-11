@@ -50,4 +50,6 @@ run zsfinal_s4       4 0
 run zsfinal_blind_s2 2 1
 run zsfinal_blind_s4 4 1
 
-echo -e "\nAll cells done. Checkpoints in ${OUT}/zsfinal_*/. Next: eval (see README §Eval)."
+echo -e "\nAll cells done. Checkpoints in ${OUT}/zsfinal_*/."
+echo "⚠️  Eval the BEST checkpoint (deepforest-epoch=*.ckpt, top-1 val-mAP), NOT"
+echo "    deepforest_final.pth (last epoch, up to patience=10 past the best). See README §Eval."

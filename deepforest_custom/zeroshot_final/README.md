@@ -42,8 +42,13 @@ gain is generic hard-example mining; if shadow > blind, the shadow prior is doin
 remapped to the current repo root and sub-400 px tiles dropped. They are **gitignored**
 (machine-specific absolute paths); `build_csvs.py` is the tracked, reproducible source.
 
-- train: **128 images** (BRU 41 / NEON 55 / WON 32), 1402 boxes
-- val: **36 images** (BRU 10 / WON 9... NEON absent from val), 443 boxes
+- train: **128 images** (BRU 41 / NEON 55 / WON 32), 1402 boxes (incl. 16 confirmed-empty
+  hard negatives)
+- val: **36 images** = BRU 10 / WON 9 / **17 NEON-site crops** (WOOD, DCFS, OAES, STER, …) whose
+  `domain` column is empty and which carry **no shadow annotations**. NEON *is* in val — only the
+  metadata is missing, because the manual shadow-annotation effort (55 NEON images, phase22) was
+  spent on train only: shadow vectors are a train-time loss input, never needed at validation.
+  Practical effect: WON-shrink doesn't touch them (not WON) and val-mAP is computed normally.
 - **Dropped tiles** (one per split): `bru_tile_856_4400_rot285.tif` (train) and
   `bru_tile_456_4400_rot183.tif` (val), both **400×200 px** rotation-crop strips. The
   400×400 `RandomCrop` in deepforest_custom has **no padding** → albumentations raises
@@ -61,9 +66,13 @@ Checkpoints → `checkpoints/zsfinal/zsfinal_<cell>/` (best-mAP epoch kept; auto
 ## Eval (after training) — outputs to benchmark_results_holdout/
 Re-infer every cell through ONE pinned foxtrot→SAM pipeline, writing geojsons + the automatic
 `summary.json` provenance to **`benchmark_results_holdout/zsfinal_<cell>/`**, e.g.:
+**Eval the BEST checkpoint (`deepforest-epoch=*.ckpt`, top-1 val-mAP), NOT `deepforest_final.pth`** —
+the latter is the in-memory model at the *last* epoch, up to `patience`=10 epochs past the best
+(the trainer never reloads the best weights before saving it). `save_top_k=1` guarantees exactly
+one `deepforest-epoch=*.ckpt` per cell, so a glob resolves it:
 ```bash
 caffeinate -i ./venv310/bin/python phase30/benchmark.py \
-  --models checkpoints/zsfinal/zsfinal_s4/deepforest_final.pth \
+  --models checkpoints/zsfinal/zsfinal_s4/deepforest-epoch=*.ckpt \
   --names  zsfinal_s4 \
   --holdout-dir data/tcd/images/data/tcd/val \
   --shadow-model solar/shadow_regression/output/shadow_model_combined_best.pth \
