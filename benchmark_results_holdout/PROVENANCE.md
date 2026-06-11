@@ -42,6 +42,36 @@ summary, so this file records what we could reconstruct — and, honestly, what 
   are sound and important for the ablation (see "TRAINING provenance" below) — they
   need a fresh eval through the pinned pipeline.
 
+## TRAINING recipes — the zero-shot apples-to-apples matrix (reconstructed 2026-06-11)
+All zero-shot models train on the same BRU/WON/NEON data (`phase22_train.csv`, 129 tiles;
+`*_filt.csv` = 128/129 after the sub-400px drop — negligible). But they span **THREE
+training setups**, so they are NOT one matched family:
+
+| family | models | trainer | base | epochs/patience | augmentation | evidence |
+|---|---|---|---|---|---|---|
+| **A (originals)** | `phase21_baseline` (no-shadow†), `phase22_B_L4` (shadow ×4) | `deepforest_custom` @ Modal A100 | weecology | 50 / 10, bs16 lr1e-3 | crop400 + **HFlip** | `deepforest_custom/modal_deepforest.py` docstring; `phase30/SHADOW_RERANKER_ABLATION.md` Provenance |
+| **B** | `ablation_pre_s2` (shadow ×2) | **phase30/lib** @ Modal A100 | weecology | 50 / 10, bs16 lr1e-3 | crop400 + **photometric** (blur/brightness/HSV), **no flip** | `phase30/modal/ablation_grid.sh` (S1) + `phase30/modal/train.py` AUG |
+| **C (local blind family)** | `ablation_shadow_w4_local`, `ablation_blind_w2/w4`, `blindzero_w2/w4` | phase30/lib, **local MPS** | weecology | 50 / **99** (no early stop), bs16 lr1e-3 | **crop400 only** (no flip — per train.log, contra the handoff note) | `checkpoints/*/train.log` |
+
+† `phase21_baseline` ≡ no-shadow: its train CSV had no shadow vectors, so the reweight
+never fired (confirmed in SHADOW_RERANKER_ABLATION.md; 129/129 image overlap with phase22).
+
+**Two further complete single-recipe sweep families already exist** (`checkpoints/zeroshot_shadow/`,
+filt CSVs, deepforest_custom trainer, local MPS, crop400):
+- **F1 `zs_*`** — from weecology, 40 ep: sw {0,1,2,4,8} singles + `zs_sw_2{,b,c}` (3 shadow seeds)
+  + `zs_blind_2{a,b,c}` (3 blind seeds). Missing: blind ×4. (= `sweep.sh` + `control_run.sh`.)
+- **F2 `p22re_*`** — fine-tuned FROM `phase21_baseline.pth`, 25 ep: sw {0,1,2,4,8} + `p22re_blind4`.
+  Single seed each. (= the deleted `overnight_shadow.sh` Obj2 "recreate" runs.)
+
+**Clean (training-matched) comparisons available TODAY, no retraining:**
+- shadow ×4 vs none: `phase21_baseline` ↔ `phase22_B_L4` (family A — the headline pair)
+- specificity @ w2: `zs_sw_2{,b,c}` ↔ `zs_blind_2{a,b,c}` (F1, 3v3 seeds)
+- specificity @ w4: `p22re_sw_4` ↔ `p22re_blind4` (F2) and `ablation_shadow_w4_local` ↔
+  `ablation_blind_w4`/`blindzero_w4` (C)
+- **NOT clean:** the published w0→×2→×4 monotonic trio (A+B mix: `ablation_pre_s2`'s trainer
+  fork + augmentation differ from A) — footnote this in the paper or re-make the w2 point
+  from a matched family.
+
 ## TRAINING provenance — the blind-control (shadow-specificity) checkpoint family
 The blind models are the key ablation: same count of upweighted boxes per image as the
 shadow logic chose, but picked at RANDOM. If blind ≈ shadow, the gain is generic
