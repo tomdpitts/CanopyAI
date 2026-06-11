@@ -1,0 +1,145 @@
+GPU available: True (mps), used: True
+TPU available: False, using: 0 TPU cores
+💡 Tip: For seamless cloud logging and experiment tracking, try installing [litlogger](https://pypi.org/project/litlogger/) to enable LitLogger, which logs metrics and artifacts automatically to the Lightning Experiments platform.
+GPU available: True (mps), used: True
+TPU available: False, using: 0 TPU cores
+💡 Tip: For seamless cloud logging and experiment tracking, try installing [litlogger](https://pypi.org/project/litlogger/) to enable LitLogger, which logs metrics and artifacts automatically to the Lightning Experiments platform.
+/Users/tompitts/Library/Mobile Documents/com~apple~CloudDocs/dphil icloud/CanopyAI/venv310/lib/python3.10/site-packages/pytorch_lightning/callbacks/model_checkpoint.py:881: Checkpoint directory /Users/tompitts/Library/Mobile Documents/com~apple~CloudDocs/dphil icloud/CanopyAI/checkpoints/zsfinal/zsfinal_s1 exists and is not empty.
+/Users/tompitts/Library/Mobile Documents/com~apple~CloudDocs/dphil icloud/CanopyAI/venv310/lib/python3.10/site-packages/torch/optim/lr_scheduler.py:60: UserWarning: The verbose parameter is deprecated. Please use get_last_lr() to access the learning rate.
+  warnings.warn(
+
+============================================================
+🌲 DeepForest Training: zsfinal_s1
+============================================================
+============================================================
+🌲 DeepForest Fine-tuning
+============================================================
+
+⚙️  Initializing model...
+   Shadow angle auto-derived from CSV: 78.7 deg
+   shadow_channel=False  shadow_cross_attention=False  shadow_proposals=False  shadow_proposals_iso=False  won_bbox_shrink=True
+   Loaded 128 shadow vectors from train CSV (0 skipped — no shadow annotation)
+   No dg_scale/dark_scale/otsu_ctr in train CSV — shadow maps will use per-tile stats
+   Loaded domain labels from train CSV: ['BRU', 'NEON', 'WON']
+   Loaded 19 shadow vectors from val CSV (17 skipped — no shadow annotation)
+   No dg_scale/dark_scale/otsu_ctr in val CSV — shadow maps will use per-tile stats
+   Loaded domain labels from val CSV: ['BRU', 'NAN', 'NEON', 'WON']
+   Shadow Anticipation: DISABLED
+   ✅ Shadow Loss Reweight: ENABLED  weight=1.0x for shadow-casting GT boxes
+   Shadow Proposals: DISABLED
+
+📦 Loading pretrained weights...
+   ✅ Loaded HuggingFace pretrained weights
+
+🔍 Searching for checkpoint to resume from...
+   ⚠️  No checkpoint found in checkpoints/zsfinal/zsfinal_s1
+   Starting fresh training
+
+⚙️  Configuring training...
+   🔄 Train transform: crop400 + ToTensorV2 (wrapper active)
+   Validation enabled: deepforest_custom/zeroshot_final/val.csv
+
+🔲 Found 16 confirmed-empty (hard-negative) images — will be injected into dataset after CSV loading
+
+📊 Loading training data from deepforest_custom/zeroshot_final/train.csv...
+   Training samples: 1386 bounding boxes
+   Annotated images: 112
+   Empty images    : 16
+   Total images    : 128
+
+📊 Loading validation data from deepforest_custom/zeroshot_final/val.csv...
+   Validation samples: 439 bounding boxes
+   Annotated images  : 32
+   Empty images      : 4
+
+⚙️  Training configuration:
+   Epochs: 50
+   Batch size: 16
+   Learning rate: 0.001
+   Early stopping patience: 5
+   Checkpoint dir: checkpoints/zsfinal/zsfinal_s1
+
+🚀 Starting training...
+------------------------------------------------------------
+   Optimizer: SGD  backbone_lr=0.001
+┏━━━┳━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━┳━━━━━━━┳━━━━━━━┓
+┃   ┃ Name                 ┃ Type                  ┃ Params ┃ Mode  ┃ FLOPs ┃
+┡━━━╇━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━╇━━━━━━━╇━━━━━━━┩
+│ 0 │ iou_metric           │ IntersectionOverUnion │      0 │ train │     0 │
+│ 1 │ mAP_metric           │ MeanAveragePrecision  │      0 │ train │     0 │
+│ 2 │ empty_frame_accuracy │ BinaryAccuracy        │      0 │ train │     0 │
+│ 3 │ model                │ RetinaNetHub          │ 32.1 M │ train │     0 │
+└───┴──────────────────────┴───────────────────────┴────────┴───────┴───────┘
+Trainable params: 31.9 M                                                        
+Non-trainable params: 222 K                                                     
+Total params: 32.1 M                                                            
+Total estimated model params size (MB): 128                                     
+Modules in train mode: 205                                                      
+Modules in eval mode: 0                                                         
+Total FLOPs: 0                                                                  
+/Users/tompitts/Library/Mobile Documents/com~apple~CloudDocs/dphil icloud/CanopyAI/venv310/lib/python3.10/site-packages/albumentations/core/composition.py:331: UserWarning: Got processor for bboxes, but no transform to process it.
+  self._set_keys()
+/Users/tompitts/Library/Mobile Documents/com~apple~CloudDocs/dphil icloud/CanopyAI/venv310/lib/python3.10/site-packages/albumentations/core/composition.py:331: UserWarning: Got processor for bboxes, but no transform to process it.
+  self._set_keys()
+Metric map improved. New best score: 0.383
+Epoch 2, global step 24: 'map' reached 0.38286 (best 0.38286), saving model to '/Users/tompitts/Library/Mobile Documents/com~apple~CloudDocs/dphil icloud/CanopyAI/checkpoints/zsfinal/zsfinal_s1/deepforest-epoch=02-map=0.38.ckpt' as top 1
+Epoch 5, global step 48: 'map' was not in top 1
+Epoch 8, global step 72: 'map' was not in top 1
+Epoch 11, global step 96: 'map' was not in top 1
+Metric map improved by 0.035 >= min_delta = 0.0. New best score: 0.418
+Epoch 14, global step 120: 'map' reached 0.41813 (best 0.41813), saving model to '/Users/tompitts/Library/Mobile Documents/com~apple~CloudDocs/dphil icloud/CanopyAI/checkpoints/zsfinal/zsfinal_s1/deepforest-epoch=14-map=0.42.ckpt' as top 1
+Epoch 17, global step 144: 'map' was not in top 1
+Epoch 20, global step 168: 'map' was not in top 1
+Epoch 23, global step 192: 'map' was not in top 1
+Epoch 26, global step 216: 'map' was not in top 1
+Monitored metric map did not improve in the last 5 records. Best score: 0.418. Signaling Trainer to stop.
+Epoch 29, global step 240: 'map' was not in top 1
+   ✅ Injected 16 empty images into training dataset (total: 128 images)
+   ✅ RetinaNet cls loss patched — shadow GT weight=1.0x
+   📉 Epoch 0 Loss: 1.2344
+   📉 Epoch 1 Loss: 1.0507
+   📉 Epoch 2 Loss: 0.9416
+   📉 Epoch 3 Loss: 0.8999
+   📉 Epoch 4 Loss: 0.8634
+   📈 Epoch 5 mAP: 0.3829
+   📉 Epoch 5 Loss: 0.8473
+   📉 Epoch 6 Loss: 0.8329
+   📉 Epoch 7 Loss: 0.8222
+   📈 Epoch 8 mAP: 0.3708
+   📉 Epoch 8 Loss: 0.8158
+   📉 Epoch 9 Loss: 0.8104
+   📉 Epoch 10 Loss: 0.8063
+   📈 Epoch 11 mAP: 0.3713
+   📉 Epoch 11 Loss: 0.8013
+   📉 Epoch 12 Loss: 0.7961
+   📉 Epoch 13 Loss: 0.7961
+   📈 Epoch 14 mAP: 0.3666
+   📉 Epoch 14 Loss: 0.7922
+   📉 Epoch 15 Loss: 0.7960
+   📉 Epoch 16 Loss: 0.7958
+   📈 Epoch 17 mAP: 0.4181
+   📉 Epoch 17 Loss: 0.7974
+   📉 Epoch 18 Loss: 0.8039
+   📉 Epoch 19 Loss: 0.8167
+   📈 Epoch 20 mAP: 0.3764
+   📉 Epoch 20 Loss: 0.8093
+   📉 Epoch 21 Loss: 0.8257
+   📉 Epoch 22 Loss: 0.8196
+   📈 Epoch 23 mAP: 0.3707
+   📉 Epoch 23 Loss: 0.8142
+   📉 Epoch 24 Loss: 0.8143
+   📉 Epoch 25 Loss: 0.8124
+   📈 Epoch 26 mAP: 0.3756
+   📉 Epoch 26 Loss: 0.8142
+   📉 Epoch 27 Loss: 0.8136
+   📉 Epoch 28 Loss: 0.8114
+   📈 Epoch 29 mAP: 0.3825
+   📉 Epoch 29 Loss: 0.8152
+Epoch 29/49 ━━━━━━━━━━━━━━━━━━━━━━━━ 8/8 0:00:24 • 0:00:00 0.33it/s v_num: 0.000
+/Users/tompitts/Library/Mobile Documents/com~apple~CloudDocs/dphil icloud/CanopyAI/deepforest_custom/train_deepforest.py:1040: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+  best_sd = torch.load(best_ckpt, map_location="cpu")["state_dict"]
+
+✅ Training complete!
+💾 Saved final model to checkpoints/zsfinal/zsfinal_s1/deepforest_final.pth
+💾 Saved BEST (top-1 val-mAP) model to checkpoints/zsfinal/zsfinal_s1/deepforest_best.pth  (from deepforest-epoch=14-map=0.42.ckpt)
+🧾 Training provenance → checkpoints/zsfinal/zsfinal_s1/train_summary.json
