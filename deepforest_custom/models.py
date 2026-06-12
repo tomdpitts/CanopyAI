@@ -828,6 +828,23 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
                             weights[i] = self.shadow_loss_weight
                             break   # one hit is enough
 
+            # One-time provenance: confirm the SHADOW path actually selected boxes
+            # (k>0) — if k≈0 the shadow map / vector isn't firing and "shadow"
+            # training silently degenerates to no-shadow (≈ blind). Set
+            # SLR_DEBUG=1 to print every tile's k instead of just once.
+            if os.environ.get("SHADOW_BLIND_CONTROL") != "1":
+                _k = int((weights != 1.0).sum().item())
+                if os.environ.get("SLR_DEBUG") == "1":
+                    import sys as _s
+                    print(f"   🌑 shadow-select k={_k}/{N_gt} (angle={angle_deg:.0f}°)",
+                          file=_s.stderr, flush=True)
+                elif not getattr(self, "_shadow_select_announced", False):
+                    import sys as _s
+                    print(f"   🌑 SHADOW path: selected k={_k}/{N_gt} boxes on first tile "
+                          f"(angle={angle_deg:.0f}°, weight={self.shadow_loss_weight}x)",
+                          file=_s.stderr, flush=True)
+                    self._shadow_select_announced = True
+
             # Negative control (SHADOW_BLIND_CONTROL=1): keep the same NUMBER of
             # upweighted boxes per image as the shadow logic selected, but choose
             # them at RANDOM (shadow-blind).  If this reproduces the shadow gain,
