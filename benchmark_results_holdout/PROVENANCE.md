@@ -27,9 +27,9 @@ summary, so this file records what we could reconstruct — and, honestly, what 
 
 | dir | what | SAM | reranker | score floor | generator (best guess) |
 |---|---|---|---|---|---|
-| `phase21_baseline` | DeepForest no-shadow, zero-shot, 439 | **UNKNOWN** | off (base ablation) | ~0 (full tail) | older pipeline (NOT current benchmark.py) |
-| `phase22_B_L4` | DeepForest shadow×4, zero-shot, 439 | **UNKNOWN** | off | ~0 | older pipeline |
-| `ablation_pre_s2` | DeepForest shadow×2, zero-shot, 439 | **UNKNOWN** (memory flagged unconfirmed) | off | ~0 | older pipeline |
+| `phase21_baseline` | DeepForest no-shadow, zero-shot, 439 | **vit_b** ✅FOUND | **ON** ✅CORRECTED | ~0 (full tail) | benchmark.py, Jun-3 02:59 run (see notes) |
+| `phase22_B_L4` | DeepForest shadow×4, zero-shot, 439 | **vit_b** ✅FOUND | **ON** ✅CORRECTED | ~0 | benchmark.py, Jun-3 02:59 (same run as phase21) |
+| `ablation_pre_s2` | DeepForest shadow×2, zero-shot, 439 | **vit_h** ✅FOUND | **ON** ✅CORRECTED | ~0 | benchmark.py, Jun-4 07:28 run (DIFFERENT SAM!) |
 | `ablation_tcd_s0/s2/s4` | DeepForest fine-tuned on TCD, 439 | **vit_h** (reconstructed — see note) | off | ~0 | `phase30/modal/infer.py` |
 | `detectree2_stock_100m_px` | detectree2 @100m, geo→pixel | n/a (native masks) | n/a | n/a | `infer_detectree2.py` (conda `tcd` env), pixel-transformed |
 | `restor_mrcnn` | Restor MRCNN re-inference, TREE-only export | n/a (MRCNN masks) | n/a | n/a | `phase30/restor_baseline/run_restor.py` (CPU detectron2) |
@@ -44,6 +44,33 @@ summary, so this file records what we could reconstruct — and, honestly, what 
 > Section A `zsfinal` zero-shot run is vit_l — SAM differs *between* categories A and B. That's
 > acceptable (they're different regimes, already cross-category-caveated), but do not imply a
 > shared SAM across the whole table.
+
+> **✅ ZERO-SHOT EVAL PROVENANCE RECOVERED (2026-06-13, forensic dig through prior Claude
+> transcripts + geojson mtimes + crown-vertex signatures).** Earlier marked UNKNOWN; now FOUND:
+> - **`phase21_baseline` + `phase22_B_L4` = SAM vit_b.** One run, 2026-06-03 02:59 (mtimes Jun 3
+>   20:13 / Jun 4 03:55, no `--skip-existing`, not overwritten since; `track1_retest.log` shows
+>   "Inference: phase22_B_L4"). Command: `benchmark.py --models phase22_B_L4.pth phase21_baseline.pth
+>   --names phase22_B_L4 phase21_baseline --sam-model vit_b --sam-checkpoint sam_vit_b_01ec64.pth
+>   --df-confidence 0.05 --max-dets 512 --pred-score-thresh 0.0 --output-root benchmark_results_holdout`.
+> - **`ablation_pre_s2` = SAM vit_h** (DIFFERENT!). Separate run 2026-06-04 07:28: same flags but
+>   `--models checkpoints/ablation_pre_s2/deepforest-epoch=29-map=0.66.ckpt --names ablation_pre_s2
+>   --sam-model vit_h --sam-checkpoint sam_vit_h_4b8939.pth`.
+> - Corroboration: crown-vertex medians — phase21/22 = **17** (vit_b), pre_s2 = **19** (vit_h).
+> - **CONSEQUENCE:** the published w0→×2→×4 trio is NOT one family — it mixes SAM (vit_b/vit_h)
+>   AND training (pre_s2 = phase30/lib + photometric-no-flip vs phase21/22 = deepforest_custom + HFlip;
+>   see TRAINING matrix below). Only **phase21 ↔ phase22** (both vit_b, both deepforest_custom) is a
+>   clean matched pair. The ×2 point must be re-made to claim a monotonic trend.
+> - df-0.05-era foxtrot lowered the model `score_thresh` (scores → 0.0009); today's foxtrot floors at
+>   0.1 — so reproducing these requires the score_thresh patch (see REINFER_PLAN_vitl §4).
+
+> **✅ RERANKER CORRECTION (2026-06-13, proven).** The reranker column above was earlier
+> marked "off" — that was WRONG. The published zero-shot mAP (0.498/0.535) is RERANKED:
+> `phase22 + --reranker-checkpoint phase30/cnn_reranker_ens3.pt` reproduces **0.526 ≈ 0.535**
+> (vit_b, 40-tile sample); without the reranker it's 0.178. The existing geojsons' bimodal
+> score distribution (FPs→0, TPs→1) is the reranker's TP-probability signature; raw runs are
+> unimodal. Threshold, SAM model, and commit 49f543f were all tested and EXONERATED — the
+> reranker is the sole cause of the recent reproduction failures. **Current status + the
+> reranker-ON plan: `phase30/zeroshot/ZEROSHOT_STATUS_AND_PLAN.md`.**
 
 ## DEAD / discarded
 - `blindzero_w2`, `blindzero_w4` **geojson dirs** — the 2026-06-11 eval of the blind
