@@ -1,0 +1,1280 @@
+{
+  "subset": "sparse",
+  "n_tiles": 180,
+  "created": "2026-06-15T18:31:12+10:00",
+  "source_dir": "data/tcd/images/data/tcd/val",
+  "criteria": {
+    "canopy_frac": "no restriction (all densities; recorded per-tile for reference)",
+    "biome_excluded": [
+      "TropMoistForest(1)",
+      "TropDryForest(2)",
+      "TropConifForest(3)",
+      "TropSavanna(7)",
+      "Unknown(-1)"
+    ],
+    "tree_floor": "none (any tree count, incl. 0)"
+  },
+  "stems_kept_as": "tcd_val_tile_N (symlinks; preserves reuse of existing predictions via --tiles-file)",
+  "tiles": [
+    {
+      "stem": "tcd_val_tile_24",
+      "trees": 28,
+      "canopy_frac": 0.0,
+      "biome": "TempConifer",
+      "biome_code": 5
+    },
+    {
+      "stem": "tcd_val_tile_126",
+      "trees": 13,
+      "canopy_frac": 0.0,
+      "biome": "Desert/Xeric",
+      "biome_code": 13
+    },
+    {
+      "stem": "tcd_val_tile_117",
+      "trees": 7,
+      "canopy_frac": 0.0,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_68",
+      "trees": 7,
+      "canopy_frac": 0.0,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_172",
+      "trees": 5,
+      "canopy_frac": 0.0,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_10",
+      "trees": 4,
+      "canopy_frac": 0.0,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_63",
+      "trees": 3,
+      "canopy_frac": 0.0,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_90",
+      "trees": 3,
+      "canopy_frac": 0.0,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_103",
+      "trees": 1,
+      "canopy_frac": 0.0,
+      "biome": "TempConifer",
+      "biome_code": 5
+    },
+    {
+      "stem": "tcd_val_tile_321",
+      "trees": 1,
+      "canopy_frac": 0.0,
+      "biome": "TempConifer",
+      "biome_code": 5
+    },
+    {
+      "stem": "tcd_val_tile_70",
+      "trees": 1,
+      "canopy_frac": 0.0,
+      "biome": "TempConifer",
+      "biome_code": 5
+    },
+    {
+      "stem": "tcd_val_tile_9",
+      "trees": 1,
+      "canopy_frac": 0.0,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_118",
+      "trees": 0,
+      "canopy_frac": 0.0,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_124",
+      "trees": 0,
+      "canopy_frac": 0.0,
+      "biome": "TempConifer",
+      "biome_code": 5
+    },
+    {
+      "stem": "tcd_val_tile_157",
+      "trees": 0,
+      "canopy_frac": 0.0,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_182",
+      "trees": 0,
+      "canopy_frac": 0.0,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_191",
+      "trees": 0,
+      "canopy_frac": 0.0,
+      "biome": "TempConifer",
+      "biome_code": 5
+    },
+    {
+      "stem": "tcd_val_tile_193",
+      "trees": 0,
+      "canopy_frac": 0.0,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_22",
+      "trees": 0,
+      "canopy_frac": 0.0,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_257",
+      "trees": 0,
+      "canopy_frac": 0.0,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_278",
+      "trees": 0,
+      "canopy_frac": 0.0,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_312",
+      "trees": 0,
+      "canopy_frac": 0.0,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_322",
+      "trees": 0,
+      "canopy_frac": 0.0,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_353",
+      "trees": 0,
+      "canopy_frac": 0.0,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_362",
+      "trees": 0,
+      "canopy_frac": 0.0,
+      "biome": "Desert/Xeric",
+      "biome_code": 13
+    },
+    {
+      "stem": "tcd_val_tile_376",
+      "trees": 0,
+      "canopy_frac": 0.0,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_412",
+      "trees": 0,
+      "canopy_frac": 0.0,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_41",
+      "trees": 0,
+      "canopy_frac": 0.0,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_44",
+      "trees": 0,
+      "canopy_frac": 0.0,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_50",
+      "trees": 0,
+      "canopy_frac": 0.0,
+      "biome": "TempConifer",
+      "biome_code": 5
+    },
+    {
+      "stem": "tcd_val_tile_81",
+      "trees": 0,
+      "canopy_frac": 0.0,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_85",
+      "trees": 0,
+      "canopy_frac": 0.0,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_94",
+      "trees": 5,
+      "canopy_frac": 0.0003,
+      "biome": "TempConifer",
+      "biome_code": 5
+    },
+    {
+      "stem": "tcd_val_tile_120",
+      "trees": 11,
+      "canopy_frac": 0.0004,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_140",
+      "trees": 0,
+      "canopy_frac": 0.0009,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_258",
+      "trees": 81,
+      "canopy_frac": 0.0013,
+      "biome": "TempConifer",
+      "biome_code": 5
+    },
+    {
+      "stem": "tcd_val_tile_48",
+      "trees": 86,
+      "canopy_frac": 0.0014,
+      "biome": "TempConifer",
+      "biome_code": 5
+    },
+    {
+      "stem": "tcd_val_tile_47",
+      "trees": 1,
+      "canopy_frac": 0.0015,
+      "biome": "TempConifer",
+      "biome_code": 5
+    },
+    {
+      "stem": "tcd_val_tile_180",
+      "trees": 267,
+      "canopy_frac": 0.0023,
+      "biome": "TempConifer",
+      "biome_code": 5
+    },
+    {
+      "stem": "tcd_val_tile_232",
+      "trees": 9,
+      "canopy_frac": 0.0033,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_152",
+      "trees": 0,
+      "canopy_frac": 0.004,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_234",
+      "trees": 55,
+      "canopy_frac": 0.0046,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_285",
+      "trees": 1,
+      "canopy_frac": 0.0049,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_291",
+      "trees": 26,
+      "canopy_frac": 0.006,
+      "biome": "TempGrass",
+      "biome_code": 8
+    },
+    {
+      "stem": "tcd_val_tile_138",
+      "trees": 26,
+      "canopy_frac": 0.0067,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_267",
+      "trees": 6,
+      "canopy_frac": 0.0071,
+      "biome": "TempConifer",
+      "biome_code": 5
+    },
+    {
+      "stem": "tcd_val_tile_204",
+      "trees": 9,
+      "canopy_frac": 0.0076,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_33",
+      "trees": 40,
+      "canopy_frac": 0.0095,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_328",
+      "trees": 7,
+      "canopy_frac": 0.0114,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_382",
+      "trees": 115,
+      "canopy_frac": 0.0117,
+      "biome": "TempConifer",
+      "biome_code": 5
+    },
+    {
+      "stem": "tcd_val_tile_164",
+      "trees": 52,
+      "canopy_frac": 0.0118,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_430",
+      "trees": 41,
+      "canopy_frac": 0.0121,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_31",
+      "trees": 17,
+      "canopy_frac": 0.0123,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_4",
+      "trees": 39,
+      "canopy_frac": 0.0131,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_319",
+      "trees": 97,
+      "canopy_frac": 0.014,
+      "biome": "TempConifer",
+      "biome_code": 5
+    },
+    {
+      "stem": "tcd_val_tile_190",
+      "trees": 32,
+      "canopy_frac": 0.0152,
+      "biome": "Boreal",
+      "biome_code": 6
+    },
+    {
+      "stem": "tcd_val_tile_406",
+      "trees": 8,
+      "canopy_frac": 0.0159,
+      "biome": "TempConifer",
+      "biome_code": 5
+    },
+    {
+      "stem": "tcd_val_tile_429",
+      "trees": 112,
+      "canopy_frac": 0.0181,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_42",
+      "trees": 8,
+      "canopy_frac": 0.0188,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_431",
+      "trees": 42,
+      "canopy_frac": 0.0204,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_403",
+      "trees": 122,
+      "canopy_frac": 0.0216,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_83",
+      "trees": 26,
+      "canopy_frac": 0.0261,
+      "biome": "Mediterranean",
+      "biome_code": 12
+    },
+    {
+      "stem": "tcd_val_tile_59",
+      "trees": 26,
+      "canopy_frac": 0.0273,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_436",
+      "trees": 10,
+      "canopy_frac": 0.028,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_100",
+      "trees": 27,
+      "canopy_frac": 0.0281,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_7",
+      "trees": 10,
+      "canopy_frac": 0.0284,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_255",
+      "trees": 124,
+      "canopy_frac": 0.03,
+      "biome": "TempConifer",
+      "biome_code": 5
+    },
+    {
+      "stem": "tcd_val_tile_110",
+      "trees": 41,
+      "canopy_frac": 0.0306,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_151",
+      "trees": 6,
+      "canopy_frac": 0.0347,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_108",
+      "trees": 4,
+      "canopy_frac": 0.035,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_176",
+      "trees": 29,
+      "canopy_frac": 0.0356,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_360",
+      "trees": 14,
+      "canopy_frac": 0.0358,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_54",
+      "trees": 42,
+      "canopy_frac": 0.0371,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_96",
+      "trees": 50,
+      "canopy_frac": 0.0375,
+      "biome": "Desert/Xeric",
+      "biome_code": 13
+    },
+    {
+      "stem": "tcd_val_tile_144",
+      "trees": 153,
+      "canopy_frac": 0.0379,
+      "biome": "TempConifer",
+      "biome_code": 5
+    },
+    {
+      "stem": "tcd_val_tile_135",
+      "trees": 41,
+      "canopy_frac": 0.0384,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_203",
+      "trees": 2,
+      "canopy_frac": 0.0384,
+      "biome": "TempConifer",
+      "biome_code": 5
+    },
+    {
+      "stem": "tcd_val_tile_222",
+      "trees": 12,
+      "canopy_frac": 0.0395,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_304",
+      "trees": 4,
+      "canopy_frac": 0.0411,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_434",
+      "trees": 3,
+      "canopy_frac": 0.0436,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_220",
+      "trees": 52,
+      "canopy_frac": 0.0452,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_73",
+      "trees": 228,
+      "canopy_frac": 0.0453,
+      "biome": "TempConifer",
+      "biome_code": 5
+    },
+    {
+      "stem": "tcd_val_tile_438",
+      "trees": 26,
+      "canopy_frac": 0.0463,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_195",
+      "trees": 6,
+      "canopy_frac": 0.0494,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_342",
+      "trees": 55,
+      "canopy_frac": 0.0495,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_208",
+      "trees": 122,
+      "canopy_frac": 0.0504,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_141",
+      "trees": 32,
+      "canopy_frac": 0.0537,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_363",
+      "trees": 104,
+      "canopy_frac": 0.0552,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_128",
+      "trees": 34,
+      "canopy_frac": 0.0552,
+      "biome": "Desert/Xeric",
+      "biome_code": 13
+    },
+    {
+      "stem": "tcd_val_tile_134",
+      "trees": 63,
+      "canopy_frac": 0.0583,
+      "biome": "TempConifer",
+      "biome_code": 5
+    },
+    {
+      "stem": "tcd_val_tile_192",
+      "trees": 15,
+      "canopy_frac": 0.0604,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_245",
+      "trees": 2,
+      "canopy_frac": 0.0607,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_288",
+      "trees": 19,
+      "canopy_frac": 0.075,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_344",
+      "trees": 5,
+      "canopy_frac": 0.0788,
+      "biome": "Boreal",
+      "biome_code": 6
+    },
+    {
+      "stem": "tcd_val_tile_256",
+      "trees": 21,
+      "canopy_frac": 0.0799,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_302",
+      "trees": 40,
+      "canopy_frac": 0.0808,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_316",
+      "trees": 8,
+      "canopy_frac": 0.087,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_324",
+      "trees": 25,
+      "canopy_frac": 0.0882,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_137",
+      "trees": 91,
+      "canopy_frac": 0.0884,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_247",
+      "trees": 49,
+      "canopy_frac": 0.0892,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_132",
+      "trees": 7,
+      "canopy_frac": 0.0902,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_154",
+      "trees": 81,
+      "canopy_frac": 0.0912,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_212",
+      "trees": 52,
+      "canopy_frac": 0.0946,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_187",
+      "trees": 23,
+      "canopy_frac": 0.0952,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_356",
+      "trees": 61,
+      "canopy_frac": 0.096,
+      "biome": "TempGrass",
+      "biome_code": 8
+    },
+    {
+      "stem": "tcd_val_tile_238",
+      "trees": 126,
+      "canopy_frac": 0.0962,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_231",
+      "trees": 26,
+      "canopy_frac": 0.0982,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_248",
+      "trees": 70,
+      "canopy_frac": 0.0994,
+      "biome": "TempConifer",
+      "biome_code": 5
+    },
+    {
+      "stem": "tcd_val_tile_422",
+      "trees": 149,
+      "canopy_frac": 0.1078,
+      "biome": "TempConifer",
+      "biome_code": 5
+    },
+    {
+      "stem": "tcd_val_tile_209",
+      "trees": 72,
+      "canopy_frac": 0.109,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_106",
+      "trees": 50,
+      "canopy_frac": 0.1108,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_265",
+      "trees": 102,
+      "canopy_frac": 0.1117,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_214",
+      "trees": 19,
+      "canopy_frac": 0.1332,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_55",
+      "trees": 36,
+      "canopy_frac": 0.1376,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_161",
+      "trees": 32,
+      "canopy_frac": 0.1419,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_404",
+      "trees": 5,
+      "canopy_frac": 0.1431,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_237",
+      "trees": 15,
+      "canopy_frac": 0.1437,
+      "biome": "TempConifer",
+      "biome_code": 5
+    },
+    {
+      "stem": "tcd_val_tile_388",
+      "trees": 87,
+      "canopy_frac": 0.145,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_408",
+      "trees": 17,
+      "canopy_frac": 0.1451,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_16",
+      "trees": 12,
+      "canopy_frac": 0.1464,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_61",
+      "trees": 125,
+      "canopy_frac": 0.1466,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_377",
+      "trees": 113,
+      "canopy_frac": 0.1504,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_320",
+      "trees": 15,
+      "canopy_frac": 0.1522,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_289",
+      "trees": 4,
+      "canopy_frac": 0.1529,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_246",
+      "trees": 30,
+      "canopy_frac": 0.1561,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_129",
+      "trees": 85,
+      "canopy_frac": 0.1692,
+      "biome": "Mediterranean",
+      "biome_code": 12
+    },
+    {
+      "stem": "tcd_val_tile_383",
+      "trees": 8,
+      "canopy_frac": 0.1697,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_235",
+      "trees": 97,
+      "canopy_frac": 0.1719,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_277",
+      "trees": 14,
+      "canopy_frac": 0.1745,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_207",
+      "trees": 150,
+      "canopy_frac": 0.1787,
+      "biome": "TempConifer",
+      "biome_code": 5
+    },
+    {
+      "stem": "tcd_val_tile_368",
+      "trees": 9,
+      "canopy_frac": 0.1811,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_145",
+      "trees": 8,
+      "canopy_frac": 0.1912,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_386",
+      "trees": 12,
+      "canopy_frac": 0.2134,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_384",
+      "trees": 127,
+      "canopy_frac": 0.2229,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_371",
+      "trees": 58,
+      "canopy_frac": 0.2253,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_1",
+      "trees": 7,
+      "canopy_frac": 0.2316,
+      "biome": "Boreal",
+      "biome_code": 6
+    },
+    {
+      "stem": "tcd_val_tile_60",
+      "trees": 30,
+      "canopy_frac": 0.2324,
+      "biome": "TempConifer",
+      "biome_code": 5
+    },
+    {
+      "stem": "tcd_val_tile_253",
+      "trees": 5,
+      "canopy_frac": 0.2342,
+      "biome": "TempConifer",
+      "biome_code": 5
+    },
+    {
+      "stem": "tcd_val_tile_419",
+      "trees": 22,
+      "canopy_frac": 0.2409,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_397",
+      "trees": 102,
+      "canopy_frac": 0.2464,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_225",
+      "trees": 6,
+      "canopy_frac": 0.247,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_169",
+      "trees": 33,
+      "canopy_frac": 0.2603,
+      "biome": "TempConifer",
+      "biome_code": 5
+    },
+    {
+      "stem": "tcd_val_tile_250",
+      "trees": 63,
+      "canopy_frac": 0.2637,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_402",
+      "trees": 13,
+      "canopy_frac": 0.272,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_21",
+      "trees": 70,
+      "canopy_frac": 0.2748,
+      "biome": "TempConifer",
+      "biome_code": 5
+    },
+    {
+      "stem": "tcd_val_tile_198",
+      "trees": 46,
+      "canopy_frac": 0.2841,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_331",
+      "trees": 4,
+      "canopy_frac": 0.2884,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_236",
+      "trees": 39,
+      "canopy_frac": 0.2901,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_338",
+      "trees": 119,
+      "canopy_frac": 0.2925,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_290",
+      "trees": 75,
+      "canopy_frac": 0.2932,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_82",
+      "trees": 14,
+      "canopy_frac": 0.3069,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_373",
+      "trees": 13,
+      "canopy_frac": 0.3165,
+      "biome": "TempConifer",
+      "biome_code": 5
+    },
+    {
+      "stem": "tcd_val_tile_283",
+      "trees": 30,
+      "canopy_frac": 0.3187,
+      "biome": "TempConifer",
+      "biome_code": 5
+    },
+    {
+      "stem": "tcd_val_tile_354",
+      "trees": 14,
+      "canopy_frac": 0.3293,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_365",
+      "trees": 43,
+      "canopy_frac": 0.3331,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_199",
+      "trees": 6,
+      "canopy_frac": 0.3418,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_65",
+      "trees": 106,
+      "canopy_frac": 0.3849,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_284",
+      "trees": 4,
+      "canopy_frac": 0.3947,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_99",
+      "trees": 6,
+      "canopy_frac": 0.3971,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_196",
+      "trees": 19,
+      "canopy_frac": 0.4007,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_20",
+      "trees": 55,
+      "canopy_frac": 0.4012,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_206",
+      "trees": 47,
+      "canopy_frac": 0.4138,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_337",
+      "trees": 0,
+      "canopy_frac": 0.4181,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_367",
+      "trees": 10,
+      "canopy_frac": 0.4234,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_165",
+      "trees": 66,
+      "canopy_frac": 0.4336,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_437",
+      "trees": 10,
+      "canopy_frac": 0.4399,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_153",
+      "trees": 86,
+      "canopy_frac": 0.4665,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_414",
+      "trees": 4,
+      "canopy_frac": 0.4921,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_426",
+      "trees": 22,
+      "canopy_frac": 0.4988,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_95",
+      "trees": 88,
+      "canopy_frac": 0.5261,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_298",
+      "trees": 0,
+      "canopy_frac": 0.5608,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_32",
+      "trees": 13,
+      "canopy_frac": 0.5714,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_418",
+      "trees": 11,
+      "canopy_frac": 0.5995,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_350",
+      "trees": 48,
+      "canopy_frac": 0.6093,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_252",
+      "trees": 41,
+      "canopy_frac": 0.6649,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_27",
+      "trees": 0,
+      "canopy_frac": 0.6684,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_15",
+      "trees": 20,
+      "canopy_frac": 0.6813,
+      "biome": "Mangrove",
+      "biome_code": 14
+    },
+    {
+      "stem": "tcd_val_tile_34",
+      "trees": 0,
+      "canopy_frac": 0.7569,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_119",
+      "trees": 30,
+      "canopy_frac": 0.7647,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    },
+    {
+      "stem": "tcd_val_tile_387",
+      "trees": 2,
+      "canopy_frac": 0.8813,
+      "biome": "TempBroadleaf",
+      "biome_code": 4
+    }
+  ]
+}

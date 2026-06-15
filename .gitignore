@@ -120,3 +120,24 @@ benchmark_results_noRR_*/
 benchmark_results_tta_*/
 phase30/modal/data_csvs/
 phase30/modal/__pycache__/
+
+deepforest_custom/analysis
+
+# Track ONLY the sparse-subset documentation (README/builder/provenance) even
+# though data/* is ignored. Each directory level must be re-included then its
+# contents re-excluded to descend; at the leaf we re-include just the 3 docs
+# (the .tif/_meta.json symlinks stay ignored). See data/.../sparse/README.md.
+!data/tcd/
+data/tcd/*
+!data/tcd/images/
+data/tcd/images/*
+!data/tcd/images/data/
+data/tcd/images/data/*
+!data/tcd/images/data/tcd/
+data/tcd/images/data/tcd/*
+!data/tcd/images/data/tcd/sparse/
+data/tcd/images/data/tcd/sparse/*
+!data/tcd/images/data/tcd/sparse/README.md
+!data/tcd/images/data/tcd/sparse/build_sparse_subset.py
+!data/tcd/images/data/tcd/sparse/_SUBSET_PROVENANCE.json
+
