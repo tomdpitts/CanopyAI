@@ -15,6 +15,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 # DataLoader worker count — env-overridable.  Default 8 (cluster/CUDA), but on
@@ -245,6 +246,23 @@ class _SingleCropValDataset:
         from albumentations.pytorch import ToTensorV2
         self.base       = base_ds
         self.collate_fn = base_ds.collate_fn
+        # Skip val tiles smaller than patch_size in either dim — RandomCrop(patch)
+        # raises CropSizeError on them. (Known: one 400×200 BRU edge tile.) We drop
+        # them from the val index rather than pad, to keep the metric on real crops.
+        from PIL import Image
+        root = getattr(base_ds, "root_dir", "") or ""
+        self._idxs = []
+        for i, name in enumerate(base_ds.image_names):
+            path = str(name) if os.path.isabs(str(name)) else os.path.join(root, str(name))
+            try:
+                w, h = Image.open(path).size
+            except Exception:
+                self._idxs.append(i); continue   # can't stat → keep; fail loudly if real
+            if w >= patch_size and h >= patch_size:
+                self._idxs.append(i)
+        n_drop = len(base_ds.image_names) - len(self._idxs)
+        if n_drop:
+            print(f"   ⚠️  val: skipped {n_drop} tile(s) < {patch_size}px (RandomCrop would fail)")
         self._val_t     = A.Compose(
             [A.RandomCrop(patch_size, patch_size), ToTensorV2()],
             bbox_params=A.BboxParams(format="pascal_voc", label_fields=["category_ids"],
@@ -252,9 +270,10 @@ class _SingleCropValDataset:
         )
 
     def __len__(self):
-        return len(self.base.image_names)
+        return len(self._idxs)
 
     def __getitem__(self, idx):
+        idx      = self._idxs[idx]
         img_name = self.base.image_names[idx]
         img      = self.base.load_image(idx)
         gt       = self.base.annotations_for_path(img_name)
@@ -561,6 +580,8 @@ def train_deepforest(
     augmentations=None,           # If set (list of dicts), overrides default/wrapper augmentation logic
     fast_dev_run=False,           # Lightning fast_dev_run: 1 train + 1 val batch then exit
     precision=None,               # Override Lightning precision (e.g. "16-mixed", "bf16-mixed")
+    seed=None,                    # If set, pl.seed_everything(seed, workers=True) for reproducible runs
+    min_delta=0.002,              # EarlyStopping: min `map` improvement to reset patience
 ):
     """
     Train a DeepForest model using DeepForest 2.0 config-based API.
@@ -595,6 +616,15 @@ def train_deepforest(
     print("=" * 60)
     print("🌲 DeepForest Fine-tuning")
     print("=" * 60)
+
+    # Reproducibility: opt-in. Default (None) preserves the historical unseeded
+    # behaviour of the zero-shot runs (phase21/phase22). Pass seed=42 to make the
+    # weight init, dataloader shuffle and crop sampling repeatable (mirrors
+    # phase30/lib). Note: with shuffle + workers, exact bit-reproducibility also
+    # needs deterministic CUDA kernels; this gets you the same draw, not bitwise.
+    if seed is not None:
+        pl.seed_everything(int(seed), workers=True)
+        print(f"   🎲 seed_everything({int(seed)}, workers=True)")
 
     # Initialize model
     print("\n⚙️  Initializing model...")
@@ -777,10 +807,17 @@ def train_deepforest(
         names = [list(a.keys())[0] if isinstance(a, dict) else a for a in augmentations]
         print(f"   🔄 Train transform: crop{CROP_SIZE} + {names} + ToTensorV2")
     elif use_wrapper:
-        model._train_transform_override = _build_train_transform(None)
-        model.config.train.augmentations = OmegaConf.create([])
+        # Zero-shot recipe (phase22): DeepForest's NATIVE transform on full tiles,
+        # no forced crop — the proven 0.498 run used augmentations=[] (no crop, no
+        # flip). Set DF_FORCE_CROP=1 to re-enable the crop{CROP_SIZE}+ToTensorV2
+        # override (e.g. to bound RPN memory on large tiles).
         note = "spatial shadow active" if uses_spatial_shadow else "wrapper active"
-        print(f"   🔄 Train transform: crop{CROP_SIZE} + ToTensorV2 ({note})")
+        model.config.train.augmentations = OmegaConf.create([])
+        if os.environ.get("DF_FORCE_CROP") == "1":
+            model._train_transform_override = _build_train_transform(None)
+            print(f"   🔄 Train transform: crop{CROP_SIZE} + ToTensorV2 ({note})")
+        else:
+            print(f"   🔄 Augmentations disabled, native transform / no crop ({note})")
     else:
         model._train_transform_override = _build_train_transform([{"HorizontalFlip": {"p": 0.5}}])
         print(f"   🔄 Train transform: crop{CROP_SIZE} + HorizontalFlip + ToTensorV2 (default)")
@@ -942,8 +979,10 @@ def train_deepforest(
             monitor=_monitor,
             patience=patience,
             mode="max",
+            min_delta=min_delta,
             verbose=True,
         )
+        print(f"   Early stopping min_delta: {min_delta}")
         callbacks.append(early_stop_callback)
 
     print("\n🚀 Starting training...")
@@ -969,12 +1008,43 @@ def train_deepforest(
 
     callbacks.append(MetrixPrinter())
 
+    # Progress bar: drop Lightning's `v_num` and show total elapsed + ETA (short).
+    from pytorch_lightning.callbacks import TQDMProgressBar
+
+    def _fmt_dur(s):
+        s = int(s)
+        h, m = s // 3600, (s % 3600) // 60
+        if h:
+            return f"{h}h{m:02d}m"
+        if m:
+            return f"{m}m{s % 60:02d}s"
+        return f"{s}s"
+
+    class _TimedProgressBar(TQDMProgressBar):
+        def on_train_start(self, trainer, pl_module):
+            super().on_train_start(trainer, pl_module)
+            self._t0 = time.monotonic()
+
+        def get_metrics(self, trainer, pl_module):
+            items = super().get_metrics(trainer, pl_module)
+            items.pop("v_num", None)
+            t0 = getattr(self, "_t0", None)
+            if t0 is not None:
+                el    = time.monotonic() - t0
+                total = int(trainer.estimated_stepping_batches or 0)
+                done  = int(trainer.global_step)
+                items["elapsed"] = _fmt_dur(el)
+                items["eta"]     = _fmt_dur(el * (total - done) / done) if (done and total) else "?"
+            return items
+
+    callbacks.append(_TimedProgressBar())
+
     trainer_kwargs = {
         "max_epochs": epochs,
         "enable_checkpointing": True,
         "callbacks": callbacks,
         "logger": logger,
-        "check_val_every_n_epoch": 3,
+        "check_val_every_n_epoch": int(os.environ.get("DF_VAL_EVERY_N_EPOCH", "1")),  # zero-shot recipe: validate every epoch (May-6 phase22 default; set >1 to speed up)
         "num_sanity_val_steps": 0,
         "gradient_clip_val": 1.0,
         "fast_dev_run": fast_dev_run,
@@ -1003,14 +1073,20 @@ def train_deepforest(
     elif precision:
         trainer_kwargs["precision"] = precision
     elif trainer_kwargs.get("accelerator") == "gpu":
-        trainer_kwargs["precision"] = "bf16-mixed"
+        # Zero-shot recipe (phase22): full fp32 on CUDA — the proven 0.498 run used
+        # no mixed precision. Pass --precision bf16-mixed to opt back into speed.
+        trainer_kwargs["precision"] = "32-true"
     elif trainer_kwargs.get("accelerator") == "mps":
         trainer_kwargs["precision"] = "32-true"  # MPS has no autocast support
 
     trainer = pl.Trainer(**trainer_kwargs)
 
-    # torch.compile: CUDA only — MPS inductor backend is prototype and fails on backward pass.
-    if trainer_kwargs.get("accelerator") == "gpu" and torch.cuda.is_available():
+    # torch.compile: OFF by default for the zero-shot recipe — the proven 0.498 run
+    # was uncompiled, and compiling wraps the model so the exported state_dict keys
+    # gain a `_orig_mod.` prefix (see project_orig_mod_load_bug). Set DF_TORCH_COMPILE=1
+    # to opt back in (CUDA only; MPS inductor backend fails on the backward pass).
+    if (os.environ.get("DF_TORCH_COMPILE") == "1"
+            and trainer_kwargs.get("accelerator") == "gpu" and torch.cuda.is_available()):
         try:
             model.model = torch.compile(model.model)
             print("   ✅ torch.compile applied to detection model")
@@ -1208,6 +1284,18 @@ def main():
         default=None,
         help="Lightning precision override (e.g. 16-mixed, bf16-mixed, 32).",
     )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="If set, seed_everything(seed, workers=True) for a reproducible run.",
+    )
+    parser.add_argument(
+        "--min_delta",
+        type=float,
+        default=0.002,
+        help="EarlyStopping min `map` improvement to reset patience (default 0.002).",
+    )
 
     args = parser.parse_args()
 
@@ -1233,6 +1321,8 @@ def main():
         shadow_loss_weight=args.shadow_loss_weight,
         fast_dev_run=args.fast_dev_run,
         precision=args.precision,
+        seed=args.seed,
+        min_delta=args.min_delta,
     )
 
 

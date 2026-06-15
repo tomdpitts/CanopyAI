@@ -1,9 +1,9 @@
 {
   "name": "phase22_B_L4",
   "model": "x",
-  "started": "2026-06-15T13:27:15+10:00",
-  "ended": "2026-06-15T13:31:23+10:00",
-  "git_sha": "dcff683",
+  "started": "2026-06-15T14:52:29+10:00",
+  "ended": "2026-06-15T14:56:36+10:00",
+  "git_sha": "dc21fc3",
   "argv": [
     "phase30/benchmark.py",
     "--models",

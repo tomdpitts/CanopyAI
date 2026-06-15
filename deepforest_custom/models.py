@@ -186,7 +186,7 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
         # IoU=0.4, which better suits aerial tree crown detection where predicted boxes
         # are often tighter than the annotated GT polygon bounds.
         from torchmetrics.detection.mean_ap import MeanAveragePrecision as _MAP
-        self.mAP_metric = _MAP(iou_thresholds=[0.4])
+        self.mAP_metric = _MAP(iou_thresholds=[0.5])
 
         # Cap proposals to avoid OOM on large TCD tiles (2048×2048) where
         # uncapped NMS across thousands of anchors blows GPU memory.
@@ -757,10 +757,11 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
     # Shadow loss reweighting
     # ------------------------------------------------------------------
 
-    # Shadow probe fractions of ray-box intersection distance (exact edge in shadow direction).
-    # 3 inside crown (< 1.0×edge), 3 outside (> 1.0×edge).
-    _SLR_PROBE_FRACTIONS = (0.26, 0.54, 0.80, 1.12, 1.52, 2.0)
-    _SLR_PROBE_MIN_PX    = 5      # minimum probe distance in px (floor for tiny boxes)
+    # Shadow probe distances (px): range covering ~1–15 m trees at 30–50° sun
+    # elevation. Zero-shot recipe (phase22): FIXED pixel offsets — the proven 0.498
+    # method. (The ray-box-fraction variant — _SLR_PROBE_FRACTIONS, which upweighted
+    # ~90% of crowns — is an untested change; recoverable from git @2abbc36.)
+    _SLR_PROBE_DISTANCES = (12, 20, 30, 42, 55, 75, 100)
     _SLR_SHADOW_THRESH   = 0.35   # min shadow_map value to count as shadow evidence
     _SLR_PROBE_RADIUS    = 2      # half-side of neighbourhood patch sampled at each probe
 
@@ -804,19 +805,10 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
 
             cx = ((boxes[:, 0] + boxes[:, 2]) / 2).cpu().numpy()
             cy = ((boxes[:, 1] + boxes[:, 3]) / 2).cpu().numpy()
-            bw = (boxes[:, 2] - boxes[:, 0]).cpu().numpy()
-            bh = (boxes[:, 3] - boxes[:, 1]).cpu().numpy()
 
             r = self._SLR_PROBE_RADIUS
             for i in range(N_gt):
-                # Ray-box intersection: exact distance from crown centre to box
-                # edge in the shadow direction — direction-invariant boundary.
-                t_x = ((float(bw[i]) / 2) / abs(sdx)) if abs(sdx) > 1e-6 else float("inf")
-                t_y = ((float(bh[i]) / 2) / abs(sdy)) if abs(sdy) > 1e-6 else float("inf")
-                edge_dist = max(min(t_x, t_y), self._SLR_PROBE_MIN_PX)
-                probe_dists = [max(f * edge_dist, self._SLR_PROBE_MIN_PX)
-                               for f in self._SLR_PROBE_FRACTIONS]
-                for d in probe_dists:
+                for d in self._SLR_PROBE_DISTANCES:
                     px = int(round(cx[i] + d * sdx))
                     py = int(round(cy[i] + d * sdy))
                     # Sample max over (2r+1)×(2r+1) neighbourhood — robust to
@@ -1102,11 +1094,13 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
         else:
             optimizer = torch.optim.SGD(params, lr=backbone_lr, momentum=0.9, weight_decay=1e-4)
 
+        # Zero-shot recipe (phase22): step the LR on val-mAP plateaus (map/max),
+        # the proven 0.498 schedule. (HEAD had switched to train_loss/min.)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="min", factor=0.1, patience=5, verbose=True
+            optimizer, mode="max", factor=0.1, patience=5, verbose=True
         )
         return {
             "optimizer": optimizer,
-            "lr_scheduler": {"scheduler": scheduler, "monitor": "train_loss",
+            "lr_scheduler": {"scheduler": scheduler, "monitor": "map",
                              "interval": "epoch", "frequency": 1},
         }
