@@ -735,6 +735,61 @@ def _write_summary_provenance(out_dir, args, model_spec, name,
         print(f"  ⚠️  could not write {fname}: {e}")
 
 
+def _rerank_out_dir(out_dir, holdout_dir, ensemble, tile_filter=None):
+    """In-place rerank: replace `deepforest_score` in each geojson with the CNN
+    ensemble's calibrated TP-probability, using the matching holdout tif.
+
+    Used by `--skip-inference --reranker-checkpoint` so geojsons produced WITHOUT
+    the reranker (e.g. DF+SAM-only inference offloaded to Modal) can be reranked
+    locally before scoring — the same rescoring foxtrot's 3rd stage does, and the
+    same as phase30/apply_reranker.py. Idempotent: the reranker scores from the
+    image + polygon geometry, not the current score, so re-running is a no-op."""
+    import rasterio
+    from shapely.geometry import mapping
+    out_dir = Path(out_dir); holdout_dir = Path(holdout_dir)
+    files = sorted(out_dir.glob("*_canopyai.geojson"))
+    if tile_filter is not None:
+        files = [f for f in files
+                 if f.name.replace("_canopyai.geojson", "") in tile_filter]
+    n_ok = 0
+    for f in files:
+        stem = f.name.replace("_canopyai.geojson", "")
+        gdf = gpd.read_file(str(f))
+        if gdf.empty or "deepforest_score" not in gdf.columns:
+            continue
+        tif = holdout_dir / f"{stem}.tif"
+        if not tif.exists():
+            print(f"    ⚠  rerank: missing tif for {stem}; left unchanged")
+            continue
+        with rasterio.open(tif) as src:
+            arr = src.read([1, 2, 3])
+        img = np.transpose(arr, (1, 2, 0))
+        if img.dtype != np.uint8:
+            mx = max(1, int(img.max()))
+            img = (img.astype(np.float32) / mx * 255).astype(np.uint8)
+        new_scores = ensemble.predict(img, list(gdf.geometry))
+        feats = []
+        for i, geom in enumerate(gdf.geometry):
+            clean = {}
+            for k, v in gdf.iloc[i].items():
+                if k == "geometry":
+                    continue
+                if k == "deepforest_score":
+                    clean[k] = float(new_scores[i]); continue
+                if hasattr(v, "tolist"):
+                    clean[k] = v.tolist()
+                elif isinstance(v, (int, float, str, bool)) or v is None:
+                    clean[k] = v
+                else:
+                    clean[k] = str(v)
+            feats.append({"type": "Feature", "properties": clean,
+                          "geometry": mapping(geom)})
+        with open(f, "w") as fh:
+            json.dump({"type": "FeatureCollection", "features": feats}, fh)
+        n_ok += 1
+    print(f"  🔁 reranked {n_ok} geojsons in {out_dir.name}/ (in place)")
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -784,10 +839,27 @@ def main():
         # provisional provenance (results pending) — survives a crash during scoring
         _write_summary_provenance(out_dir, args, spec, name, started_at[name])
 
+    # Optional rerank pass: when scoring pre-made geojsons (--skip-inference) that
+    # were produced WITHOUT the reranker (e.g. DF+SAM offloaded to Modal), apply the
+    # CNN reranker locally before scoring. (When inference runs here, foxtrot already
+    # reranks during inference, so this only fires under --skip-inference.)
+    rr_ensemble = None
+    if args.skip_inference and args.reranker_checkpoint:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from cnn_reranker import load_ensemble
+        import torch
+        dev = ("mps" if torch.backends.mps.is_available()
+               else "cuda" if torch.cuda.is_available() else "cpu")
+        print(f"  🔁 reranker: {args.reranker_checkpoint} on {dev} "
+              f"(rescoring geojsons before scoring)")
+        rr_ensemble = load_ensemble(Path(args.reranker_checkpoint), dev)
+
     # Step 2: evaluation
     all_results = {}
     for spec, name in zip(args.models, args.names):
         out_dir = output_root / name
+        if rr_ensemble is not None:
+            _rerank_out_dir(out_dir, holdout_dir, rr_ensemble, tile_filter=tile_filter)
         print(f"\n  Evaluating {name} ...")
         res = evaluate_model(name, out_dir, holdout_dir,
                              args.pred_score_thresh, tile_filter=tile_filter,

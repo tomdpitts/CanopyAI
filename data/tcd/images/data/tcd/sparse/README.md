@@ -66,3 +66,9 @@ Deterministic from `../val/` GT — re-running reproduces the same 180 symlinks,
     --skip-inference --tiles-file sparse_tiles.txt \
     --max-dets 512 --pred-score-thresh 0.0 --output-root benchmark_results_holdout
 ```
+
+### Many models, fresh inference → offload DF+SAM to Modal (CUDA), rerank locally
+DF+SAM on Modal (the holdout tiles are already on `canopyai-deepforest-data:/holdout`,
+no upload), then rerank+score in one local command. `benchmark.py --skip-inference
+--reranker-checkpoint` now reranks the geojsons in place before scoring. See
+`deepforest_custom/modal_benchmark.py` (`run_sparse_subset` entrypoint) for the exact 2-step.

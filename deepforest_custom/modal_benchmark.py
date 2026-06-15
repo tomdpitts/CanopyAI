@@ -47,6 +47,32 @@ Then evaluate locally (no GPU needed):
     python benchmark_tcd.py --skip-inference \\
         --models weecology phase21_baseline.pth phase21_B_λ4.pth \\
         --names  weecology phase21_baseline phase21_B_λ4
+
+Holdout-subset path (DF+SAM only on Modal → rerank + score locally)
+-------------------------------------------------------------------
+For evaluating many models on a tile SUBSET (e.g. the 180-tile `sparse`) without
+the slow local SAM pass. Tiles are already on the data volume
+(`canopyai-deepforest-data:/holdout/tcd_val_tile_N.tif`) — no upload. Modal runs
+foxtrot DF+SAM at --deepforest_confidence 0.05 + --max_boxes_sam 512 (SAM vit_b,
+NO reranker); the reranker runs locally so the heavy stage is on CUDA.
+
+    # 1. upload the model checkpoint if not already on the volume
+    modal volume put canopyai-deepforest-checkpoints manual_s4.pth manual_s4.pth
+
+    # 2. Modal inference (sharded; reads sparse_tiles.txt locally)
+    modal run --detach deepforest_custom/modal_benchmark.py::run_sparse_subset \\
+        --model /checkpoints/manual_s4.pth --name manual_s4
+
+    # 3. pull (download INTO the existing parent dir — modal volume get writes a
+    #    FILE if the leaf dest doesn't exist; spaces in the path are fine), then
+    #    rerank + score in ONE local command (--skip-inference reranks):
+    mkdir -p benchmark_results_holdout_manual
+    modal volume get canopyai-benchmark-results manual_s4 benchmark_results_holdout_manual
+    python phase30/benchmark.py --models x --names manual_s4 --skip-inference \\
+        --reranker-checkpoint phase30/cnn_reranker_ens3.pt --tiles-file sparse_tiles.txt \\
+        --max-dets 512 --pred-score-thresh 0.01 \\
+        --holdout-dir data/tcd/images/data/tcd/sparse \\
+        --output-root benchmark_results_holdout_manual
 """
 
 import os
@@ -103,8 +129,14 @@ results_volume = modal.Volume.from_name(
     "canopyai-benchmark-results", create_if_missing=True
 )
 
+data_volume = modal.Volume.from_name(
+    "canopyai-deepforest-data", create_if_missing=True
+)
+
 CHECKPOINTS_DIR = Path("/checkpoints")
 RESULTS_DIR     = Path("/results")
+DATA_DIR        = Path("/data")
+HOLDOUT_DIR     = DATA_DIR / "holdout"   # 439-tile OAM-TCD test set (tcd_val_tile_N.tif + _meta.json)
 SAM_CHECKPOINT  = CHECKPOINTS_DIR / "sam_vit_b_01ec64.pth"
 SHADOW_MODEL    = CHECKPOINTS_DIR / "shadow_model_combined_best.pth"
 
@@ -339,3 +371,132 @@ def run_all(
     print("\n🎉 All models complete. Pull results:")
     for _, name in models:
         print(f"  modal volume get canopyai-benchmark-results /{name} benchmark_results/{name}")
+
+
+# ===========================================================================
+# Holdout-subset path: DF + SAM only on PRE-UPLOADED holdout tiles, NO reranker
+# (rerank + score locally afterwards). Tiles already live on canopyai-deepforest-
+# data at /data/holdout/<stem>.tif — no upload/parquet needed; output geojsons
+# keep the source tcd_val_tile_N stem so they match the local GT + reranker.
+# ===========================================================================
+@app.function(
+    image=image,
+    gpu="A100",
+    volumes={
+        "/checkpoints": checkpoint_volume,
+        "/results":     results_volume,
+        "/data":        data_volume,
+    },
+    timeout=7200,
+    memory=16384,
+)
+def infer_holdout_shard(
+    stems: list,
+    model_spec: str,
+    model_name: str,
+    df_confidence: float = 0.05,
+    max_boxes_sam: int = 512,
+    skip_existing: bool = True,
+):
+    """Run foxtrot DF+SAM (NO reranker) on a list of holdout-tile stems read from
+    /data/holdout. Reranking is done locally afterwards via
+    `benchmark.py --skip-inference --reranker-checkpoint`."""
+    os.chdir("/root/canopyAI")
+    sys.path.insert(0, "/root/canopyAI")
+
+    out_dir = RESULTS_DIR / model_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    if not SAM_CHECKPOINT.exists():
+        raise FileNotFoundError(
+            f"SAM checkpoint not found at {SAM_CHECKPOINT}. "
+            "Run: modal run deepforest_custom/modal_benchmark.py::download_sam"
+        )
+    shadow_arg = ["--shadow_model", str(SHADOW_MODEL)] if SHADOW_MODEL.exists() else []
+    if not SHADOW_MODEL.exists():
+        print("⚠  Shadow model not found — running without shadow")
+
+    model_arg = []
+    if model_spec.lower() not in ("weecology", "weecology/deepforest", "default"):
+        if not Path(model_spec).exists():
+            raise FileNotFoundError(f"Checkpoint not found: {model_spec}")
+        model_arg = ["--deepforest_model", model_spec]
+
+    done = 0
+    for stem in stems:
+        tif = HOLDOUT_DIR / f"{stem}.tif"
+        out_path = out_dir / f"{stem}_canopyai.geojson"
+        if skip_existing and out_path.exists():
+            done += 1
+            continue
+        if not tif.exists():
+            print(f"  ✗ {stem}: tif not found at {tif}")
+            continue
+        cmd = [
+            sys.executable, "foxtrot.py",
+            "--image_path", str(tif),
+            "--output_dir", str(out_dir),
+            "--no_viz",
+            "--sam_model", "vit_b",
+            "--sam_checkpoint", str(SAM_CHECKPOINT),
+            *shadow_arg,
+            *model_arg,
+            "--deepforest_confidence", str(df_confidence),
+        ]
+        if max_boxes_sam and int(max_boxes_sam) > 0:
+            cmd += ["--max_boxes_sam", str(int(max_boxes_sam))]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+        if result.returncode != 0:
+            print(f"  ✗ {stem}: {result.stderr[-200:]}")
+        else:
+            results_volume.commit()
+            print(f"  ✓ {stem}")
+        done += 1
+    return done
+
+
+def _chunk(items: list, n_chunks: int) -> list:
+    k = max(1, (len(items) + n_chunks - 1) // n_chunks)
+    return [items[i:i + k] for i in range(0, len(items), k)]
+
+
+@app.local_entrypoint()
+def run_sparse_subset(
+    model: str = "weecology",
+    name: str = "weecology_sparse",
+    manifest: str = "sparse_tiles.txt",
+    df_confidence: float = 0.05,
+    max_boxes_sam: int = 512,
+    containers: int = 10,
+    skip_existing: bool = True,
+):
+    """DF+SAM-only inference over a manifest of holdout-tile stems (default the
+    sparse subset), sharded across GPU containers. NO reranker on Modal — rerank
+    and score LOCALLY afterwards:
+
+        modal run --detach deepforest_custom/modal_benchmark.py::run_sparse_subset \\
+            --model /checkpoints/manual_s4/deepforest_final.pth --name manual_s4
+
+        mkdir -p benchmark_results_holdout_manual   # modal volume get needs the parent to exist
+        modal volume get canopyai-benchmark-results manual_s4 benchmark_results_holdout_manual
+        ./venv310/bin/python phase30/benchmark.py --models x --names manual_s4 \\
+            --skip-inference --reranker-checkpoint phase30/cnn_reranker_ens3.pt \\
+            --tiles-file sparse_tiles.txt --max-dets 512 --pred-score-thresh 0.01 \\
+            --holdout-dir data/tcd/images/data/tcd/sparse \\
+            --output-root benchmark_results_holdout_manual
+    """
+    stems = [s.strip() for s in open(manifest) if s.strip()]
+    shards = _chunk(stems, containers)
+    print(f"🚀 {name}: {len(stems)} tiles → {len(shards)} containers "
+          f"(df-conf {df_confidence}, max_boxes_sam {max_boxes_sam}, SAM vit_b, NO reranker)")
+    results = list(infer_holdout_shard.starmap(
+        [(sh, model, name, df_confidence, max_boxes_sam, skip_existing) for sh in shards]
+    ))
+    print(f"✅ {name}: {sum(results)} tiles processed")
+    print(f"\nPull + rerank + score locally (download INTO the existing parent dir):")
+    print(f"  mkdir -p benchmark_results_holdout_manual")
+    print(f"  modal volume get canopyai-benchmark-results {name} benchmark_results_holdout_manual")
+    print(f"  python phase30/benchmark.py --models x --names {name} --skip-inference \\")
+    print(f"      --reranker-checkpoint phase30/cnn_reranker_ens3.pt --tiles-file {manifest} \\")
+    print(f"      --max-dets 512 --pred-score-thresh 0.01 \\")
+    print(f"      --holdout-dir data/tcd/images/data/tcd/sparse --output-root benchmark_results_holdout_manual")
