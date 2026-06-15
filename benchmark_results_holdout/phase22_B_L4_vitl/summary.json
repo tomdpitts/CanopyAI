@@ -1,0 +1,82 @@
+{
+  "name": "phase22_B_L4_vitl",
+  "model": "phase22_B_L4.pth",
+  "started": "2026-06-12T21:22:27+10:00",
+  "ended": "2026-06-13T01:04:21+10:00",
+  "git_sha": "2abbc36",
+  "argv": [
+    "phase30/benchmark.py",
+    "--models",
+    "phase22_B_L4.pth",
+    "--names",
+    "phase22_B_L4_vitl",
+    "--holdout-dir",
+    "data/tcd/images/data/tcd/val",
+    "--shadow-model",
+    "solar/shadow_regression/output/shadow_model_combined_best.pth",
+    "--sam-model",
+    "vit_l",
+    "--sam-checkpoint",
+    "sam_vit_l_0b3195.pth",
+    "--df-confidence",
+    "0.001",
+    "--max-dets",
+    "512",
+    "--max-boxes-sam",
+    "512",
+    "--pred-score-thresh",
+    "0.0",
+    "--skip-existing",
+    "--output-root",
+    "benchmark_results_holdout"
+  ],
+  "args": {
+    "models": [
+      "phase22_B_L4.pth"
+    ],
+    "names": [
+      "phase22_B_L4_vitl"
+    ],
+    "holdout_dir": "data/tcd/images/data/tcd/val",
+    "output_root": "benchmark_results_holdout",
+    "shadow_model": "solar/shadow_regression/output/shadow_model_combined_best.pth",
+    "abs_luma_max": null,
+    "df_confidence": 0.001,
+    "df_tile_overlap": null,
+    "bbox_pad": null,
+    "skip_nms": false,
+    "containment_threshold": null,
+    "poly_containment_threshold": null,
+    "reranker_checkpoint": null,
+    "sam_model": "vit_l",
+    "sam_checkpoint": "sam_vit_l_0b3195.pth",
+    "tiles": null,
+    "tiles_file": null,
+    "skip_inference": false,
+    "skip_existing": true,
+    "pred_score_thresh": 0.0,
+    "max_dets": 512,
+    "max_boxes_sam": 512,
+    "df_tta": false,
+    "df_tta_scales": null
+  },
+  "results": {
+    "phase22_B_L4_vitl": {
+      "n_tiles": 439,
+      "n_gt_tree": 25700,
+      "n_pred": 202067,
+      "tp": 238525812,
+      "fp": 169099431,
+      "fn": 232839680,
+      "tn": 1200834533,
+      "macro_iou": 0.5608244100450702,
+      "f1_tree": 0.5427265669643264,
+      "tree_recall": 0.5060315531116563,
+      "iou_tree": 0.3724260352662592,
+      "iou_bg": 0.7492227848238813,
+      "pixel_acc": 0.7817089937814005,
+      "map50": 0.19984408397357026,
+      "ar1000": 0.5301556420233463
+    }
+  }
+}

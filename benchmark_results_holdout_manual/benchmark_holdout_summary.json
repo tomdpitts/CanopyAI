@@ -1,0 +1,51 @@
+{
+  "args": {
+    "models": [
+      "x"
+    ],
+    "names": [
+      "phase22_B_L4"
+    ],
+    "holdout_dir": "/Users/tompitts/Library/Mobile Documents/com~apple~CloudDocs/dphil icloud/CanopyAI/data/tcd/images/data/tcd/val",
+    "output_root": "benchmark_results_holdout_manual",
+    "shadow_model": "solar/shadow_regression/output/shadow_model_combined_best.pth",
+    "abs_luma_max": null,
+    "df_confidence": null,
+    "df_tile_overlap": null,
+    "bbox_pad": null,
+    "skip_nms": false,
+    "containment_threshold": null,
+    "poly_containment_threshold": null,
+    "reranker_checkpoint": null,
+    "sam_model": null,
+    "sam_checkpoint": null,
+    "tiles": null,
+    "tiles_file": null,
+    "skip_inference": true,
+    "skip_existing": false,
+    "pred_score_thresh": 0.01,
+    "max_dets": 512,
+    "max_boxes_sam": 0,
+    "df_tta": false,
+    "df_tta_scales": null
+  },
+  "results": {
+    "phase22_B_L4": {
+      "n_tiles": 439,
+      "n_gt_tree": 25700,
+      "n_pred": 181418,
+      "tp": 266335009,
+      "fp": 86554026,
+      "fn": 205030483,
+      "tn": 1283379938,
+      "macro_iou": 0.6461172677535785,
+      "f1_tree": 0.6462445768283903,
+      "tree_recall": 0.5650286529672393,
+      "iou_tree": 0.47737173625820345,
+      "iou_bg": 0.8148627992489534,
+      "pixel_acc": 0.8416419947065905,
+      "map50": 0.4976845010213401,
+      "ar1000": 0.5731906614785992
+    }
+  }
+}

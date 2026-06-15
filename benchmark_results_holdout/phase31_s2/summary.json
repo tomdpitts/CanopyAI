@@ -1,4 +1,32 @@
 {
+  "name": "phase31_s2",
+  "model": "checkpoints/phase22_s2/deepforest_final_fixed.pth",
+  "started": "2026-06-14T22:16:16+10:00",
+  "ended": "2026-06-15T09:06:55+10:00",
+  "git_sha": "dcff683",
+  "argv": [
+    "phase30/benchmark.py",
+    "--models",
+    "checkpoints/phase22_s2/deepforest_final_fixed.pth",
+    "checkpoints/phase22_s6/deepforest_final_fixed.pth",
+    "--names",
+    "phase31_s2",
+    "phase31_s6",
+    "--sam-model",
+    "vit_b",
+    "--sam-checkpoint",
+    "sam_vit_b_01ec64.pth",
+    "--df-confidence",
+    "0.05",
+    "--max-dets",
+    "512",
+    "--pred-score-thresh",
+    "0.0",
+    "--reranker-checkpoint",
+    "phase30/cnn_reranker_ens3.pt",
+    "--output-root",
+    "benchmark_results_holdout"
+  ],
   "args": {
     "models": [
       "checkpoints/phase22_s2/deepforest_final_fixed.pth",
@@ -48,23 +76,6 @@
       "pixel_acc": 0.8096758336303989,
       "map50": 0.4863588440256065,
       "ar1000": 0.5668871595330739
-    },
-    "phase31_s6": {
-      "n_tiles": 439,
-      "n_gt_tree": 25700,
-      "n_pred": 270917,
-      "tp": 267852214,
-      "fp": 151359881,
-      "fn": 203513278,
-      "tn": 1218574083,
-      "macro_iou": 0.6022951550286215,
-      "f1_tree": 0.6015247136463137,
-      "tree_recall": 0.568247397287199,
-      "iou_tree": 0.4301289550955875,
-      "iou_bg": 0.7744613549616556,
-      "pixel_acc": 0.8072702634850504,
-      "map50": 0.48230759230042575,
-      "ar1000": 0.5624513618677043
     }
   }
 }

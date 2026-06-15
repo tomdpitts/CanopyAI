@@ -1,0 +1,27 @@
+# Pinned versions that build + run the Restor tcd-mask-rcnn-r50 baseline
+# LOCALLY on Apple Silicon (M-series), CPU inference, Python 3.10.
+#
+# DO NOT just `pip install -r` this blindly — ORDER and BUILD FLAGS matter for
+# detectron2 (compiled from source). See README "INSTALL" for the exact recipe.
+# This file documents the known-good end state.
+#
+# Install order that works (summarised; full recipe in README):
+#   1. numpy<2  torch==2.1.2  torchvision==0.16.2          (CPU wheels)
+#   2. pycocotools opencv-python==4.10.0.84 rasterio shapely geopandas huggingface_hub
+#   3. re-pin numpy==1.26.4                                 (step 2 pulls numpy 2)
+#   4. setuptools==69.5.1                                   (restores pkg_resources.packaging)
+#   5. CXXFLAGS="-Wno-error=invalid-specialization -Wno-invalid-specialization" \
+#      pip install --no-build-isolation git+https://github.com/facebookresearch/detectron2.git
+#   6. re-pin numpy==1.26.4 opencv-python==4.10.0.84        (step 5 pulls numpy 2 via matplotlib)
+
+numpy==1.26.4
+torch==2.1.2
+torchvision==0.16.2
+opencv-python==4.10.0.84
+pycocotools==2.0.11
+rasterio==1.4.4
+shapely==2.1.2
+geopandas==1.1.3
+huggingface_hub==1.17.0
+setuptools==69.5.1
+# detectron2==0.6  — installed from git source, not a wheel (see README)

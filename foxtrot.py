@@ -636,7 +636,22 @@ def detect_trees_deepforest(
                     _sd = {k[len("model."):]: v for k, v in _sd.items()}
             else:
                 _sd = _raw
-            df_model.model.load_state_dict(_sd, strict=False)
+                # Lightning checkpoints prefix weights with "model." - strip it
+                if _sd and all(k.startswith("model.") for k in _sd):
+                    _sd = {k[len("model."):]: v for k, v in _sd.items()}
+            # torch.compile() wraps the module, inserting an "_orig_mod." segment
+            # into every key. Strip it or the load silently matches nothing.
+            if _sd and all(k.startswith("_orig_mod.") for k in _sd):
+                _sd = {k[len("_orig_mod."):]: v for k, v in _sd.items()}
+            missing, unexpected = df_model.model.load_state_dict(_sd, strict=False)
+            critical = [k for k in missing if not k.startswith("aux_head")]
+            if critical:
+                raise RuntimeError(
+                    f"Custom DeepForest load matched 0 weights: {len(critical)} "
+                    f"critical keys missing (e.g. {critical[:3]}). Checkpoint key "
+                    f"format does not match model — refusing to run untrained."
+                )
+            print(f"   ✅ Loaded custom DeepForest weights ({301-len(missing)}/301 keys)")
         else:
             print("   Loading default model from Hugging Face...")
             df_model.load_model("weecology/deepforest-tree")

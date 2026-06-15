@@ -1,0 +1,72 @@
+{
+  "name": "phase22_B_L4_vitl",
+  "model": "x",
+  "started": "2026-06-13T12:53:38+10:00",
+  "ended": "2026-06-13T12:56:50+10:00",
+  "git_sha": "2abbc36",
+  "argv": [
+    "phase30/benchmark.py",
+    "--models",
+    "x",
+    "--names",
+    "phase22_B_L4_vitl",
+    "--skip-inference",
+    "--max-dets",
+    "512",
+    "--pred-score-thresh",
+    "0.10",
+    "--holdout-dir",
+    "data/tcd/images/data/tcd/val",
+    "--output-root",
+    "benchmark_results_holdout"
+  ],
+  "args": {
+    "models": [
+      "x"
+    ],
+    "names": [
+      "phase22_B_L4_vitl"
+    ],
+    "holdout_dir": "data/tcd/images/data/tcd/val",
+    "output_root": "benchmark_results_holdout",
+    "shadow_model": "solar/shadow_regression/output/shadow_model_combined_best.pth",
+    "abs_luma_max": null,
+    "df_confidence": null,
+    "df_tile_overlap": null,
+    "bbox_pad": null,
+    "skip_nms": false,
+    "containment_threshold": null,
+    "poly_containment_threshold": null,
+    "reranker_checkpoint": null,
+    "sam_model": null,
+    "sam_checkpoint": null,
+    "tiles": null,
+    "tiles_file": null,
+    "skip_inference": true,
+    "skip_existing": false,
+    "pred_score_thresh": 0.1,
+    "max_dets": 512,
+    "max_boxes_sam": 0,
+    "df_tta": false,
+    "df_tta_scales": null
+  },
+  "results": {
+    "phase22_B_L4_vitl": {
+      "n_tiles": 439,
+      "n_gt_tree": 25700,
+      "n_pred": 153194,
+      "tp": 220111898,
+      "fp": 112240283,
+      "fn": 251253594,
+      "tn": 1257693681,
+      "macro_iou": 0.5764719797565498,
+      "f1_tree": 0.5477343733861132,
+      "tree_recall": 0.46696650844351584,
+      "iou_tree": 0.3771585330868256,
+      "iou_bg": 0.7757854264262741,
+      "pixel_acc": 0.8025883971151295,
+      "map50": 0.19601045039212983,
+      "ar1000": 0.5071595330739299
+    }
+  }
+}

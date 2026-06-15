@@ -1,0 +1,70 @@
+{
+  "name": "phase22_B_L4",
+  "model": "x",
+  "started": "2026-06-13T23:11:54+10:00",
+  "ended": "2026-06-13T23:12:22+10:00",
+  "git_sha": "2abbc36",
+  "argv": [
+    "phase30/benchmark.py",
+    "--models",
+    "x",
+    "--names",
+    "phase22_B_L4",
+    "--skip-inference",
+    "--tiles-file",
+    "/tmp/sam_impact/sample40.txt",
+    "--pred-score-thresh",
+    "0.05",
+    "--output-root",
+    "benchmark_results_holdout"
+  ],
+  "args": {
+    "models": [
+      "x"
+    ],
+    "names": [
+      "phase22_B_L4"
+    ],
+    "holdout_dir": "/Users/tompitts/Library/Mobile Documents/com~apple~CloudDocs/dphil icloud/CanopyAI/data/tcd/images/data/tcd/val",
+    "output_root": "benchmark_results_holdout",
+    "shadow_model": "solar/shadow_regression/output/shadow_model_combined_best.pth",
+    "abs_luma_max": null,
+    "df_confidence": null,
+    "df_tile_overlap": null,
+    "bbox_pad": null,
+    "skip_nms": false,
+    "containment_threshold": null,
+    "poly_containment_threshold": null,
+    "reranker_checkpoint": null,
+    "sam_model": null,
+    "sam_checkpoint": null,
+    "tiles": null,
+    "tiles_file": "/tmp/sam_impact/sample40.txt",
+    "skip_inference": true,
+    "skip_existing": false,
+    "pred_score_thresh": 0.05,
+    "max_dets": 512,
+    "max_boxes_sam": 0,
+    "df_tta": false,
+    "df_tta_scales": null
+  },
+  "results": {
+    "phase22_B_L4": {
+      "n_tiles": 40,
+      "n_gt_tree": 2182,
+      "n_pred": 11063,
+      "tp": 22975632,
+      "fp": 3764882,
+      "fn": 20043783,
+      "tn": 120987863,
+      "macro_iou": 0.6633343314311061,
+      "f1_tree": 0.6587057162859211,
+      "tree_recall": 0.5340758817850033,
+      "iou_tree": 0.49109708755482634,
+      "iou_bg": 0.8355715753073858,
+      "pixel_acc": 0.8580892980098724,
+      "map50": 0.5348752033852999,
+      "ar1000": 0.6109074243813015
+    }
+  }
+}
