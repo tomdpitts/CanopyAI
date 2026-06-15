@@ -639,15 +639,25 @@ def train_deepforest(
     use_wrapper = use_shadow or won_bbox_shrink
 
     if use_wrapper:
-        # Auto-derive base shadow angle from CSV if not explicitly provided
+        # shadow_angle_deg is only consumed by paths that use the GLOBAL base
+        # angle as a fallback: shadow_channel / shadow_cross_attention /
+        # shadow_proposals. The shadow_loss_reweight path sources direction
+        # per-image from shadow_x/shadow_y (shadow_lookup) and never reads the
+        # global angle, so for reweight-only (or pure won_bbox_shrink) runs the
+        # value is inert — don't auto-derive or announce a misleading global angle.
+        angle_consumed = shadow_channel or shadow_cross_attention or shadow_proposals
         if shadow_angle_deg is None:
-            _df = pd.read_csv(train_csv)
-            if "shadow_angle" in _df.columns:
-                shadow_angle_deg = float(_df["shadow_angle"].mode()[0])
-                print(f"   Shadow angle auto-derived from CSV: {shadow_angle_deg:.1f} deg")
-            else:
+            if not angle_consumed:
+                # Inert: pass the constructor default; no global angle is in play.
                 shadow_angle_deg = 215.0
-                print(f"   Shadow angle defaulted to {shadow_angle_deg} deg (no shadow_angle column)")
+            else:
+                _df = pd.read_csv(train_csv)
+                if "shadow_angle" in _df.columns:
+                    shadow_angle_deg = float(_df["shadow_angle"].mode()[0])
+                    print(f"   Shadow angle auto-derived from CSV: {shadow_angle_deg:.1f} deg")
+                else:
+                    shadow_angle_deg = 215.0
+                    print(f"   Shadow angle defaulted to {shadow_angle_deg} deg (no shadow_angle column)")
         print(f"   shadow_channel={shadow_channel}  shadow_cross_attention={shadow_cross_attention}  "
               f"shadow_proposals={shadow_proposals}  shadow_proposals_iso={shadow_proposals_iso}  "
               f"won_bbox_shrink={won_bbox_shrink}")
