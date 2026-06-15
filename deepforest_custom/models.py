@@ -183,8 +183,8 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
         deepforest_main.deepforest.__init__(self, config=config, **kwargs)
 
         # Override DeepForest's default COCO mAP metric (averages IoU 0.5→0.95) with
-        # IoU=0.4, which better suits aerial tree crown detection where predicted boxes
-        # are often tighter than the annotated GT polygon bounds.
+        # a single IoU=0.5 threshold, which better suits aerial tree crown detection
+        # where predicted boxes are often tighter than the annotated GT polygon bounds.
         from torchmetrics.detection.mean_ap import MeanAveragePrecision as _MAP
         self.mAP_metric = _MAP(iou_thresholds=[0.5])
 

@@ -985,7 +985,7 @@ def train_deepforest(
     callbacks = []
 
     # Monitor DeepForest's native `map` metric, which we've overridden to use
-    # IoU=0.4 (better suited to aerial tree crown detection than COCO's 0.5–0.95).
+    # IoU=0.5 (better suited to aerial tree crown detection than COCO's 0.5–0.95).
     _monitor = "map"
     checkpoint_callback = ModelCheckpoint(
         dirpath=run_output_dir,
