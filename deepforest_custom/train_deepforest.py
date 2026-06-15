@@ -582,6 +582,7 @@ def train_deepforest(
     precision=None,               # Override Lightning precision (e.g. "16-mixed", "bf16-mixed")
     seed=None,                    # If set, pl.seed_everything(seed, workers=True) for reproducible runs
     min_delta=0.002,              # EarlyStopping: min `map` improvement to reset patience
+    skip_won=False,               # Drop WON-domain tiles from the dataset at load time (CSV untouched)
 ):
     """
     Train a DeepForest model using DeepForest 2.0 config-based API.
@@ -852,44 +853,57 @@ def train_deepforest(
     # pin_memory is a CUDA-only feature — disable on MPS and CPU to avoid overhead
     pin_memory = torch.cuda.is_available()
 
+    # Hard-negative empties: DeepForest's read_file errors on NaN-box rows, so we
+    # strip them to a temp CSV and re-inject the image paths into the dataset below.
     if _empty_image_paths:
         print(f"\n🔲 Found {len(_empty_image_paths)} confirmed-empty (hard-negative) images — "
-              f"will be injected into dataset after CSV loading")
+              f"stripped from CSV, re-injected into the dataset")
         _clean_train_csv = "/tmp/_clean_train.csv"
         train_df[~_empty_mask].to_csv(_clean_train_csv, index=False)
         model.config.train.csv_file = _clean_train_csv
-
-        _orig_train_dataloader = model.train_dataloader.__func__  # unbound method
-
-        def _train_dataloader_with_empties(self_model):
-            dl = _orig_train_dataloader(self_model)
-            ds = dl.dataset
-            ds.image_names = np.append(ds.image_names, _empty_image_paths)
-            if hasattr(self_model, "_train_transform_override"):
-                ds.transform = self_model._train_transform_override
-            print(f"   ✅ Injected {len(_empty_image_paths)} empty images into training dataset "
-                  f"(total: {len(ds.image_names)} images)")
-            return DataLoader(
-                ds,
-                batch_size=dl.batch_size,
-                shuffle=True,
-                collate_fn=ds.collate_fn,
-                num_workers=_NW,
-                pin_memory=pin_memory,
-                persistent_workers=(_NW > 0),
-            )
-
-        model.train_dataloader = types.MethodType(_train_dataloader_with_empties, model)
     else:
         _clean_train_csv = train_csv
-        # No empty images — still need to inject transform override if set
-        if hasattr(model, "_train_transform_override"):
-            _orig_tl = model.train_dataloader.__func__
-            def _train_dataloader_with_transform(self_model):
-                dl = _orig_tl(self_model)
-                dl.dataset.transform = self_model._train_transform_override
-                return dl
-            model.train_dataloader = types.MethodType(_train_dataloader_with_transform, model)
+
+    # Optional WON skip — code-only: drop WON image paths from the built dataset.
+    # The original CSV is left untouched (no filtered copy written).
+    _won_paths = set()
+    if skip_won and "domain" in train_df.columns:
+        _won_paths = set(train_df.loc[train_df["domain"].astype(str).str.upper() == "WON",
+                                      "image_path"])
+        print(f"   🚫 skip_won: dropping {len(_won_paths)} WON images from the training "
+              f"dataset at load time (CSV unchanged)")
+
+    # Single dataloader wrapper: filters WON, re-injects empties, applies the
+    # transform override. Rebuilds the DataLoader only when image_names changed.
+    _rebuild = bool(_empty_image_paths) or bool(_won_paths)
+    if _rebuild or hasattr(model, "_train_transform_override"):
+        _orig_train_dataloader = model.train_dataloader.__func__  # unbound method
+
+        def _train_dataloader_custom(self_model):
+            dl = _orig_train_dataloader(self_model)
+            ds = dl.dataset
+            if _won_paths:
+                ds.image_names = np.array([n for n in ds.image_names if n not in _won_paths])
+            if _empty_image_paths:
+                ds.image_names = np.append(ds.image_names, _empty_image_paths)
+            if hasattr(self_model, "_train_transform_override"):
+                ds.transform = self_model._train_transform_override
+            if _rebuild:
+                print(f"   ✅ training dataset: {len(ds.image_names)} images"
+                      + (f"  (−{len(_won_paths)} WON)" if _won_paths else "")
+                      + (f"  (+{len(_empty_image_paths)} empty)" if _empty_image_paths else ""))
+                return DataLoader(
+                    ds,
+                    batch_size=dl.batch_size,
+                    shuffle=True,
+                    collate_fn=ds.collate_fn,
+                    num_workers=_NW,
+                    pin_memory=pin_memory,
+                    persistent_workers=(_NW > 0),
+                )
+            return dl
+
+        model.train_dataloader = types.MethodType(_train_dataloader_custom, model)
 
     print(f"\n📊 Loading training data from {train_csv}...")
     print(f"   Training samples: {len(train_df[~_empty_mask])} bounding boxes")
@@ -1296,6 +1310,11 @@ def main():
         default=0.002,
         help="EarlyStopping min `map` improvement to reset patience (default 0.002).",
     )
+    parser.add_argument(
+        "--skip-won",
+        action="store_true",
+        help="Drop WON-domain tiles from training at load time (CSV untouched).",
+    )
 
     args = parser.parse_args()
 
@@ -1323,6 +1342,7 @@ def main():
         precision=args.precision,
         seed=args.seed,
         min_delta=args.min_delta,
+        skip_won=args.skip_won,
     )
 
 

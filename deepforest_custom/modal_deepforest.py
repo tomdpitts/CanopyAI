@@ -466,6 +466,7 @@ def train_deepforest_modal(
     tcd_augmentations: bool = False,  # Use TCD paper augmentation suite (overrides wrapper disable)
     seed: int = None,                 # If set, reproducible run via seed_everything(seed, workers=True)
     min_delta: float = 0.002,         # EarlyStopping: min `map` improvement to reset patience
+    skip_won: bool = False,           # Drop WON-domain tiles from training at load time (CSV untouched)
 ):
     """
     Train DeepForest on Modal GPU. Auto-resumes from checkpoint if one exists
@@ -820,6 +821,7 @@ def train_deepforest_modal(
         ),
         seed=seed,
         min_delta=min_delta,
+        skip_won=skip_won,
     )
 
     # Persist checkpoints
@@ -869,6 +871,7 @@ def main(
     tcd_augmentations: bool = False,
     seed: int = None,
     min_delta: float = 0.002,
+    skip_won: bool = False,
 ):
     """
 Modal deployment for DeepForest fine-tuning
@@ -958,6 +961,7 @@ Phase 5 training data is already in Modal storage:
         tcd_augmentations=tcd_augmentations,
         seed=seed,
         min_delta=min_delta,
+        skip_won=skip_won,
     )
 
     if results:
