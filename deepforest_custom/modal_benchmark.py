@@ -247,9 +247,15 @@ def infer_shard(
             f"SAM checkpoint not found at {SAM_CHECKPOINT}. "
             "Run: modal run deepforest_custom/modal_benchmark.py::download_sam"
         )
-    shadow_arg = ["--shadow_model", str(SHADOW_MODEL)] if SHADOW_MODEL.exists() else []
-    if not SHADOW_MODEL.exists():
-        print(f"⚠  Shadow model not found — running without shadow")
+    # DEPRECATED — shadow inference is disabled and this whole path should be removed
+    # properly in the near future (drop SHADOW_MODEL, shadow_arg, the `*shadow_arg` splices,
+    # and the one-time shadow-model upload in the module docstring). foxtrot's Stage-0 shadow
+    # vector is only consumed by checkpoints trained with shadow_channel/
+    # shadow_cross_attention=True; current plain-RGB models ignore it, and the volume's
+    # shadow_model_combined_best.pth is stale/out of date. Kept as a no-op stub only so a
+    # genuinely shadow-aware checkpoint can be evaluated in the interim by restoring (with a
+    # CURRENT shadow model):  shadow_arg = ["--shadow_model", str(SHADOW_MODEL)]
+    shadow_arg = []
 
     model_arg = []
     if model_spec.lower() not in ("weecology", "weecology/deepforest", "default"):
@@ -397,9 +403,11 @@ def infer_holdout_shard(
     df_confidence: float = 0.05,
     max_boxes_sam: int = 512,
     skip_existing: bool = True,
+    data_subdir: str = "holdout",
 ):
-    """Run foxtrot DF+SAM (NO reranker) on a list of holdout-tile stems read from
-    /data/holdout. Reranking is done locally afterwards via
+    """Run foxtrot DF+SAM (NO reranker) on a list of tile stems read from
+    /data/<data_subdir> (default "holdout"; e.g. "dryland" for the 144-tile set).
+    Reranking is done locally afterwards via
     `benchmark.py --skip-inference --reranker-checkpoint`."""
     os.chdir("/root/canopyAI")
     sys.path.insert(0, "/root/canopyAI")
@@ -412,9 +420,15 @@ def infer_holdout_shard(
             f"SAM checkpoint not found at {SAM_CHECKPOINT}. "
             "Run: modal run deepforest_custom/modal_benchmark.py::download_sam"
         )
-    shadow_arg = ["--shadow_model", str(SHADOW_MODEL)] if SHADOW_MODEL.exists() else []
-    if not SHADOW_MODEL.exists():
-        print("⚠  Shadow model not found — running without shadow")
+    # DEPRECATED — shadow inference is disabled and this whole path should be removed
+    # properly in the near future (drop SHADOW_MODEL, shadow_arg, the `*shadow_arg` splices,
+    # and the one-time shadow-model upload in the module docstring). foxtrot's Stage-0 shadow
+    # vector is only consumed by checkpoints trained with shadow_channel/
+    # shadow_cross_attention=True; current plain-RGB models ignore it, and the volume's
+    # shadow_model_combined_best.pth is stale/out of date. Kept as a no-op stub only so a
+    # genuinely shadow-aware checkpoint can be evaluated in the interim by restoring (with a
+    # CURRENT shadow model):  shadow_arg = ["--shadow_model", str(SHADOW_MODEL)]
+    shadow_arg = []
 
     model_arg = []
     if model_spec.lower() not in ("weecology", "weecology/deepforest", "default"):
@@ -424,7 +438,7 @@ def infer_holdout_shard(
 
     done = 0
     for stem in stems:
-        tif = HOLDOUT_DIR / f"{stem}.tif"
+        tif = (DATA_DIR / data_subdir) / f"{stem}.tif"
         out_path = out_dir / f"{stem}_canopyai.geojson"
         if skip_existing and out_path.exists():
             done += 1
@@ -469,6 +483,7 @@ def run_sparse_subset(
     max_boxes_sam: int = 512,
     containers: int = 10,
     skip_existing: bool = True,
+    data_subdir: str = "holdout",
 ):
     """DF+SAM-only inference over a manifest of holdout-tile stems (default the
     sparse subset), sharded across GPU containers. NO reranker on Modal — rerank
@@ -490,7 +505,7 @@ def run_sparse_subset(
     print(f"🚀 {name}: {len(stems)} tiles → {len(shards)} containers "
           f"(df-conf {df_confidence}, max_boxes_sam {max_boxes_sam}, SAM vit_b, NO reranker)")
     results = list(infer_holdout_shard.starmap(
-        [(sh, model, name, df_confidence, max_boxes_sam, skip_existing) for sh in shards]
+        [(sh, model, name, df_confidence, max_boxes_sam, skip_existing, data_subdir) for sh in shards]
     ))
     print(f"✅ {name}: {sum(results)} tiles processed")
     print(f"\nPull + rerank + score locally (download INTO the existing parent dir):")

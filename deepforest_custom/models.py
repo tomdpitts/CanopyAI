@@ -837,27 +837,44 @@ class ShadowConditionedDeepForest(deepforest_main.deepforest):
                           file=_s.stderr, flush=True)
                     self._shadow_select_announced = True
 
-            # Negative control (SHADOW_BLIND_CONTROL=1): keep the same NUMBER of
-            # upweighted boxes per image as the shadow logic selected, but choose
-            # them at RANDOM (shadow-blind).  If this reproduces the shadow gain,
-            # the effect is generic hard-example upweighting, not shadow-specific.
+            # Negative control (SHADOW_BLIND_CONTROL=1), option E — "non-shadow-first":
+            # upweight the SAME number k of boxes the shadow probe selected, but
+            # prefer NON-shadow boxes. Only on tiles where non-shadow boxes run out
+            # (k > N_gt - k) do we top up with the minimum forced number of shadow
+            # boxes, so the per-tile count stays matched to the shadow run while
+            # shadow-exclusion is maximised (overlap occurs only where geometrically
+            # unavoidable). RNG is the global numpy RNG, which seed_everything(seed)
+            # sets — so the control is reproducible from --seed. If this reproduces
+            # the shadow gain, the effect is generic hard-example upweighting, not
+            # shadow-specific. Mirrors phase30/lib/models.py.
             if os.environ.get("SHADOW_BLIND_CONTROL") == "1":
-                k = int((weights != 1.0).sum().item())
+                w_np = weights.numpy()
+                shadow_idx     = np.where(w_np != 1.0)[0]
+                non_shadow_idx = np.where(w_np == 1.0)[0]
+                k = int(shadow_idx.size)
                 weights = torch.ones(N_gt, dtype=torch.float32)
                 if k > 0:
-                    idx = np.random.default_rng().choice(N_gt, size=min(k, N_gt),
-                                                         replace=False)
-                    weights[idx] = self.shadow_loss_weight
-                # One-time provenance line: confirm the random-reweight branch
+                    n_from_non = min(k, non_shadow_idx.size)
+                    pick = []
+                    if n_from_non > 0:
+                        pick += list(np.random.choice(non_shadow_idx,
+                                                       size=n_from_non, replace=False))
+                    n_forced = k - n_from_non   # >0 only on capped tiles
+                    if n_forced > 0:
+                        pick += list(np.random.choice(shadow_idx,
+                                                       size=n_forced, replace=False))
+                    weights[torch.as_tensor(pick, dtype=torch.long)] = self.shadow_loss_weight
+                # One-time provenance line: confirm the non-shadow-first branch
                 # actually fired (and upweighted the SAME count the shadow logic
                 # chose), so a blind run is verifiable from its log — not a silent
-                # no-op. Mirrors phase30/lib/models.py.
+                # no-op.
                 if not getattr(self, "_blind_control_announced", False):
                     import sys as _sys
                     n_up = int((weights != 1.0).sum().item())
-                    print(f"   🎲 SHADOW_BLIND_CONTROL active: random reweight branch "
-                          f"taken (shadow-selected k={k}, randomly upweighted={n_up}/"
-                          f"{N_gt} boxes @ weight={self.shadow_loss_weight}x)",
+                    print(f"   🎲 SHADOW_BLIND_CONTROL (non-shadow-first) active: "
+                          f"shadow-selected k={k}, upweighted n={n_up}/{N_gt} boxes "
+                          f"(forced-shadow overlap only when non-shadow boxes run out) "
+                          f"@ weight={self.shadow_loss_weight}x",
                           file=_sys.stderr, flush=True)
                     self._blind_control_announced = True
 

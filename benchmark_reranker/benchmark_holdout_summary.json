@@ -1,0 +1,51 @@
+{
+  "args": {
+    "models": [
+      "checkpoints/manual_s3.5/deepforest_best.pth"
+    ],
+    "names": [
+      "manual_s3.5"
+    ],
+    "holdout_dir": "data/tcd/images/data/tcd/val",
+    "output_root": "benchmark_reranker",
+    "shadow_model": null,
+    "abs_luma_max": null,
+    "df_confidence": 0.05,
+    "df_tile_overlap": null,
+    "bbox_pad": null,
+    "skip_nms": false,
+    "containment_threshold": null,
+    "poly_containment_threshold": null,
+    "reranker_checkpoint": null,
+    "sam_model": "vit_b",
+    "sam_checkpoint": "sam_vit_b_01ec64.pth",
+    "tiles": null,
+    "tiles_file": null,
+    "skip_inference": false,
+    "skip_existing": true,
+    "pred_score_thresh": 0.01,
+    "max_dets": 512,
+    "max_boxes_sam": 512,
+    "df_tta": false,
+    "df_tta_scales": null
+  },
+  "results": {
+    "manual_s3.5": {
+      "n_tiles": 439,
+      "n_gt_tree": 25700,
+      "n_pred": 180473,
+      "tp": 240010806,
+      "fp": 150942112,
+      "fn": 231354686,
+      "tn": 1218991852,
+      "macro_iou": 0.5734677579577726,
+      "f1_tree": 0.5566639960754172,
+      "tree_recall": 0.5091819619243574,
+      "iou_tree": 0.3856787293892684,
+      "iou_bg": 0.7612567865262768,
+      "pixel_acc": 0.7923766301270226,
+      "map50": 0.1996776549597111,
+      "ar1000": 0.5280544747081712
+    }
+  }
+}

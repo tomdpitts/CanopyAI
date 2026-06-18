@@ -31,6 +31,7 @@ import csv
 import datetime
 import io
 import json
+import os
 import subprocess
 import sys
 import time
@@ -65,8 +66,14 @@ def parse_args():
                    help=f"OAM-TCD val split with *.tif + *_meta.json (default: {DEFAULT_HOLDOUT_DIR}).")
     p.add_argument("--output-root", default="benchmark_results_holdout",
                    help="Where per-model prediction folders + summary files are written.")
-    p.add_argument("--shadow-model",
-                   default="solar/shadow_regression/output/shadow_model_combined_best.pth")
+    p.add_argument("--shadow-model", default=None,
+                   help="DEPRECATED (off by default; slated for proper removal in the near "
+                        "future). Path to a shadow-direction model (.pth) for foxtrot's "
+                        "Stage-0 shadow-vector prediction. The vector is only consumed by "
+                        "checkpoints trained with shadow_channel/shadow_cross_attention=True; "
+                        "current plain-RGB models ignore it and the usual shadow model is "
+                        "stale. Only pass this (with a CURRENT model) to evaluate a "
+                        "shadow-aware checkpoint in the interim.")
     p.add_argument("--abs-luma-max", type=float, default=None,
                    help="Shadow map luma ceiling passed to foxtrot (None → foxtrot default).")
     p.add_argument("--df-confidence", type=float, default=None,
@@ -159,8 +166,9 @@ def run_foxtrot(model_spec, mtype, image_path, out_dir, shadow_model,
     cmd = [sys.executable, str(REPO_ROOT / "foxtrot.py"),
            "--image_path", str(image_path),
            "--output_dir", str(out_dir),
-           "--shadow_model", str(shadow_model),
            "--no_viz"]
+    if shadow_model:
+        cmd += ["--shadow_model", str(shadow_model)]
     if max_boxes_sam and int(max_boxes_sam) > 0:
         cmd += ["--max_boxes_sam", str(int(max_boxes_sam))]
     if df_tta:
@@ -208,10 +216,12 @@ def run_segformer(image_path, out_dir):
 
 
 def run_detectree2_one(image_path, out_dir):
+    # weights: "finetuned" (model_echo29.pth, default) or "detectree2" (stock Zenodo
+    # 230103_randresize_full.pth). Override with DETECTREE2_WEIGHTS=detectree2.
     cmd = [sys.executable, str(REPO_ROOT / "infer_detectree2.py"),
            "--image_path", str(image_path),
            "--output_dir", str(out_dir),
-           "--weights", "finetuned"]
+           "--weights", os.environ.get("DETECTREE2_WEIGHTS", "finetuned")]
     r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if r.returncode != 0:
         print(f"      ⚠  infer_detectree2 failed: {r.stderr[-300:]}")

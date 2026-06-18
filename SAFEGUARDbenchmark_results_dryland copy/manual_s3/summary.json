@@ -1,0 +1,80 @@
+{
+  "name": "manual_s3",
+  "model": "checkpoints/manual_s3/deepforest_best.pth",
+  "started": "2026-06-16T18:47:01+10:00",
+  "ended": "2026-06-16T20:04:36+10:00",
+  "git_sha": "9fd4777",
+  "argv": [
+    "phase30/benchmark.py",
+    "--models",
+    "checkpoints/manual_s3/deepforest_best.pth",
+    "--names",
+    "manual_s3",
+    "--df-confidence",
+    "0.05",
+    "--max-boxes-sam",
+    "512",
+    "--max-dets",
+    "512",
+    "--pred-score-thresh",
+    "0.01",
+    "--sam-model",
+    "vit_b",
+    "--sam-checkpoint",
+    "sam_vit_b_01ec64.pth",
+    "--skip-existing",
+    "--holdout-dir",
+    "data/tcd/images/data/tcd/dryland",
+    "--output-root",
+    "benchmark_results_dryland"
+  ],
+  "args": {
+    "models": [
+      "checkpoints/manual_s3/deepforest_best.pth"
+    ],
+    "names": [
+      "manual_s3"
+    ],
+    "holdout_dir": "data/tcd/images/data/tcd/dryland",
+    "output_root": "benchmark_results_dryland",
+    "shadow_model": null,
+    "abs_luma_max": null,
+    "df_confidence": 0.05,
+    "df_tile_overlap": null,
+    "bbox_pad": null,
+    "skip_nms": false,
+    "containment_threshold": null,
+    "poly_containment_threshold": null,
+    "reranker_checkpoint": null,
+    "sam_model": "vit_b",
+    "sam_checkpoint": "sam_vit_b_01ec64.pth",
+    "tiles": null,
+    "tiles_file": null,
+    "skip_inference": false,
+    "skip_existing": true,
+    "pred_score_thresh": 0.01,
+    "max_dets": 512,
+    "max_boxes_sam": 512,
+    "df_tta": false,
+    "df_tta_scales": null
+  },
+  "results": {
+    "manual_s3": {
+      "n_tiles": 144,
+      "n_gt_tree": 12837,
+      "n_pred": 59275,
+      "tp": 69303576,
+      "fp": 60574159,
+      "fn": 29545560,
+      "tn": 444556481,
+      "macro_iou": 0.6330820758161188,
+      "f1_tree": 0.6059941772210926,
+      "tree_recall": 0.7011045195174999,
+      "iou_tree": 0.4347142367117679,
+      "iou_bg": 0.8314499149204696,
+      "pixel_acc": 0.8507901711596383,
+      "map50": 0.30700315513601667,
+      "ar1000": 0.590558541715354
+    }
+  }
+}

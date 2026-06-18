@@ -1,0 +1,80 @@
+{
+  "name": "manual_s2",
+  "model": "checkpoints/manual_s2/deepforest_best.pth",
+  "started": "2026-06-16T12:03:06+10:00",
+  "ended": "2026-06-16T12:36:40+10:00",
+  "git_sha": "9fd4777",
+  "argv": [
+    "phase30/benchmark.py",
+    "--models",
+    "checkpoints/manual_s2/deepforest_best.pth",
+    "--names",
+    "manual_s2",
+    "--df-confidence",
+    "0.05",
+    "--max-boxes-sam",
+    "512",
+    "--max-dets",
+    "512",
+    "--pred-score-thresh",
+    "0.01",
+    "--sam-model",
+    "vit_b",
+    "--sam-checkpoint",
+    "sam_vit_b_01ec64.pth",
+    "--skip-existing",
+    "--holdout-dir",
+    "data/tcd/images/data/tcd/dryland",
+    "--output-root",
+    "benchmark_results_dryland"
+  ],
+  "args": {
+    "models": [
+      "checkpoints/manual_s2/deepforest_best.pth"
+    ],
+    "names": [
+      "manual_s2"
+    ],
+    "holdout_dir": "data/tcd/images/data/tcd/dryland",
+    "output_root": "benchmark_results_dryland",
+    "shadow_model": null,
+    "abs_luma_max": null,
+    "df_confidence": 0.05,
+    "df_tile_overlap": null,
+    "bbox_pad": null,
+    "skip_nms": false,
+    "containment_threshold": null,
+    "poly_containment_threshold": null,
+    "reranker_checkpoint": null,
+    "sam_model": "vit_b",
+    "sam_checkpoint": "sam_vit_b_01ec64.pth",
+    "tiles": null,
+    "tiles_file": null,
+    "skip_inference": false,
+    "skip_existing": true,
+    "pred_score_thresh": 0.01,
+    "max_dets": 512,
+    "max_boxes_sam": 512,
+    "df_tta": false,
+    "df_tta_scales": null
+  },
+  "results": {
+    "manual_s2": {
+      "n_tiles": 144,
+      "n_gt_tree": 12837,
+      "n_pred": 58795,
+      "tp": 69245383,
+      "fp": 62192766,
+      "fn": 29603753,
+      "tn": 442937874,
+      "macro_iou": 0.6291580669126193,
+      "f1_tree": 0.6013825991304731,
+      "tree_recall": 0.700515814321331,
+      "iou_tree": 0.42998363866815237,
+      "iou_bg": 0.8283324951570863,
+      "pixel_acc": 0.8480139192607667,
+      "map50": 0.3135168530747121,
+      "ar1000": 0.592817636519436
+    }
+  }
+}

@@ -1,0 +1,72 @@
+{
+  "name": "detectree2_stock_px",
+  "model": "detectree2",
+  "started": "2026-06-17T01:45:06+10:00",
+  "ended": "2026-06-17T01:47:11+10:00",
+  "git_sha": "9fd4777",
+  "argv": [
+    "phase30/benchmark.py",
+    "--models",
+    "detectree2",
+    "--names",
+    "detectree2_stock_px",
+    "--skip-inference",
+    "--pred-score-thresh",
+    "0.01",
+    "--max-dets",
+    "512",
+    "--holdout-dir",
+    "data/tcd/images/data/tcd/val",
+    "--output-root",
+    "benchmark_results_holdout_manual"
+  ],
+  "args": {
+    "models": [
+      "detectree2"
+    ],
+    "names": [
+      "detectree2_stock_px"
+    ],
+    "holdout_dir": "data/tcd/images/data/tcd/val",
+    "output_root": "benchmark_results_holdout_manual",
+    "shadow_model": null,
+    "abs_luma_max": null,
+    "df_confidence": null,
+    "df_tile_overlap": null,
+    "bbox_pad": null,
+    "skip_nms": false,
+    "containment_threshold": null,
+    "poly_containment_threshold": null,
+    "reranker_checkpoint": null,
+    "sam_model": null,
+    "sam_checkpoint": null,
+    "tiles": null,
+    "tiles_file": null,
+    "skip_inference": true,
+    "skip_existing": false,
+    "pred_score_thresh": 0.01,
+    "max_dets": 512,
+    "max_boxes_sam": 0,
+    "df_tta": false,
+    "df_tta_scales": null
+  },
+  "results": {
+    "detectree2_stock_px": {
+      "n_tiles": 439,
+      "n_gt_tree": 25700,
+      "n_pred": 72394,
+      "tp": 256125497,
+      "fp": 442003440,
+      "fn": 215239995,
+      "tn": 927930524,
+      "macro_iou": 0.4328996622848014,
+      "f1_tree": 0.4380106320284147,
+      "tree_recall": 0.5433692142232592,
+      "iou_tree": 0.2804184465078784,
+      "iou_bg": 0.5853808780617245,
+      "pixel_acc": 0.6430545651559678,
+      "map50": 0.07615779637433588,
+      "ar1000": 0.22832684824902724
+    }
+  }
+}

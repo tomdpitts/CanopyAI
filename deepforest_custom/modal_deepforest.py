@@ -467,6 +467,7 @@ def train_deepforest_modal(
     seed: int = None,                 # If set, reproducible run via seed_everything(seed, workers=True)
     min_delta: float = 0.002,         # EarlyStopping: min `map` improvement to reset patience
     skip_won: bool = False,           # Drop WON-domain tiles from training at load time (CSV untouched)
+    shadow_blind_control: bool = False,  # Negative control: upweight same count on NON-shadow GTs (non-shadow-first)
 ):
     """
     Train DeepForest on Modal GPU. Auto-resumes from checkpoint if one exists
@@ -479,6 +480,12 @@ def train_deepforest_modal(
     os.chdir("/root/canopyAI")
     sys.path.insert(0, "/root/canopyAI")
     sys.path.insert(0, "/root/canopyAI/deepforest_custom")
+
+    # Negative control: the model reads this env var inside _compute_shadow_gt_weights
+    # to swap shadow-selected GT boxes for an equal count of (mostly) non-shadow boxes.
+    if shadow_blind_control:
+        os.environ["SHADOW_BLIND_CONTROL"] = "1"
+        print("   🎲 SHADOW_BLIND_CONTROL=1 — blind (non-shadow-first) negative control")
 
     import tarfile
     import train_deepforest as trainer
@@ -831,7 +838,7 @@ def train_deepforest_modal(
     print("\nTo download:")
     print(
         f"  modal volume get canopyai-deepforest-checkpoints "
-        f"/{run_name}/deepforest_final.pth ./{run_name}.pth"
+        f"/{run_name}/deepforest_best.pth ./{run_name}.pth"
     )
 
     return results
@@ -872,6 +879,7 @@ def main(
     seed: int = None,
     min_delta: float = 0.002,
     skip_won: bool = False,
+    shadow_blind_control: bool = False,
 ):
     """
 Modal deployment for DeepForest fine-tuning
@@ -962,6 +970,7 @@ Phase 5 training data is already in Modal storage:
         seed=seed,
         min_delta=min_delta,
         skip_won=skip_won,
+        shadow_blind_control=shadow_blind_control,
     )
 
     if results:

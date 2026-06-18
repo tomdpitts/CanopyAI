@@ -1,0 +1,80 @@
+{
+  "name": "manual_s3",
+  "model": "checkpoints/manual_s3/deepforest_best.pth",
+  "started": "2026-06-17T02:28:31+10:00",
+  "ended": "2026-06-17T10:43:07+10:00",
+  "git_sha": "9fd4777",
+  "argv": [
+    "phase30/benchmark.py",
+    "--models",
+    "checkpoints/manual_s3/deepforest_best.pth",
+    "--names",
+    "manual_s3",
+    "--df-confidence",
+    "0.05",
+    "--max-boxes-sam",
+    "512",
+    "--max-dets",
+    "512",
+    "--pred-score-thresh",
+    "0.01",
+    "--sam-model",
+    "vit_b",
+    "--sam-checkpoint",
+    "sam_vit_b_01ec64.pth",
+    "--skip-existing",
+    "--holdout-dir",
+    "data/tcd/images/data/tcd/val",
+    "--output-root",
+    "benchmark_results_holdout_manual"
+  ],
+  "args": {
+    "models": [
+      "checkpoints/manual_s3/deepforest_best.pth"
+    ],
+    "names": [
+      "manual_s3"
+    ],
+    "holdout_dir": "data/tcd/images/data/tcd/val",
+    "output_root": "benchmark_results_holdout_manual",
+    "shadow_model": null,
+    "abs_luma_max": null,
+    "df_confidence": 0.05,
+    "df_tile_overlap": null,
+    "bbox_pad": null,
+    "skip_nms": false,
+    "containment_threshold": null,
+    "poly_containment_threshold": null,
+    "reranker_checkpoint": null,
+    "sam_model": "vit_b",
+    "sam_checkpoint": "sam_vit_b_01ec64.pth",
+    "tiles": null,
+    "tiles_file": null,
+    "skip_inference": false,
+    "skip_existing": true,
+    "pred_score_thresh": 0.01,
+    "max_dets": 512,
+    "max_boxes_sam": 512,
+    "df_tta": false,
+    "df_tta_scales": null
+  },
+  "results": {
+    "manual_s3": {
+      "n_tiles": 439,
+      "n_gt_tree": 25700,
+      "n_pred": 177103,
+      "tp": 238623085,
+      "fp": 140961836,
+      "fn": 232742407,
+      "tn": 1228972128,
+      "macro_iou": 0.5782617295242024,
+      "f1_tree": 0.5608389898037455,
+      "tree_recall": 0.5062379173908641,
+      "iou_tree": 0.3896985714803831,
+      "iou_bg": 0.7668248875680217,
+      "pixel_acc": 0.7970432013205352,
+      "map50": 0.2000680704190293,
+      "ar1000": 0.52431906614786
+    }
+  }
+}

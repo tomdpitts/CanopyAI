@@ -1,0 +1,80 @@
+{
+  "name": "manual_s2.5",
+  "model": "checkpoints/manual_s2.5/deepforest_best.pth",
+  "started": "2026-06-18T14:58:57+10:00",
+  "ended": "2026-06-18T19:00:32+10:00",
+  "git_sha": "9fd4777",
+  "argv": [
+    "phase30/benchmark.py",
+    "--models",
+    "checkpoints/manual_s2.5/deepforest_best.pth",
+    "--names",
+    "manual_s2.5",
+    "--df-confidence",
+    "0.05",
+    "--max-boxes-sam",
+    "512",
+    "--max-dets",
+    "512",
+    "--pred-score-thresh",
+    "0.01",
+    "--sam-model",
+    "vit_b",
+    "--sam-checkpoint",
+    "sam_vit_b_01ec64.pth",
+    "--skip-existing",
+    "--holdout-dir",
+    "data/tcd/images/data/tcd/val",
+    "--output-root",
+    "benchmark_reranker"
+  ],
+  "args": {
+    "models": [
+      "checkpoints/manual_s2.5/deepforest_best.pth"
+    ],
+    "names": [
+      "manual_s2.5"
+    ],
+    "holdout_dir": "data/tcd/images/data/tcd/val",
+    "output_root": "benchmark_reranker",
+    "shadow_model": null,
+    "abs_luma_max": null,
+    "df_confidence": 0.05,
+    "df_tile_overlap": null,
+    "bbox_pad": null,
+    "skip_nms": false,
+    "containment_threshold": null,
+    "poly_containment_threshold": null,
+    "reranker_checkpoint": null,
+    "sam_model": "vit_b",
+    "sam_checkpoint": "sam_vit_b_01ec64.pth",
+    "tiles": null,
+    "tiles_file": null,
+    "skip_inference": false,
+    "skip_existing": true,
+    "pred_score_thresh": 0.01,
+    "max_dets": 512,
+    "max_boxes_sam": 512,
+    "df_tta": false,
+    "df_tta_scales": null
+  },
+  "results": {
+    "manual_s2.5": {
+      "n_tiles": 439,
+      "n_gt_tree": 25700,
+      "n_pred": 178084,
+      "tp": 238352728,
+      "fp": 165990927,
+      "fn": 233012764,
+      "tn": 1203943037,
+      "macro_iou": 0.5625259940180533,
+      "f1_tree": 0.5443650527496432,
+      "tree_recall": 0.5056643561001279,
+      "iou_tree": 0.3739708597804206,
+      "iou_bg": 0.7510811282556858,
+      "pixel_acc": 0.7833032048644671,
+      "map50": 0.2004982114814318,
+      "ar1000": 0.5165758754863813
+    }
+  }
+}
